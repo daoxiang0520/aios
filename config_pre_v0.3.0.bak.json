@@ -1,0 +1,31 @@
+{
+  "database": "./data/aios.db",
+  "workspace": "./workspace",
+  "poll_interval_seconds": 2.0,
+  "max_actions_per_cycle": 8,
+  "budget": {
+    "max_model_calls_per_cycle": 4,
+    "max_tool_calls_per_cycle": 8
+  },
+  "model": {
+    "provider": "deepseek",
+    "base_url": "https://api.deepseek.com",
+    "model": "deepseek-v4-flash",
+    "api_key_env": "DEEPSEEK_API_KEY",
+    "timeout_seconds": 60,
+    "max_tokens": 2048,
+    "temperature": 0.1,
+    "thinking": "disabled"
+  },
+  "permissions": {
+    "allowed_tools": [
+      "echo",
+      "list_files",
+      "read_file",
+      "write_file"
+    ],
+    "allow_writes": true,
+    "max_read_bytes": 1048576,
+    "max_write_bytes": 1048576
+  }
+}

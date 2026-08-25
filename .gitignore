@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+config.json
+api.key
+*.key
+.env
+.env.*
+data/
+workspace/
+sandbox/
+skills/candidates/
+skills/history/
+skills/deprecated/
+skills/reports/
+.smoke/

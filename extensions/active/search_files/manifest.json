@@ -1,0 +1,33 @@
+{
+  "name": "search_files",
+  "version": "0.1.0",
+  "description": "Search workspace files by path and optionally UTF-8 text content.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string"
+      },
+      "limit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+      },
+      "content": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "query"
+    ],
+    "additionalProperties": false
+  },
+  "kind": "workspace_search",
+  "config": {},
+  "permissions": {
+    "database": "none",
+    "filesystem": "workspace_read",
+    "network": false,
+    "subprocess": false
+  }
+}

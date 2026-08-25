@@ -1,0 +1,29 @@
+{
+  "name": "query_dead_letters",
+  "version": "0.1.0",
+  "description": "Query exhausted task failures and their errors.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "limit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+      },
+      "status": {
+        "type": "string"
+      }
+    },
+    "additionalProperties": false
+  },
+  "kind": "state_query",
+  "config": {
+    "source": "dead_letters"
+  },
+  "permissions": {
+    "database": "read_only",
+    "filesystem": "none",
+    "network": false,
+    "subprocess": false
+  }
+}

@@ -1,0 +1,123 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+@dataclass(slots=True)
+class ModelConfig:
+    provider: str = "mock"
+    base_url: str = "https://api.openai.com/v1"
+    model: str = "gpt-5-mini"
+    api_key_env: str = "OPENAI_API_KEY"
+    timeout_seconds: int = 60
+    max_tokens: int = 2048
+    temperature: float = 0.1
+    thinking: str = "disabled"
+    protocol: str = "tool_calling"
+
+
+@dataclass(slots=True)
+class PermissionConfig:
+    allowed_tools: list[str] = field(
+        default_factory=lambda: ["read", "write", "edit", "bash"]
+    )
+    allow_writes: bool = True
+    max_read_bytes: int = 1_048_576
+    max_write_bytes: int = 1_048_576
+
+
+@dataclass(slots=True)
+class BudgetConfig:
+    max_model_calls_per_cycle: int = 4
+    max_tool_calls_per_cycle: int = 8
+    reserved_completion_tool_calls: int = 1
+
+
+@dataclass(slots=True)
+class EvolutionConfig:
+    enabled: bool = False
+    auto_promote: bool = True
+    trigger_repetitions: int = 2
+    retry_after_evolution: bool = True
+    extensions_path: str = "./extensions"
+
+
+@dataclass(slots=True)
+class CapabilityConfig:
+    network_enabled: bool = False
+    allowed_domains: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class SandboxConfig:
+    backend: str = "docker"
+    image: str = "python:3.12-slim"
+    timeout_seconds: int = 60
+    memory_mb: int = 512
+    cpus: float = 1.0
+    pids_limit: int = 128
+    root: str = "./sandbox"
+
+
+@dataclass(slots=True)
+class Settings:
+    root: Path
+    database: Path
+    workspace: Path
+    poll_interval_seconds: float = 2.0
+    max_actions_per_cycle: int = 8
+    model: ModelConfig = field(default_factory=ModelConfig)
+    permissions: PermissionConfig = field(default_factory=PermissionConfig)
+    budget: BudgetConfig = field(default_factory=BudgetConfig)
+    evolution: EvolutionConfig = field(default_factory=EvolutionConfig)
+    capabilities: CapabilityConfig = field(default_factory=CapabilityConfig)
+    sandbox: SandboxConfig = field(default_factory=SandboxConfig)
+
+    @classmethod
+    def load(cls, path: str | Path) -> "Settings":
+        config_path = Path(path).resolve()
+        raw: dict[str, Any] = json.loads(config_path.read_text(encoding="utf-8"))
+        root = config_path.parent
+
+        def resolved(value: str) -> Path:
+            candidate = Path(value)
+            return (root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+
+        permissions = PermissionConfig(**raw.get("permissions", {}))
+        legacy = {"list_files": "read", "read_file": "read", "write_file": "write", "append_file": "edit", "echo": "write"}
+        for old, new in legacy.items():
+            if old in permissions.allowed_tools and new not in permissions.allowed_tools:
+                permissions.allowed_tools.append(new)
+
+        return cls(
+            root=root,
+            database=resolved(raw.get("database", "./data/aios.db")),
+            workspace=resolved(raw.get("workspace", "./workspace")),
+            poll_interval_seconds=float(raw.get("poll_interval_seconds", 2.0)),
+            max_actions_per_cycle=int(raw.get("max_actions_per_cycle", 8)),
+            model=ModelConfig(**raw.get("model", {})),
+            permissions=permissions,
+            budget=BudgetConfig(**raw.get("budget", {})),
+            evolution=EvolutionConfig(**raw.get("evolution", {})),
+            capabilities=CapabilityConfig(**raw.get("capabilities", {})),
+            sandbox=SandboxConfig(**raw.get("sandbox", {})),
+        )
+
+    @property
+    def extensions(self) -> Path:
+        candidate = Path(self.evolution.extensions_path)
+        return (self.root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+
+    @property
+    def sandbox_root(self) -> Path:
+        candidate = Path(self.sandbox.root)
+        return (self.root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+
+    def ensure_directories(self) -> None:
+        self.database.parent.mkdir(parents=True, exist_ok=True)
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        self.extensions.mkdir(parents=True, exist_ok=True)
+        self.sandbox_root.mkdir(parents=True, exist_ok=True)
