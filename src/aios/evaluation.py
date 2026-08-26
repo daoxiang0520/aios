@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any
 
 from .capabilities import EvidenceContract
-from .protocol import contains_serialized_tool_call
+from .protocol import contains_serialized_tool_call, is_skill_authoring_request
 from .types import Action, ActionResult
 
 
@@ -43,6 +44,12 @@ class Verifier:
         missing = [name for name in contract.artifacts if name.lower() not in written_names]
         if contract.artifacts:
             self._check(checks, "artifact", "requested_artifact_created", not missing, "missing=" + ",".join(missing) if missing else "all requested artifacts created")
+        if self._is_skill_authoring_request(request):
+            valid_candidate, candidate_detail = self._valid_skill_candidate(actions, results)
+            self._check(
+                checks, "artifact", "valid_skill_candidate_package",
+                valid_candidate, candidate_detail,
+            )
 
         evidence_ok = True
         for requirement in contract.evidence:
@@ -61,6 +68,53 @@ class Verifier:
         passed = all(check["passed"] for check in checks)
         outcome = "completed" if passed else "degraded" if degraded else "retryable_failure"
         return {"passed": passed, "outcome": outcome, "degraded": degraded, "evidence_satisfied": evidence_ok, "checks": checks}
+
+    @staticmethod
+    def _is_skill_authoring_request(request: str) -> bool:
+        return is_skill_authoring_request(request)
+
+    @staticmethod
+    def _valid_skill_candidate(
+        actions: list[Action], results: list[ActionResult]
+    ) -> tuple[bool, str]:
+        packages: dict[str, dict[str, str]] = {}
+        for action, result in zip(actions, results, strict=False):
+            if action.tool not in {"write", "write_file"} or not result.ok:
+                continue
+            raw_path = str(action.arguments.get("path", "")).replace("\\", "/").strip("/")
+            match = re.fullmatch(
+                r"skill_candidates/([a-z][a-z0-9_]{1,63})/(manifest\.json|skill\.py)",
+                raw_path,
+            )
+            content = action.arguments.get("content")
+            if match and isinstance(content, str):
+                packages.setdefault(match.group(1), {})[match.group(2)] = content
+        errors: list[str] = []
+        for name, files in packages.items():
+            if {"manifest.json", "skill.py"} - files.keys():
+                errors.append(f"{name}: missing manifest.json or skill.py")
+                continue
+            try:
+                manifest = json.loads(files["manifest.json"])
+                compile(files["skill.py"], "skill.py", "exec")
+            except (json.JSONDecodeError, SyntaxError) as exc:
+                errors.append(f"{name}: {type(exc).__name__}")
+                continue
+            valid = (
+                isinstance(manifest, dict)
+                and manifest.get("name") == name
+                and manifest.get("entrypoint", "skill.py") == "skill.py"
+                and re.fullmatch(r"\d+\.\d+\.\d+", str(manifest.get("version", ""))) is not None
+                and isinstance(manifest.get("input_schema"), dict)
+                and manifest["input_schema"].get("type") == "object"
+                and "process.sandbox_exec" in manifest.get("required_capabilities", [])
+                and isinstance(manifest.get("tests"), list)
+                and len(manifest["tests"]) >= 1
+            )
+            if valid:
+                return True, f"validated skill_candidates/{name}"
+            errors.append(f"{name}: manifest contract failed")
+        return False, "; ".join(errors) if errors else "no complete skill candidate package was written"
 
     @staticmethod
     def _check(checks: list[dict[str, Any]], layer: str, name: str, passed: bool, detail: str) -> None:

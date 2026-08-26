@@ -194,6 +194,92 @@ class V06SkillTests(unittest.TestCase):
         kinds = {item["kind"] for item in runtime.store.recent_traces(limit=50)}
         self.assertTrue({"SKILL_INVOKE", "SKILL_CAPABILITY_CHECK", "SKILL_RESULT"} <= kinds)
 
+    def test_skill_authoring_contract_defers_inspection_and_requires_valid_package(self) -> None:
+        runtime = AIOSRuntime(self.settings)
+        runtime.capabilities = CapabilityRegistry.default(
+            sandbox_available=True, network_enabled=False
+        )
+        runtime.sandbox.run = Mock(side_effect=AssertionError("authoring inspection must be deferred"))
+        skill_manifest = {
+            "name": "python_file_stats",
+            "version": "1.0.0",
+            "description": "Count Python files and source lines.",
+            "entrypoint": "skill.py",
+            "required_capabilities": ["filesystem.read", "process.sandbox_exec"],
+            "input_schema": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+            "tests": [{
+                "input": {"path": "."}, "expect_exit": 0,
+                "stdout_contains": "python_files",
+            }],
+        }
+        runtime.controller.plan = Mock(side_effect=[
+            Plan(
+                "inspect internals",
+                [Action("bash", {"command": "ls -la /skills"}, call_id="bad_scan")],
+                done=False,
+            ),
+            Plan(
+                "write candidate",
+                [
+                    Action("write", {
+                        "path": "skill_candidates/python_file_stats/manifest.json",
+                        "content": json.dumps(skill_manifest),
+                    }, call_id="manifest"),
+                    Action("write", {
+                        "path": "skill_candidates/python_file_stats/skill.py",
+                        "content": SKILL_SOURCE,
+                    }, call_id="source"),
+                ],
+                done=False,
+            ),
+            Plan("Candidate package created and queued for review.", [], done=True),
+        ])
+        request = (
+            "请设计一个可复用 Skill，接收目录路径并输出 Python 文件与总行数，"
+            "同时写基础测试。"
+        )
+        runtime.store.add_event(Event("TASK_REQUEST", {"message": request}))
+        runtime.run_once()
+        task = runtime.store.list_tasks()[0]
+        self.assertEqual(task.status, TaskStatus.COMPLETED)
+        self.assertEqual(runtime.sandbox.run.call_count, 0)
+        self.assertIn("skill_authoring", runtime.controller.plan.call_args_list[0].args[2])
+        self.assertEqual(task.result["skill_candidates"][0]["manifest"]["name"], "python_file_stats")
+        check = next(
+            item for item in task.result["evidence"]["verification"]["checks"]
+            if item["name"] == "valid_skill_candidate_package"
+        )
+        self.assertTrue(check["passed"])
+
+    def test_skill_authoring_verifier_rejects_incomplete_package(self) -> None:
+        from aios.evaluation import Verifier
+        from aios.types import ActionResult
+
+        action = Action("write", {
+            "path": "skill_candidates/incomplete_skill/skill.py",
+            "content": SKILL_SOURCE,
+        })
+        result = ActionResult("write", True, {"path": "unused"})
+        verified = Verifier().verify(
+            [action], [result], planned_count=1, task_done=True,
+            request="创建一个 Skill 并编写基础测试。", final_output="done",
+        )
+        check = next(
+            item for item in verified["checks"]
+            if item["name"] == "valid_skill_candidate_package"
+        )
+        self.assertFalse(check["passed"])
+        self.assertFalse(verified["passed"])
+
+    def test_short_skill_capability_question_does_not_trigger_authoring(self) -> None:
+        manager = SkillManager(self.settings.skills_root, self.settings.skills)
+        self.assertIsNone(manager.authoring_context("你能产生skill吗？"))
+        self.assertIsNotNone(manager.authoring_context("请设计一个统计 Python 文件的可复用 Skill。"))
+
     def test_runtime_projection_does_not_expose_lifecycle_directories(self) -> None:
         manager = SkillManager(self.settings.skills_root, self.settings.skills)
         manager.bootstrap_builtins()

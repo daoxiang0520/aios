@@ -1,5 +1,14 @@
 # AIOS v0.6 实现与测试报告
 
+## v0.6.3 Skill Authoring Contract
+
+- 修复 Task 42 暴露的 Skill 创作预算浪费：候选包完整前不执行 Bash 探查，至少为 `manifest.json` 与 `skill.py` 保留写入额度。
+- 将候选目录、Manifest、输入 Schema、Capability、基础测试及 `--input-json` 入口要求作为确定性创作协议注入模型。
+- Verifier 新增 `valid_skill_candidate_package` 检查；缺任一文件、目录与 Manifest 名称不一致、版本非法、无测试或源码不可编译都不能完成任务。
+- “编写基础测试”表示在 Manifest 中声明候选测试，不再被错误解释为立即执行未注册候选；Benchmark 和 Promote 仍走宿主生命周期门。
+- 协议修复失败现在记录 `finish_reason`、正文类型/长度与 reasoning 长度，不记录或泄露模型正文。
+- 在真实目标仓库中 56 项测试全部通过，无跳过；包含 Docker Skill Dispatcher 实机边界测试，以及“能力询问不触发创作”的意图边界测试。
+
 ## v0.6.2 Skill Telemetry + Lineage
 
 - 新增 `skill_usage` 持久表，记录 Skill/版本、任务、轮次、调用顺序、耗时、退出码、Capability 评估、Verifier 结果和任务结果。
@@ -47,7 +56,7 @@ Root Capability → Primitive Tool → Skill → Workflow → Harness
 ## 验收结果
 
 - Python 源码与测试编译检查通过。
-- 在真实目标仓库中共 53 项单元/集成测试全部通过，无跳过。
+- v0.6.2 发布时在真实目标仓库中共 53 项单元/集成测试全部通过，无跳过。
 - Docker Engine 可用，真实通过了只读 Skill Dispatcher、`workspace_search` 执行和直接源文件调用拒绝测试。
 - 测试覆盖：四原语不增殖、Manifest 与 Lineage 验证、确定性候选、Benchmark 门、人工晋升门、单调版本、回滚、废弃、权限交集、Agent 候选注册、Skill 遥测与标准 Trace、模型调用/token 计数、Runtime 目录隔离和旧版回归。
 

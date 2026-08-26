@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import signal
 import time
 import uuid
@@ -132,6 +133,11 @@ class AIOSRuntime:
             context["skills"] = (
                 self.skills.catalog(self.capabilities) if self.settings.skills.enabled else []
             )
+            skill_authoring = (
+                self.skills.authoring_context(task.request) if self.settings.skills.enabled else None
+            )
+            if skill_authoring is not None:
+                context["skill_authoring"] = skill_authoring
             context["harness"] = harness_settings
             context["harness_version"] = harness.get("version")
             self.store.trace(cycle_id, "context_composed", context)
@@ -160,12 +166,17 @@ class AIOSRuntime:
                     action.tool in {"write", "write_file"} and result.ok
                     for action, result in zip(all_actions, all_results, strict=False)
                 )
+                skill_candidate_written = self._skill_candidate_written(all_actions, all_results)
                 reserved = (
                     min(
-                        max(0, self.settings.budget.reserved_completion_tool_calls),
+                        max(
+                            2 if skill_authoring is not None and not skill_candidate_written else 0,
+                            max(0, self.settings.budget.reserved_completion_tool_calls),
+                        ),
                         remaining_before_round,
                     )
-                    if expected_artifacts and not artifact_written
+                    if (expected_artifacts and not artifact_written)
+                    or (skill_authoring is not None and not skill_candidate_written)
                     else 0
                 )
                 context["observations"] = observations
@@ -197,6 +208,15 @@ class AIOSRuntime:
                     remaining_before_round,
                     reserved,
                 )
+                if skill_authoring is not None and not skill_candidate_written:
+                    authoring_writes = [
+                        action for action in actions if action.tool in {"write", "write_file"}
+                    ]
+                    deferred_actions = [
+                        *[action for action in actions if action.tool not in {"write", "write_file"}],
+                        *deferred_actions,
+                    ]
+                    actions = authoring_writes
                 planned_count += len(actions)
                 budget_deferred += len(deferred_actions)
                 budget_truncated = budget_truncated or bool(deferred_actions)
@@ -462,6 +482,21 @@ class AIOSRuntime:
                     tokens_after=model_tokens_total,
                 )
             return True
+
+    @staticmethod
+    def _skill_candidate_written(actions: list, results: list) -> bool:
+        packages: dict[str, set[str]] = {}
+        for action, result in zip(actions, results, strict=False):
+            if action.tool not in {"write", "write_file"} or not result.ok:
+                continue
+            raw_path = str(action.arguments.get("path", "")).replace("\\", "/").strip("/")
+            match = re.fullmatch(
+                r"skill_candidates/([a-z][a-z0-9_]{1,63})/(manifest\.json|skill\.py)",
+                raw_path,
+            )
+            if match:
+                packages.setdefault(match.group(1), set()).add(match.group(2))
+        return any({"manifest.json", "skill.py"} <= files for files in packages.values())
 
     @staticmethod
     def _final_output(summary: str, actions: list, results: list) -> str:

@@ -11,6 +11,7 @@ from typing import Any
 
 from .capabilities import CapabilityRegistry, CapabilityRequirement, EvidenceContract
 from .config import SkillConfig
+from .protocol import is_skill_authoring_request
 from .sandbox import DockerSandboxBroker
 
 
@@ -71,6 +72,32 @@ class SkillManager:
         "state.skill_usage_read",
         "network.external",
     }
+
+    @staticmethod
+    def authoring_context(request: str) -> dict[str, Any] | None:
+        """Return a deterministic contract for requests that create or mutate a Skill."""
+        if not is_skill_authoring_request(request):
+            return None
+        return {
+            "required": True,
+            "package_root": "skill_candidates/<lowercase_snake_case_name>",
+            "required_files": ["manifest.json", "skill.py"],
+            "manifest_requirements": {
+                "version": "MAJOR.MINOR.PATCH",
+                "entrypoint": "skill.py",
+                "required_capabilities": ["process.sandbox_exec"],
+                "input_schema_type": "object",
+                "minimum_tests": 1,
+            },
+            "instructions": [
+                "Choose one lowercase snake_case name and use it in both the directory and manifest.",
+                "Use write to create both files directly; paths are relative to the workspace.",
+                "Put basic executable test cases in manifest.json under tests.",
+                "skill.py must accept --input-json and print its result to stdout.",
+                "Do not inspect /skills or /workspace and do not use bash before both files are written.",
+                "The host registers the candidate after verification; do not promote it.",
+            ],
+        }
 
     def __init__(self, root: Path, config: SkillConfig):
         self.root = root.resolve()

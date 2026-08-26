@@ -1,7 +1,9 @@
 # Self-Evolving AIOS v0.6
 
-Current release: **v0.6.2**. In addition to the v0.6.1 protocol and boundary fixes,
-it records standardized Skill invocation telemetry and evolutionary lineage. These
+Current release: **v0.6.3**. In addition to standardized Skill telemetry and lineage,
+it adds a deterministic Skill Authoring Contract that reserves candidate-package writes,
+blocks wasteful `/skills` inspection during authoring, and verifies both `manifest.json`
+and `skill.py` before candidate registration. These
 records are the data foundation for replay benchmarks, utility scoring, experience
 analysis, mutation, selection, and quarantine in later v0.6 releases.
 

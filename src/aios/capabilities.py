@@ -5,6 +5,8 @@ from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from .protocol import is_skill_authoring_request
+
 
 class CapabilityState(StrEnum):
     AVAILABLE = "available"
@@ -93,7 +95,8 @@ class EvidenceContract:
         process_markers = ("运行", "执行", "测试", "pytest", "python", "shell", "bash", "命令")
         if any(marker in text for marker in process_markers):
             capabilities.append(CapabilityRequirement("process.sandbox_exec", "Task requires executable commands"))
-            if any(marker in text for marker in ("测试", "pytest", "test")):
+            skill_authoring = is_skill_authoring_request(request)
+            if any(marker in text for marker in ("测试", "pytest", "test")) and not skill_authoring:
                 evidence.append(EvidenceRequirement("command_success"))
 
         output_artifacts = list(dict.fromkeys(artifacts or []))

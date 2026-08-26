@@ -335,7 +335,14 @@ class LLMController:
             if isinstance(tool_calls, list) and tool_calls:
                 raise ControllerError("Model protocol repair failed: native tool calls remained")
             if not isinstance(content, str) or not content.strip() or contains_serialized_tool_call(content):
-                raise ControllerError("Model protocol repair failed: no valid final answer")
+                reasoning = message.get("reasoning_content")
+                raise ControllerError(
+                    "Model protocol repair failed: no valid final answer; "
+                    f"finish_reason={choice.get('finish_reason', 'unknown')}; "
+                    f"content_type={type(content).__name__}; "
+                    f"content_chars={len(content) if isinstance(content, str) else 0}; "
+                    f"reasoning_chars={len(reasoning) if isinstance(reasoning, str) else 0}"
+                )
             return Plan(
                 summary=content.strip(), actions=[], done=True,
                 model_usage=combined_usage,
@@ -378,10 +385,21 @@ class LLMController:
     @staticmethod
     def _prompt_append(context: dict[str, Any]) -> str:
         harness = context.get("harness", {})
-        if not isinstance(harness, dict):
-            return ""
-        value = harness.get("prompt_append", "")
-        return f"\nAdditional approved policy:\n{value}" if isinstance(value, str) and value else ""
+        sections: list[str] = []
+        if isinstance(harness, dict):
+            value = harness.get("prompt_append", "")
+            if isinstance(value, str) and value.strip():
+                sections.append("Additional approved policy:\n" + value.strip())
+        authoring = context.get("skill_authoring")
+        if isinstance(authoring, dict) and authoring.get("required"):
+            sections.append(
+                "SKILL AUTHORING CONTRACT: Create exactly one candidate package under "
+                "skill_candidates/<lowercase_snake_case_name>/ using workspace-relative write calls. "
+                "Write manifest.json and skill.py before using bash. The manifest name must match the "
+                "directory, declare process.sandbox_exec, describe an object input_schema, and contain "
+                "at least one test. skill.py must accept --input-json. Never inspect /skills or /workspace."
+            )
+        return "\n" + "\n".join(sections) if sections else ""
 
     @classmethod
     def _parse_plan_content(cls, content: Any) -> Plan:
