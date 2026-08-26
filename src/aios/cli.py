@@ -8,10 +8,13 @@ from pathlib import Path
 from typing import Any
 
 from .config import Settings
+from .capabilities import CapabilityRegistry
 from .diagnostics import Diagnoser
 from .evolution import EvolutionManager
 from .evaluation import Verifier
 from .plugins import PluginManager
+from .sandbox import DockerSandboxBroker
+from .skills import SkillManager
 from .runtime import AIOSRuntime
 from .storage import StateStore
 from .types import Action, ActionResult, Event, Goal, GoalStatus, GoalType, Memory, MemoryType, Task, TaskStatus
@@ -112,6 +115,30 @@ def _parser() -> argparse.ArgumentParser:
     rollback = evolution_commands.add_parser("rollback")
     rollback.add_argument("version", type=int)
     rollback.add_argument("--approve", action="store_true")
+
+    skill = commands.add_parser("skill", help="Manage versioned sandbox skills")
+    skill_commands = skill.add_subparsers(dest="skill_command", required=True)
+    skill_commands.add_parser("list")
+    skill_commands.add_parser("candidates")
+    skill_show = skill_commands.add_parser("show")
+    skill_show.add_argument("name")
+    skill_versions = skill_commands.add_parser("versions")
+    skill_versions.add_argument("name")
+    skill_propose = skill_commands.add_parser("propose")
+    skill_propose.add_argument("--manifest", required=True, help="Path to manifest.json")
+    skill_propose.add_argument("--source", required=True, help="Path to skill.py")
+    skill_benchmark = skill_commands.add_parser("benchmark")
+    skill_benchmark.add_argument("candidate_id")
+    skill_promote = skill_commands.add_parser("promote")
+    skill_promote.add_argument("candidate_id")
+    skill_promote.add_argument("--approve", action="store_true")
+    skill_rollback = skill_commands.add_parser("rollback")
+    skill_rollback.add_argument("name")
+    skill_rollback.add_argument("--approve", action="store_true")
+    skill_deprecate = skill_commands.add_parser("deprecate")
+    skill_deprecate.add_argument("name")
+    skill_deprecate.add_argument("--approve", action="store_true")
+    skill_commands.add_parser("bootstrap")
     return parser
 
 
@@ -125,6 +152,19 @@ def _load(path: str) -> tuple[Settings, StateStore]:
 
 def _print_json(value: Any) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2, default=str))
+
+
+def _skill_services(settings: Settings) -> tuple[SkillManager, DockerSandboxBroker, CapabilityRegistry]:
+    manager = SkillManager(settings.skills_root, settings.skills)
+    if settings.skills.enabled:
+        manager.bootstrap_builtins()
+    broker = DockerSandboxBroker(settings.sandbox_root, settings.sandbox, manager.runtime)
+    capabilities = CapabilityRegistry.default(
+        sandbox_available=broker.available(),
+        network_enabled=settings.capabilities.network_enabled,
+        allowed_domains=settings.capabilities.allowed_domains,
+    )
+    return manager, broker, capabilities
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -142,6 +182,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 target.write_text(json.dumps(_default_config(), indent=2), encoding="utf-8")
         settings, _ = _load(str(target))
+        _skill_services(settings)
         print(f"Initialized AIOS at {settings.root}")
         return 0
 
@@ -177,6 +218,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "status":
+        skill_manager, _, skill_capabilities = _skill_services(settings)
         _print_json(
             {
                 "pending_events": store.count_pending_events(),
@@ -187,6 +229,10 @@ def main(argv: list[str] | None = None) -> int:
                 "active_generated_tools": [
                     plugin.name
                     for plugin in PluginManager(settings.extensions, store, settings.workspace).active_plugins()
+                ],
+                "active_skills": [
+                    item["name"]
+                    for item in skill_manager.catalog(skill_capabilities)
                 ],
             }
         )
@@ -317,6 +363,35 @@ def main(argv: list[str] | None = None) -> int:
         elif args.evolution_command == "rollback":
             _print_json(manager.rollback(args.version, approved=args.approve))
         return 0
+    if args.command == "skill":
+        manager, broker, capabilities = _skill_services(settings)
+        if args.skill_command == "list":
+            _print_json(manager.catalog(capabilities))
+        elif args.skill_command == "candidates":
+            _print_json(manager.list_candidates())
+        elif args.skill_command == "show":
+            match = next((item for item in manager.catalog(capabilities) if item["name"] == args.name), None)
+            if match is None:
+                raise SystemExit(f"Unknown active skill: {args.name}")
+            _print_json(match)
+        elif args.skill_command == "versions":
+            _print_json(manager.versions(args.name))
+        elif args.skill_command == "propose":
+            manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
+            source = Path(args.source).read_text(encoding="utf-8")
+            _print_json(manager.propose(manifest, source))
+        elif args.skill_command == "benchmark":
+            _print_json(manager.benchmark(args.candidate_id, broker))
+        elif args.skill_command == "promote":
+            _print_json(manager.promote(args.candidate_id, approved=args.approve))
+        elif args.skill_command == "rollback":
+            _print_json(manager.rollback(args.name, approved=args.approve))
+        elif args.skill_command == "deprecate":
+            _print_json(manager.deprecate(args.name, approved=args.approve))
+        elif args.skill_command == "bootstrap":
+            manager.bootstrap_builtins()
+            _print_json(manager.catalog(capabilities))
+        return 0
     return 2
 
 
@@ -379,7 +454,13 @@ def _default_config() -> dict[str, Any]:
         "database": "./data/aios.db",
         "workspace": "./workspace",
         "model": {"provider": "mock"},
-        "permissions": {"allowed_tools": ["echo", "list_files", "read_file", "write_file"]},
+        "permissions": {"allowed_tools": ["read", "write", "edit", "bash"]},
+        "skills": {
+            "enabled": True,
+            "root": "./skills",
+            "require_human_promotion": True,
+        },
+        "evolution": {"enabled": False, "auto_promote": False},
     }
 
 

@@ -1,8 +1,8 @@
-# Self-Evolving AIOS MVP
+# Self-Evolving AIOS v0.6
 
-> 下一阶段已调整为架构收缩版 **v0.5 — Capability Kernel Refactor**：冻结新的专用 Tool Evolution，优先实现 CapabilityRegistry、EvidenceContract、分层 Verifier、`aiosctl` 与强沙盒。完整路线见 [`AIOS_v0.5_目标与路线.md`](./AIOS_v0.5_目标与路线.md)。
+> v0.6 将进化面从“增加专用 Tool Schema”迁移为“学习可执行、可测试、可版本化的 Skill”。模型的原生工具面仍固定为 `read / write / edit / bash`。
 
-这是 `Self-Evolving-AIOS_完整设计.md` 的 v0.5 可运行实现。它把 Agent 与 Host 的边界收紧为：任务契约与能力预检 → Tool Calling → 强沙盒执行 → 分层证据验收 → 有条件提交与记忆。
+当前分层为：`Root Capability → Primitive Tool → Skill → Workflow → Harness`。v0.6 实现 Skill 层；Workflow 和 Harness 的自主进化仍是后续版本。
 
 ## 已实现
 
@@ -38,10 +38,42 @@
 - 原生 Tool Calling、函数Schema和 `tool_call_id` 结果回传；
 - 普通模型文本直接作为最终回答，不再要求最终回答使用JSON；
 - 所有原生工具调用仍经过白名单、路径隔离和预算检查。
+- 版本化 Skill Registry：`candidate / active / history / deprecated / reports`；
+- Skill Manifest：名称、SemVer、输入 Schema、测试和 `required_capabilities`；
+- Docker-only Skill Benchmark，候选代码绝不在宿主 Python 中执行；
+- 需人工确认的 Promote / Rollback / Deprecated 生命周期；
+- Agent 可在 `workspace/skill_candidates/`产生候选 Skill，默认只注册、不自动执行或晋升；
+- 沙盒只读挂载 `skills/runtime`，不暴露候选、历史、报告和废弃代码；
+- 内置 `workspace_search`、`state_query`、`trace_failure_analyzer` 三个可复用 Skill。
+
+## Skill 使用与进化
+
+模型通过稳定的 `bash` 原语调用 Skill，不会将 Skill 注入 Tool Schema：
+
+```bash
+python /skills/skill.py list
+python /skills/skill.py run workspace_search --input-json '{"query":"hello"}'
+python /skills/skill.py run trace_failure_analyzer --input-json '{"limit":100}'
+```
+
+宿主管理命令：
+
+```powershell
+python -m aios --config config.json skill list
+python -m aios --config config.json skill candidates
+python -m aios --config config.json skill propose --manifest manifest.json --source skill.py
+python -m aios --config config.json skill benchmark <candidate_id>
+python -m aios --config config.json skill promote <candidate_id> --approve
+python -m aios --config config.json skill versions <name>
+python -m aios --config config.json skill rollback <name> --approve
+python -m aios --config config.json skill deprecate <name> --approve
+```
+
+Skill 不会产生权限。有效权限始终是 `Manifest 声明能力 ∩ Host 已授予能力`；例如声明 `network.external` 的 Skill 在默认配置下仍是 `needs_authority`。
 
 ## 安全边界与尚未实现
 
-v0.5 冻结 v0.4 的自动 Tool Evolution，旧插件仅保留执行兼容且不再暴露给模型。模型生成的命令只能进入 Docker 强沙盒；Docker 不可用时任务进入 `blocked_capability`，绝不降级到宿主 PowerShell。网络默认关闭并进入 `needs_authority`。域名代理、凭据代理、生产发布审批与更强领域验证仍未实现。
+v0.6 继续冻结 v0.4 的 Tool Evolution，旧插件仅保留兼容且不再暴露给模型。模型生成的命令和 Skill 测试只能进入 Docker 强沙盒；Docker 不可用时绝不降级到宿主 PowerShell。网络默认关闭。域名代理、凭据代理、Workflow Evolution、Harness Evolution 与生产发布审批仍未实现。
 
 ## 快速开始
 
@@ -201,4 +233,4 @@ python -m unittest discover -s tests -v
 
 ## 当前阶段
 
-v0.5 是 Capability Kernel 第一版：先让系统可靠地区分“完成、降级、缺能力、缺授权和真实失败”，并阻断假完成与宿主机越权。它不是任意源码自修改系统；进化功能暂时冻结，而不是删除。
+v0.6 已开始 Skill Evolution：Trace 或重复任务可以被沉淀为候选 Skill，但是只有通过沙盒测试和晋升门的版本才会进入运行时。它是受约束的能力学习，不是任意宿主源码自修改。

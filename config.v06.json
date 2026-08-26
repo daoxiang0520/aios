@@ -8,12 +8,22 @@
     "max_tool_calls_per_cycle": 8,
     "reserved_completion_tool_calls": 1
   },
-  "evolution": {
-    "enabled": false,
-    "auto_promote": false,
-    "trigger_repetitions": 2,
-    "retry_after_evolution": false,
-    "extensions_path": "./extensions"
+  "model": {
+    "provider": "deepseek",
+    "base_url": "https://api.deepseek.com",
+    "model": "deepseek-v4-flash",
+    "api_key_env": "DEEPSEEK_API_KEY",
+    "timeout_seconds": 60,
+    "max_tokens": 31296,
+    "temperature": 0.1,
+    "thinking": "disabled",
+    "protocol": "tool_calling"
+  },
+  "permissions": {
+    "allowed_tools": ["read", "write", "edit", "bash"],
+    "allow_writes": true,
+    "max_read_bytes": 1048576,
+    "max_write_bytes": 1048576
   },
   "capabilities": {
     "network_enabled": false,
@@ -35,21 +45,11 @@
     "max_source_bytes": 131072,
     "benchmark_timeout_seconds": 30
   },
-  "model": {
-    "provider": "mock",
-    "base_url": "https://api.openai.com/v1",
-    "model": "gpt-5-mini",
-    "api_key_env": "OPENAI_API_KEY",
-    "timeout_seconds": 60,
-    "max_tokens": 2048,
-    "temperature": 0.1,
-    "thinking": "disabled",
-    "protocol": "tool_calling"
-  },
-  "permissions": {
-    "allowed_tools": ["read", "write", "edit", "bash"],
-    "allow_writes": true,
-    "max_read_bytes": 1048576,
-    "max_write_bytes": 1048576
+  "evolution": {
+    "enabled": false,
+    "auto_promote": false,
+    "trigger_repetitions": 2,
+    "retry_after_evolution": false,
+    "extensions_path": "./extensions"
   }
 }

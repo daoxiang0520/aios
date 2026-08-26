@@ -63,6 +63,15 @@ class SandboxConfig:
 
 
 @dataclass(slots=True)
+class SkillConfig:
+    enabled: bool = True
+    root: str = "./skills"
+    require_human_promotion: bool = True
+    max_source_bytes: int = 131_072
+    benchmark_timeout_seconds: int = 30
+
+
+@dataclass(slots=True)
 class Settings:
     root: Path
     database: Path
@@ -75,6 +84,7 @@ class Settings:
     evolution: EvolutionConfig = field(default_factory=EvolutionConfig)
     capabilities: CapabilityConfig = field(default_factory=CapabilityConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
+    skills: SkillConfig = field(default_factory=SkillConfig)
 
     @classmethod
     def load(cls, path: str | Path) -> "Settings":
@@ -104,6 +114,7 @@ class Settings:
             evolution=EvolutionConfig(**raw.get("evolution", {})),
             capabilities=CapabilityConfig(**raw.get("capabilities", {})),
             sandbox=SandboxConfig(**raw.get("sandbox", {})),
+            skills=SkillConfig(**raw.get("skills", {})),
         )
 
     @property
@@ -116,8 +127,14 @@ class Settings:
         candidate = Path(self.sandbox.root)
         return (self.root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
 
+    @property
+    def skills_root(self) -> Path:
+        candidate = Path(self.skills.root)
+        return (self.root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+
     def ensure_directories(self) -> None:
         self.database.parent.mkdir(parents=True, exist_ok=True)
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.extensions.mkdir(parents=True, exist_ok=True)
         self.sandbox_root.mkdir(parents=True, exist_ok=True)
+        self.skills_root.mkdir(parents=True, exist_ok=True)

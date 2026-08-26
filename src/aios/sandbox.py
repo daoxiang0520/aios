@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,9 +36,10 @@ class DockerSandboxBroker:
     the host.
     """
 
-    def __init__(self, root: Path, config: SandboxConfig):
+    def __init__(self, root: Path, config: SandboxConfig, skills_root: Path | None = None):
         self.root = root.resolve()
         self.config = config
+        self.skills_root = skills_root.resolve() if skills_root is not None else None
         self.session: SandboxSession | None = None
 
     def available(self) -> bool:
@@ -84,8 +86,10 @@ class DockerSandboxBroker:
             "--pids-limit", str(self.config.pids_limit),
             "--mount", f"type=bind,src={self.session.path},dst=/workspace",
             "--mount", f"type=bind,src={self.session.state_path},dst=/aios-state,readonly",
-            "--workdir", "/workspace", self.config.image, "sh", "-lc", command,
         ]
+        if self.skills_root is not None and self.skills_root.exists():
+            args.extend(["--mount", f"type=bind,src={self.skills_root},dst=/skills,readonly"])
+        args.extend(["--workdir", "/workspace", self.config.image, "sh", "-lc", command])
         try:
             result = subprocess.run(
                 args,
@@ -107,8 +111,45 @@ class DockerSandboxBroker:
             "changes": changes,
         }
 
+    def run_candidate(self, package: Path, command: str, timeout_seconds: int) -> dict[str, Any]:
+        self._validate_command_scope(command)
+        if not self.available():
+            raise SandboxUnavailable("Docker sandbox is unavailable; candidate code cannot run on host")
+        self.root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="skill_benchmark_", dir=self.root) as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            state = root / "state"
+            workspace.mkdir()
+            state.mkdir()
+            (state / "state.json").write_text(
+                json.dumps({"tasks": [], "traces": [], "dead-letters": [], "memory": [], "capabilities": {}}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            timeout = min(timeout_seconds, self.config.timeout_seconds)
+            args = [
+                "docker", "run", "--rm", "--network", "none", "--read-only",
+                "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                "--memory", f"{self.config.memory_mb}m", "--cpus", str(self.config.cpus),
+                "--pids-limit", str(self.config.pids_limit),
+                "--mount", f"type=bind,src={workspace},dst=/workspace",
+                "--mount", f"type=bind,src={state},dst=/aios-state,readonly",
+                "--mount", f"type=bind,src={package.resolve()},dst=/candidate,readonly",
+                "--workdir", "/workspace", self.config.image, "sh", "-lc", command,
+            ]
+            try:
+                result = subprocess.run(
+                    args, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    timeout=timeout, check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise TimeoutError(f"Skill benchmark exceeded {timeout}s") from exc
+            return {"exit_code": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
+
     @staticmethod
     def _validate_command_scope(command: str) -> None:
+        if "/skills/" in command and "/skills/skill.py" not in command:
+            raise SandboxPolicyError("Skills must be invoked through python /skills/skill.py run")
         broad_root_patterns = (
             r"(?:^|[;&|]\s*)cd\s+/(?:\s|[;&|]|$)",
             r"\bfind\s+/(?:\s|$)",

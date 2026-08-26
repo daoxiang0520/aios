@@ -16,6 +16,7 @@ from .memory import ContextComposer, MemoryManager
 from .plugins import PluginManager
 from .security import SecurityKernel
 from .sandbox import DockerSandboxBroker
+from .skills import SkillManager
 from .storage import StateStore
 from .tools import ToolExecutor, ToolRegistry
 from .types import ActionResult, Event, MemoryType, Task, TaskStatus
@@ -36,7 +37,10 @@ class AIOSRuntime:
         self.context = ContextComposer(self.memories)
         self.verifier = Verifier()
         self.plugins = PluginManager(settings.extensions, self.store, settings.workspace)
-        self.sandbox = DockerSandboxBroker(settings.sandbox_root, settings.sandbox)
+        self.skills = SkillManager(settings.skills_root, settings.skills)
+        if settings.skills.enabled:
+            self.skills.bootstrap_builtins()
+        self.sandbox = DockerSandboxBroker(settings.sandbox_root, settings.sandbox, self.skills.runtime)
         self.capabilities = CapabilityRegistry.default(
             sandbox_available=self.sandbox.available(),
             network_enabled=settings.capabilities.network_enabled,
@@ -110,6 +114,7 @@ class AIOSRuntime:
                 "dead-letters": self.store.list_dead_letters(limit=100),
                 "memory": [asdict(item) for item in self.store.list_memories(limit=100)],
                 "capabilities": self.capabilities.as_dict(),
+                "skills": self.skills.catalog(self.capabilities) if self.settings.skills.enabled else [],
             })
             self.security.workspace = snapshot.resolve()
 
@@ -121,6 +126,9 @@ class AIOSRuntime:
             context = self.context.compose(task.request)
             context["evidence_contract"] = contract.as_dict()
             context["capabilities"] = self.capabilities.as_dict()
+            context["skills"] = (
+                self.skills.catalog(self.capabilities) if self.settings.skills.enabled else []
+            )
             context["harness"] = harness_settings
             context["harness_version"] = harness.get("version")
             self.store.trace(cycle_id, "context_composed", context)
@@ -289,6 +297,13 @@ class AIOSRuntime:
                 committed = self.sandbox.commit(self.settings.workspace)
                 task_result["committed_files"] = committed
                 task_result["final_output"] = self._published_output(final_output, snapshot)
+                skill_candidates = (
+                    self.skills.ingest_workspace_candidates(self.settings.workspace, self.sandbox)
+                    if self.settings.skills.enabled else []
+                )
+                if skill_candidates:
+                    task_result["skill_candidates"] = skill_candidates
+                    self.store.trace(cycle_id, "skill_candidates_ingested", {"candidates": skill_candidates})
                 self.store.finish_events(event_ids)
                 self.store.update_task(int(task.id), TaskStatus.COMPLETED, result=task_result)
                 self.store.add_checkpoint(int(task.id), "completed", task_result)

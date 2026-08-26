@@ -10,8 +10,5 @@ api.key
 data/
 workspace/
 sandbox/
-skills/candidates/
-skills/history/
-skills/deprecated/
-skills/reports/
+skills/
 .smoke/

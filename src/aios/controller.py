@@ -26,6 +26,9 @@ not completion. If the user requested an artifact, do not set done=true until wr
 
 TOOL_SYSTEM_PROMPT = """You are the controller of a permission-gated AI runtime.
 Use the provided tools whenever workspace evidence or file changes are required.
+Reusable skills are listed in context.skills. Discover them with `python /skills/skill.py list`
+and invoke them through bash as `python /skills/skill.py run NAME --input-json '{...}'`.
+Skills do not grant permissions; if a required capability is unavailable, report the block.
 Do not merely describe a tool call: call the tool. Tool results will be returned to you.
 Listing or reading files is observation, not task completion. Continue until the user goal is fulfilled.
 For a requested artifact, call write and only finish after its successful tool result.
