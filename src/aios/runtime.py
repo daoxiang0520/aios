@@ -173,6 +173,7 @@ class AIOSRuntime:
                     "used_tool_calls": len(all_actions),
                     "remaining_tool_calls": remaining_before_round,
                     "reserved_completion_tool_calls": reserved,
+                    "protocol_repairs_remaining": 1,
                     "required_artifacts": expected_artifacts,
                     "instruction": (
                         "When remaining calls reach the reserved count, stop inspection and create the requested artifact. "
@@ -444,7 +445,8 @@ class AIOSRuntime:
             self.store.add_checkpoint(task_id, "evolution", evolution_result)
         if evolution_result.get("changed") or evolution_result.get("rolled_back_tools"):
             self._reload_generated_tools()
-        if task.attempts < task.max_attempts:
+        terminal_protocol_failure = "Model protocol repair failed:" in error
+        if task.attempts < task.max_attempts and not terminal_protocol_failure:
             self.store.update_task(task_id, TaskStatus.RETRYING, result=result, error=error)
             payload = dict(event.payload)
             payload["task_id"] = task_id
@@ -463,7 +465,8 @@ class AIOSRuntime:
             )
         else:
             if (
-                evolution_result.get("changed")
+                not terminal_protocol_failure
+                and evolution_result.get("changed")
                 and self.settings.evolution.retry_after_evolution
             ):
                 retry_id = self.store.retry_task(task_id)
@@ -481,7 +484,10 @@ class AIOSRuntime:
             self.store.update_task(task_id, TaskStatus.DEAD_LETTER, result=result, error=error)
             dead_id = self.store.add_dead_letter(task_id, event, error)
             self.store.trace(cycle_id, "dead_lettered", {"task_id": task_id, "dead_letter_id": dead_id})
-            LOGGER.error("Task %s exhausted retries and entered dead letter %s", task_id, dead_id)
+            if terminal_protocol_failure and task.attempts < task.max_attempts:
+                LOGGER.error("Task %s entered dead letter %s after terminal protocol repair failure", task_id, dead_id)
+            else:
+                LOGGER.error("Task %s exhausted retries and entered dead letter %s", task_id, dead_id)
 
     def _reload_generated_tools(self) -> None:
         registry = ToolRegistry(self.settings.permissions, self.plugins, self.sandbox)

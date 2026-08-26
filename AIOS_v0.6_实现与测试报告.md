@@ -1,5 +1,12 @@
 # AIOS v0.6 实现与测试报告
 
+## v0.6.1 协议与边界修复
+
+- 最终轮收到序列化 DSML 时，只进行一次不带 Tools 的最终答案修复，不重跑已执行动作。
+- 修复仍失败时视为终止性协议失败，不再完整重试同一任务三次。
+- Skill Dispatcher 调用改为 Shell token 级精确校验，禁止用 `;`、管道或重定向捆绑直接 `/skills` 访问。
+- Windows CLI 将 stdout/stderr 统一配置为 UTF-8，避免中文、Emoji 和 Trace JSON 触发 GBK 编码异常。
+
 ## 版本目标
 
 v0.6 将高阶能力的进化从“增加模型可见 Tool Schema”迁移到 Skill 层：

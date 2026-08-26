@@ -28,6 +28,8 @@ TOOL_SYSTEM_PROMPT = """You are the controller of a permission-gated AI runtime.
 Use the provided tools whenever workspace evidence or file changes are required.
 Reusable skills are listed in context.skills. Discover them with `python /skills/skill.py list`
 and invoke them through bash as `python /skills/skill.py run NAME --input-json '{...}'`.
+Never list, read, write, or inspect `/skills` directly, and never combine a Skill dispatcher
+invocation with another shell command, pipe, or redirection.
 Skills do not grant permissions; if a required capability is unavailable, report the block.
 Do not merely describe a tool call: call the tool. Tool results will be returned to you.
 Listing or reading files is observation, not task completion. Continue until the user goal is fulfilled.
@@ -193,6 +195,7 @@ class LLMController:
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,
         }
+        force_final = False
         if use_tool_calling:
             request_data["tools"] = self.tool_schemas
             budget = (context or {}).get("budget", {})
@@ -203,18 +206,7 @@ class LLMController:
         if self.config.provider == "deepseek":
             thinking = self.config.thinking if self.config.thinking in {"enabled", "disabled"} else "disabled"
             request_data["thinking"] = {"type": thinking}
-        body = json.dumps(request_data).encode("utf-8")
-        request = urllib.request.Request(
-            self.config.base_url.rstrip("/") + "/chat/completions",
-            data=body,
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
-                response_data = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise ControllerError(f"Model request failed: {exc}") from exc
+        response_data = self._send_request(request_data, key)
         try:
             choice = response_data["choices"][0]
             message = choice["message"]
@@ -238,6 +230,10 @@ class LLMController:
                 )
             if use_tool_calling and isinstance(content, str) and content.strip():
                 if contains_serialized_tool_call(content):
+                    budget = (context or {}).get("budget", {})
+                    repairs = int(budget.get("protocol_repairs_remaining", 0))
+                    if force_final and repairs > 0:
+                        return self._repair_final_answer(request_data, content, key)
                     raise ControllerError(
                         "Model emitted serialized tool-call markup instead of a native tool call or final answer"
                     )
@@ -257,6 +253,64 @@ class LLMController:
                 ) from exc
         except (KeyError, IndexError, TypeError) as exc:
             raise ControllerError("Model returned an invalid plan") from exc
+
+    def _send_request(self, request_data: dict[str, Any], key: str) -> dict[str, Any]:
+        body = json.dumps(request_data).encode("utf-8")
+        request = urllib.request.Request(
+            self.config.base_url.rstrip("/") + "/chat/completions",
+            data=body,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
+                response_data = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise ControllerError(f"Model request failed: {exc}") from exc
+        if not isinstance(response_data, dict):
+            raise ControllerError("Model returned an invalid response object")
+        return response_data
+
+    def _repair_final_answer(
+        self,
+        original_request: dict[str, Any],
+        invalid_content: str,
+        key: str,
+    ) -> Plan:
+        """Perform one no-tools synthesis retry without re-running completed actions."""
+        messages = list(original_request.get("messages", []))
+        messages.extend([
+            {"role": "assistant", "content": invalid_content},
+            {
+                "role": "user",
+                "content": (
+                    "Protocol correction: tools are unavailable. Do not emit XML, DSML, tool-call "
+                    "tags, JSON tool requests, or describe another command. Using only the existing "
+                    "conversation and tool results, return the best concise natural-language final answer."
+                ),
+            },
+        ])
+        repair_request = {
+            "model": original_request["model"],
+            "messages": messages,
+            "max_tokens": original_request["max_tokens"],
+            "temperature": original_request["temperature"],
+        }
+        if "thinking" in original_request:
+            repair_request["thinking"] = original_request["thinking"]
+        response_data = self._send_request(repair_request, key)
+        try:
+            choice = response_data["choices"][0]
+            message = choice["message"]
+            content = message.get("content")
+            tool_calls = message.get("tool_calls")
+            if isinstance(tool_calls, list) and tool_calls:
+                raise ControllerError("Model protocol repair failed: native tool calls remained")
+            if not isinstance(content, str) or not content.strip() or contains_serialized_tool_call(content):
+                raise ControllerError("Model protocol repair failed: no valid final answer")
+            return Plan(summary=content.strip(), actions=[], done=True)
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ControllerError("Model protocol repair failed: invalid response") from exc
 
     @classmethod
     def _parse_tool_calls(cls, tool_calls: Any) -> list[Action]:

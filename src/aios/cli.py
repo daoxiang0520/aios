@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -168,6 +169,7 @@ def _skill_services(settings: Settings) -> tuple[SkillManager, DockerSandboxBrok
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_windows_stdio()
     args = _parser().parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -393,6 +395,14 @@ def main(argv: list[str] | None = None) -> int:
             _print_json(manager.catalog(capabilities))
         return 0
     return 2
+
+
+def _configure_windows_stdio() -> None:
+    """Keep JSON, Chinese text and trace symbols printable in Windows consoles."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="replace")
 
 
 def _goal_dict(goal: Goal) -> dict[str, Any]:

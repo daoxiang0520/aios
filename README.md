@@ -1,5 +1,9 @@
 # Self-Evolving AIOS v0.6
 
+Current patch release: **v0.6.1**. It adds a single no-tools final-answer repair for
+serialized DSML responses, stops identical full-task retries after a failed repair,
+hardens Skill dispatcher command parsing, and configures Windows CLI output as UTF-8.
+
 > v0.6 将进化面从“增加专用 Tool Schema”迁移为“学习可执行、可测试、可版本化的 Skill”。模型的原生工具面仍固定为 `read / write / edit / bash`。
 
 当前分层为：`Root Capability → Primitive Tool → Skill → Workflow → Harness`。v0.6 实现 Skill 层；Workflow 和 Harness 的自主进化仍是后续版本。

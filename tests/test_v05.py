@@ -182,6 +182,55 @@ class V05Tests(unittest.TestCase):
         protocol_check = next(item for item in verified["checks"] if item["name"] == "no_serialized_tool_protocol")
         self.assertFalse(protocol_check["passed"])
 
+    def test_final_dsml_gets_one_no_tools_synthesis_repair(self) -> None:
+        config = self.settings.model
+        config.provider = "deepseek"
+        config.api_key_env = "TEST_DEEPSEEK_KEY"
+        controller = LLMController(config)
+        payloads = []
+
+        def response(content: str):
+            value = MagicMock()
+            value.read.return_value = json.dumps({
+                "choices": [{"message": {"content": content, "tool_calls": []}, "finish_reason": "stop"}]
+            }).encode("utf-8")
+            value.__enter__.return_value = value
+            return value
+
+        replies = iter([
+            response('<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="bash">'),
+            response("Skill inspection completed; three active skills are available."),
+        ])
+
+        def fake_open(request, timeout):
+            payloads.append(json.loads(request.data.decode("utf-8")))
+            return next(replies)
+
+        context = {"budget": {"remaining_model_calls_after_this": 0, "protocol_repairs_remaining": 1}}
+        with patch.dict(os.environ, {"TEST_DEEPSEEK_KEY": "test-only"}), patch(
+            "urllib.request.urlopen", side_effect=fake_open
+        ):
+            plan = controller.plan(Intent("test", "test", None, []), [], context)
+
+        self.assertTrue(plan.done)
+        self.assertEqual(plan.summary, "Skill inspection completed; three active skills are available.")
+        self.assertEqual(len(payloads), 2)
+        self.assertEqual(payloads[0]["tool_choice"], "none")
+        self.assertNotIn("tools", payloads[1])
+        self.assertNotIn("tool_choice", payloads[1])
+
+    def test_failed_protocol_repair_is_terminal_without_full_task_retries(self) -> None:
+        runtime = AIOSRuntime(self.settings)
+        runtime.controller.plan = Mock(
+            side_effect=ControllerError("Model protocol repair failed: no valid final answer")
+        )
+        runtime.store.add_event(Event("USER_REQUEST", {"message": "test skill"}))
+        runtime.run_once()
+        task = runtime.store.list_tasks()[0]
+        self.assertEqual(task.status, TaskStatus.DEAD_LETTER)
+        self.assertEqual(task.attempts, 1)
+        self.assertEqual(runtime.store.count_pending_events(), 0)
+
     def test_protocol_polluted_success_memory_is_not_retrieved(self) -> None:
         runtime = AIOSRuntime(self.settings)
         runtime.memories.remember(MemoryType.EPISODIC, "bad <｜｜DSML｜｜tool_calls> trace")

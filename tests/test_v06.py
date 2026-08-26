@@ -127,6 +127,23 @@ class V06SkillTests(unittest.TestCase):
         for hidden in ("candidates", "history", "deprecated", "reports"):
             self.assertFalse((manager.runtime / hidden).exists())
 
+    def test_skill_dispatcher_rejects_combined_or_direct_skill_commands(self) -> None:
+        from aios.sandbox import DockerSandboxBroker
+
+        DockerSandboxBroker._validate_command_scope("python /skills/skill.py list")
+        DockerSandboxBroker._validate_command_scope(
+            "python /skills/skill.py run workspace_search --input-json '{\"query\":\"a;b\"}'"
+        )
+        unsafe = (
+            "python /skills/skill.py list; ls /skills/active",
+            "python /skills/skill.py list 2>&1",
+            "cat /skills/active/workspace_search/skill.py",
+            "python -c \"open('/skills/active/workspace_search/skill.py').read()\"",
+        )
+        for command in unsafe:
+            with self.subTest(command=command), self.assertRaises(SandboxPolicyError):
+                DockerSandboxBroker._validate_command_scope(command)
+
     def test_skill_exists_but_is_blocked_without_host_capability(self) -> None:
         manager = SkillManager(self.settings.skills_root, self.settings.skills)
         candidate = manager.propose(

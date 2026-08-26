@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -148,8 +149,36 @@ class DockerSandboxBroker:
 
     @staticmethod
     def _validate_command_scope(command: str) -> None:
-        if "/skills/" in command and "/skills/skill.py" not in command:
-            raise SandboxPolicyError("Skills must be invoked through python /skills/skill.py run")
+        if "/skills" in command:
+            try:
+                lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+                lexer.whitespace_split = True
+                lexer.commenters = ""
+                tokens = list(lexer)
+            except ValueError as exc:
+                raise SandboxPolicyError("Invalid shell quoting in Skill invocation") from exc
+            operators = {token for token in tokens if token and set(token) <= set(";&|<>")}
+            skill_paths = [token for token in tokens if "/skills" in token]
+            if operators or not skill_paths or any(path != "/skills/skill.py" for path in skill_paths):
+                raise SandboxPolicyError(
+                    "Skill commands cannot be combined with shell operators or direct /skills access"
+                )
+            if len(tokens) < 3 or tokens[0] not in {"python", "python3"} or tokens[1] != "/skills/skill.py":
+                raise SandboxPolicyError("Skills must be invoked through python /skills/skill.py")
+            operation = tokens[2]
+            valid = (
+                (operation == "list" and len(tokens) == 3)
+                or (operation == "show" and len(tokens) == 4 and re.fullmatch(r"[a-z][a-z0-9_]{1,63}", tokens[3]))
+                or (operation == "run" and len(tokens) == 4 and re.fullmatch(r"[a-z][a-z0-9_]{1,63}", tokens[3]))
+                or (
+                    operation == "run" and len(tokens) == 6
+                    and re.fullmatch(r"[a-z][a-z0-9_]{1,63}", tokens[3])
+                    and tokens[4] == "--input-json"
+                    and _is_json_object(tokens[5])
+                )
+            )
+            if not valid:
+                raise SandboxPolicyError("Invalid or unsafe Skill dispatcher invocation")
         broad_root_patterns = (
             r"(?:^|[;&|]\s*)cd\s+/(?:\s|[;&|]|$)",
             r"\bfind\s+/(?:\s|$)",
@@ -160,7 +189,6 @@ class DockerSandboxBroker:
             raise SandboxPolicyError(
                 "Broad container-root access is forbidden; inspect /workspace or /aios-state only"
             )
-
     def expose_read_only_state(self, state: dict[str, Any]) -> None:
         if self.session is None:
             raise SandboxUnavailable("No active sandbox session")
@@ -211,3 +239,10 @@ class DockerSandboxBroker:
             if path.is_file():
                 manifest[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
         return manifest
+
+
+def _is_json_object(value: str) -> bool:
+    try:
+        return isinstance(json.loads(value), dict)
+    except (TypeError, json.JSONDecodeError):
+        return False
