@@ -139,6 +139,9 @@ def _parser() -> argparse.ArgumentParser:
     skill_deprecate = skill_commands.add_parser("deprecate")
     skill_deprecate.add_argument("name")
     skill_deprecate.add_argument("--approve", action="store_true")
+    skill_telemetry = skill_commands.add_parser("telemetry")
+    skill_telemetry.add_argument("--name")
+    skill_telemetry.add_argument("--limit", type=int, default=50)
     skill_commands.add_parser("bootstrap")
     return parser
 
@@ -390,6 +393,8 @@ def main(argv: list[str] | None = None) -> int:
             _print_json(manager.rollback(args.name, approved=args.approve))
         elif args.skill_command == "deprecate":
             _print_json(manager.deprecate(args.name, approved=args.approve))
+        elif args.skill_command == "telemetry":
+            _print_json(store.list_skill_usage(limit=args.limit, skill_name=args.name))
         elif args.skill_command == "bootstrap":
             manager.bootstrap_builtins()
             _print_json(manager.catalog(capabilities))

@@ -4,12 +4,14 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 from aios.capabilities import CapabilityRegistry
 from aios.config import Settings, SkillConfig
 from aios.runtime import AIOSRuntime
 from aios.sandbox import SandboxPolicyError
 from aios.skills import SkillManager, SkillPromotionError, SkillValidationError
+from aios.types import Action, Event, Plan, TaskStatus
 
 
 SKILL_SOURCE = '''import argparse,json
@@ -19,7 +21,7 @@ data=json.loads(a.input_json); print(json.dumps({"value":data.get("value","ok")}
 
 
 def manifest(version: str = "1.0.0", capabilities: list[str] | None = None) -> dict:
-    return {
+    value = {
         "name": "sample_skill",
         "version": version,
         "description": "A sandboxed reusable test skill.",
@@ -27,6 +29,15 @@ def manifest(version: str = "1.0.0", capabilities: list[str] | None = None) -> d
         "input_schema": {"type": "object"},
         "tests": [{"input": {"value": "pass"}, "expect_exit": 0, "stdout_contains": "pass"}],
     }
+    if version != "1.0.0":
+        value.update({
+            "parent_version": "1.0.0",
+            "mutation_reason": "Improve the reusable test behavior.",
+            "source_task_ids": [7],
+            "source_trace_ids": [70],
+            "hypothesis": "The mutation should preserve behavior while improving reuse.",
+        })
+    return value
 
 
 class FakeBroker:
@@ -95,10 +106,24 @@ class V06SkillTests(unittest.TestCase):
         manager.benchmark(second["candidate_id"], FakeBroker())
         manager.promote(second["candidate_id"], approved=True)
         self.assertEqual(manager.versions("sample_skill")[0]["version"], "1.1.0")
+        self.assertEqual(manager.versions("sample_skill")[0]["parent_version"], "1.0.0")
+        self.assertEqual(manager.versions("sample_skill")[0]["source_task_ids"], [7])
         self.assertEqual(manager.rollback("sample_skill", approved=True)["version"], "1.0.0")
         self.assertEqual(manager.deprecate("sample_skill", approved=True)["status"], "deprecated")
         self.assertEqual(manager.active_skills(), [])
         self.assertFalse((manager.runtime_active / "sample_skill").exists())
+
+    def test_mutation_requires_explicit_parent_lineage(self) -> None:
+        manager = SkillManager(self.settings.skills_root, self.settings.skills)
+        first = manager.propose(manifest(), SKILL_SOURCE)
+        manager.benchmark(first["candidate_id"], FakeBroker())
+        manager.promote(first["candidate_id"], approved=True)
+        missing_parent = manifest("1.1.0")
+        missing_parent.pop("parent_version")
+        candidate = manager.propose(missing_parent, SKILL_SOURCE.replace('"ok"', '"new"'))
+        manager.benchmark(candidate["candidate_id"], FakeBroker())
+        with self.assertRaises(SkillPromotionError):
+            manager.promote(candidate["candidate_id"], approved=True)
 
     def test_agent_candidate_is_registered_but_not_executed_or_promoted(self) -> None:
         manager = SkillManager(self.settings.skills_root, self.settings.skills)
@@ -118,6 +143,56 @@ class V06SkillTests(unittest.TestCase):
         self.assertEqual(records[0]["manifest"]["origin"], "agent")
         self.assertFalse((manager.active / "sample_skill").exists())
         self.assertFalse((manager.runtime_active / "sample_skill").exists())
+
+    def test_agent_candidate_inherits_source_task_and_trace_lineage(self) -> None:
+        manager = SkillManager(self.settings.skills_root, self.settings.skills)
+        candidate_root = self.settings.workspace / "skill_candidates" / "sample_skill"
+        candidate_root.mkdir(parents=True)
+        (candidate_root / "manifest.json").write_text(json.dumps(manifest()), encoding="utf-8")
+        (candidate_root / "skill.py").write_text(SKILL_SOURCE, encoding="utf-8")
+        records = manager.ingest_workspace_candidates(
+            self.settings.workspace, FakeBroker(), source_task_id=41, source_trace_ids=[401, 402]
+        )
+        lineage = records[0]["manifest"]
+        self.assertEqual(lineage["source_task_ids"], [41])
+        self.assertEqual(lineage["source_trace_ids"], [401, 402])
+
+    def test_runtime_records_standard_skill_telemetry_and_traces(self) -> None:
+        runtime = AIOSRuntime(self.settings)
+        runtime.sandbox.run = Mock(return_value={
+            "exit_code": 0, "stdout": "[]", "stderr": "", "changes": []
+        })
+        runtime.controller.plan = Mock(side_effect=[
+            Plan(
+                "use reusable search",
+                [Action("bash", {
+                    "command": "python /skills/skill.py run workspace_search --input-json '{\"query\":\"needle\"}'"
+                }, call_id="skill_call")],
+                done=False,
+                model_usage={"model_calls": 1, "total_tokens": 100},
+            ),
+            Plan(
+                "No matching files were found.", [], done=True,
+                model_usage={"model_calls": 1, "total_tokens": 50},
+            ),
+        ])
+        runtime.store.add_event(Event("USER_REQUEST", {"message": "inspect files for needle"}))
+        runtime.run_once()
+        task = runtime.store.list_tasks()[0]
+        self.assertEqual(task.status, TaskStatus.COMPLETED)
+        usage = runtime.store.list_skill_usage()
+        self.assertEqual(len(usage), 1)
+        self.assertEqual(usage[0]["skill_name"], "workspace_search")
+        self.assertEqual(usage[0]["skill_version"], "1.0.0")
+        self.assertEqual(usage[0]["input_keys"], ["query"])
+        self.assertEqual(usage[0]["status"], "success")
+        self.assertTrue(usage[0]["verifier_passed"])
+        self.assertEqual(usage[0]["model_calls_before"], 1)
+        self.assertEqual(usage[0]["model_calls_after"], 2)
+        self.assertEqual(usage[0]["tokens_before"], 100)
+        self.assertEqual(usage[0]["tokens_after"], 150)
+        kinds = {item["kind"] for item in runtime.store.recent_traces(limit=50)}
+        self.assertTrue({"SKILL_INVOKE", "SKILL_CAPABILITY_CHECK", "SKILL_RESULT"} <= kinds)
 
     def test_runtime_projection_does_not_expose_lifecycle_directories(self) -> None:
         manager = SkillManager(self.settings.skills_root, self.settings.skills)

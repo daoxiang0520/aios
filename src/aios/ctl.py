@@ -13,7 +13,7 @@ from .storage import StateStore
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="aiosctl", description="Read-only AIOS state interface")
     parser.add_argument("--config", default="config.json")
-    parser.add_argument("resource", choices=["tasks", "traces", "dead-letters", "memory", "capabilities"])
+    parser.add_argument("resource", choices=["tasks", "traces", "dead-letters", "memory", "skill-usage", "capabilities"])
     parser.add_argument("action", choices=["list", "show"], nargs="?", default="list")
     parser.add_argument("--limit", type=int, default=50)
     args = parser.parse_args(argv)
@@ -28,6 +28,8 @@ def main(argv: list[str] | None = None) -> int:
         payload = store.list_dead_letters(limit=args.limit)
     elif args.resource == "memory":
         payload = [asdict(item) for item in store.list_memories(limit=args.limit)]
+    elif args.resource == "skill-usage":
+        payload = store.list_skill_usage(limit=args.limit)
     else:
         sandbox = DockerSandboxBroker(settings.sandbox_root, settings.sandbox)
         payload = CapabilityRegistry.default(

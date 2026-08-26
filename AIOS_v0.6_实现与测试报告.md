@@ -1,5 +1,16 @@
 # AIOS v0.6 实现与测试报告
 
+## v0.6.2 Skill Telemetry + Lineage
+
+- 新增 `skill_usage` 持久表，记录 Skill/版本、任务、轮次、调用顺序、耗时、退出码、Capability 评估、Verifier 结果和任务结果。
+- 为避免将用户输入复制到长期遥测中，只记录规范化输入 SHA-256 与字段名，不保存原始 Skill 输入。
+- 每次调用统一产生 `SKILL_INVOKE`、`SKILL_CAPABILITY_CHECK`、`SKILL_RESULT` 三类 Trace。
+- 新增 `aios skill telemetry` 与 `aiosctl skill-usage list` 查询入口，同时将最近遥测暴露为沙盒只读状态。
+- Manifest 新增 `parent_version`、`mutation_reason`、`source_task_ids`、`source_trace_ids`、`hypothesis`、`benchmark_delta` Lineage 字段。
+- 现有 Skill 的新版本在 Promote 前必须显式指向当前 Active 版本，防止无来源替换。
+- Agent 生成的候选在未显式填写时，会自动继承来源 Task ID 和当前 Cycle Trace IDs。
+- `state_query` 升级到 1.1.0，可查询 `skill-usage`。
+
 ## v0.6.1 协议与边界修复
 
 - 最终轮收到序列化 DSML 时，只进行一次不带 Tools 的最终答案修复，不重跑已执行动作。
@@ -36,9 +47,9 @@ Root Capability → Primitive Tool → Skill → Workflow → Harness
 ## 验收结果
 
 - Python 源码与测试编译检查通过。
-- 在真实目标仓库中共 47 项单元/集成测试全部通过，无跳过。
+- 在真实目标仓库中共 53 项单元/集成测试全部通过，无跳过。
 - Docker Engine 可用，真实通过了只读 Skill Dispatcher、`workspace_search` 执行和直接源文件调用拒绝测试。
-- 测试覆盖：四原语不增殖、Manifest 验证、确定性候选、Benchmark 门、人工晋升门、单调版本、回滚、废弃、权限交集、Agent 候选注册、Runtime 目录隔离和旧版回归。
+- 测试覆盖：四原语不增殖、Manifest 与 Lineage 验证、确定性候选、Benchmark 门、人工晋升门、单调版本、回滚、废弃、权限交集、Agent 候选注册、Skill 遥测与标准 Trace、模型调用/token 计数、Runtime 目录隔离和旧版回归。
 
 ## 边界与后续
 

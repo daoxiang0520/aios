@@ -146,6 +146,7 @@ class CapabilityRegistry:
                 Capability("state.trace_read", CapabilityState.COMPOSABLE, "python /aios-state/aiosctl.py traces", "Read-only snapshot"),
                 Capability("state.dead_letter_read", CapabilityState.COMPOSABLE, "python /aios-state/aiosctl.py dead-letters", "Read-only snapshot"),
                 Capability("state.memory_read", CapabilityState.COMPOSABLE, "python /aios-state/aiosctl.py memory", "Read-only snapshot"),
+                Capability("state.skill_usage_read", CapabilityState.COMPOSABLE, "python /aios-state/aiosctl.py skill-usage", "Read-only Skill telemetry snapshot"),
                 Capability("credentials.agent_visible", CapabilityState.FORBIDDEN, "credential broker", "Secrets never enter sandbox"),
                 Capability("deployment.production_promote", CapabilityState.NEEDS_AUTHORITY, "host promotion", "Host approval required"),
             ]

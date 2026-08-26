@@ -90,6 +90,7 @@ class Plan:
     actions: list[Action]
     done: bool = False
     protocol_message: dict[str, Any] | None = None
+    model_usage: dict[str, int] | None = None
 
 
 @dataclass(slots=True)

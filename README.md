@@ -1,8 +1,9 @@
 # Self-Evolving AIOS v0.6
 
-Current patch release: **v0.6.1**. It adds a single no-tools final-answer repair for
-serialized DSML responses, stops identical full-task retries after a failed repair,
-hardens Skill dispatcher command parsing, and configures Windows CLI output as UTF-8.
+Current release: **v0.6.2**. In addition to the v0.6.1 protocol and boundary fixes,
+it records standardized Skill invocation telemetry and evolutionary lineage. These
+records are the data foundation for replay benchmarks, utility scoring, experience
+analysis, mutation, selection, and quarantine in later v0.6 releases.
 
 > v0.6 将进化面从“增加专用 Tool Schema”迁移为“学习可执行、可测试、可版本化的 Skill”。模型的原生工具面仍固定为 `read / write / edit / bash`。
 
@@ -71,7 +72,18 @@ python -m aios --config config.json skill promote <candidate_id> --approve
 python -m aios --config config.json skill versions <name>
 python -m aios --config config.json skill rollback <name> --approve
 python -m aios --config config.json skill deprecate <name> --approve
+python -m aios --config config.json skill telemetry --limit 50
+python -m aios --config config.json skill telemetry --name workspace_search --limit 20
 ```
+
+Each `skill run` produces `SKILL_INVOKE`, `SKILL_CAPABILITY_CHECK`, and
+`SKILL_RESULT` traces plus a durable `skill_usage` row. Telemetry stores an input
+digest and input field names rather than the raw input payload. Query the same
+read-only data with `aiosctl --config config.json skill-usage list`.
+
+Skill manifests can declare `parent_version`, `mutation_reason`, `source_task_ids`,
+`source_trace_ids`, `hypothesis`, and `benchmark_delta`. Promoting a new version of
+an existing Skill requires its `parent_version` to match the active version.
 
 Skill 不会产生权限。有效权限始终是 `Manifest 声明能力 ∩ Host 已授予能力`；例如声明 `network.external` 的 Skill 在默认配置下仍是 `needs_authority`。
 

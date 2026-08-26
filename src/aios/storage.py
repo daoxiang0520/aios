@@ -143,6 +143,36 @@ CREATE TABLE IF NOT EXISTS evolution_runs (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_evolution_runs_status ON evolution_runs(status, id DESC);
+
+CREATE TABLE IF NOT EXISTS skill_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    invocation_id TEXT NOT NULL UNIQUE,
+    cycle_id TEXT NOT NULL,
+    task_id INTEGER,
+    model_round INTEGER NOT NULL,
+    sequence_index INTEGER NOT NULL,
+    model_calls_before INTEGER NOT NULL DEFAULT 0,
+    model_calls_after INTEGER,
+    tokens_before INTEGER NOT NULL DEFAULT 0,
+    tokens_after INTEGER,
+    skill_name TEXT NOT NULL,
+    skill_version TEXT NOT NULL,
+    status TEXT NOT NULL,
+    input_digest TEXT NOT NULL,
+    input_keys TEXT NOT NULL DEFAULT '[]',
+    required_capabilities TEXT NOT NULL DEFAULT '[]',
+    capability_assessment TEXT NOT NULL DEFAULT '{}',
+    duration_ms REAL NOT NULL DEFAULT 0,
+    exit_code INTEGER,
+    fallback_used INTEGER NOT NULL DEFAULT 0,
+    verifier_passed INTEGER,
+    task_outcome TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+CREATE INDEX IF NOT EXISTS idx_skill_usage_name ON skill_usage(skill_name, id DESC);
+CREATE INDEX IF NOT EXISTS idx_skill_usage_task ON skill_usage(task_id, id ASC);
+CREATE INDEX IF NOT EXISTS idx_skill_usage_cycle ON skill_usage(cycle_id, id ASC);
 """
 
 
@@ -274,6 +304,79 @@ class StateStore:
                 "kind": row["kind"],
                 "data": json.loads(row["data"]),
                 "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    def add_skill_usage(self, record: dict[str, Any]) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """INSERT INTO skill_usage(
+                       invocation_id,cycle_id,task_id,model_round,sequence_index,
+                       model_calls_before,tokens_before,
+                       skill_name,skill_version,status,input_digest,input_keys,
+                       required_capabilities,capability_assessment,duration_ms,
+                       exit_code,fallback_used
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    record["invocation_id"], record["cycle_id"], record.get("task_id"),
+                    int(record["model_round"]), int(record["sequence_index"]),
+                    int(record.get("model_calls_before", 0)), int(record.get("tokens_before", 0)),
+                    record["skill_name"], record["skill_version"], record["status"],
+                    record["input_digest"], json.dumps(record.get("input_keys", []), ensure_ascii=False),
+                    json.dumps(record.get("required_capabilities", []), ensure_ascii=False),
+                    json.dumps(record.get("capability_assessment", {}), ensure_ascii=False, default=str),
+                    float(record.get("duration_ms", 0)), record.get("exit_code"),
+                    int(bool(record.get("fallback_used", False))),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def finalize_skill_usage(
+        self,
+        cycle_id: str,
+        *,
+        verifier_passed: bool,
+        task_outcome: str,
+        model_calls_after: int | None = None,
+        tokens_after: int | None = None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """UPDATE skill_usage
+                   SET verifier_passed=?,task_outcome=?,model_calls_after=?,tokens_after=?
+                   WHERE cycle_id=? AND verifier_passed IS NULL""",
+                (int(verifier_passed), task_outcome, model_calls_after, tokens_after, cycle_id),
+            )
+
+    def list_skill_usage(self, limit: int = 50, skill_name: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM skill_usage"
+        params: tuple[Any, ...]
+        if skill_name:
+            query += " WHERE skill_name=?"
+            params = (skill_name, limit)
+        else:
+            params = (limit,)
+        query += " ORDER BY id DESC LIMIT ?"
+        with self.connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [
+            {
+                "id": row["id"], "invocation_id": row["invocation_id"],
+                "cycle_id": row["cycle_id"], "task_id": row["task_id"],
+                "model_round": row["model_round"], "sequence_index": row["sequence_index"],
+                "model_calls_before": row["model_calls_before"],
+                "model_calls_after": row["model_calls_after"],
+                "tokens_before": row["tokens_before"], "tokens_after": row["tokens_after"],
+                "skill_name": row["skill_name"], "skill_version": row["skill_version"],
+                "status": row["status"], "input_digest": row["input_digest"],
+                "input_keys": json.loads(row["input_keys"]),
+                "required_capabilities": json.loads(row["required_capabilities"]),
+                "capability_assessment": json.loads(row["capability_assessment"]),
+                "duration_ms": row["duration_ms"], "exit_code": row["exit_code"],
+                "fallback_used": bool(row["fallback_used"]),
+                "verifier_passed": None if row["verifier_passed"] is None else bool(row["verifier_passed"]),
+                "task_outcome": row["task_outcome"], "created_at": row["created_at"],
             }
             for row in rows
         ]

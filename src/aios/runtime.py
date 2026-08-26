@@ -15,7 +15,7 @@ from .goals import GoalManager, IntentArbiter
 from .memory import ContextComposer, MemoryManager
 from .plugins import PluginManager
 from .security import SecurityKernel
-from .sandbox import DockerSandboxBroker
+from .sandbox import DockerSandboxBroker, SandboxPolicyError
 from .skills import SkillManager
 from .storage import StateStore
 from .tools import ToolExecutor, ToolRegistry
@@ -71,6 +71,8 @@ class AIOSRuntime:
         LOGGER.info("AIOS stopped")
 
     def run_once(self) -> bool:
+        model_calls_used = 0
+        model_tokens_total = 0
         events = self.store.claim_events(limit=1)
         if not events:
             return False
@@ -113,6 +115,7 @@ class AIOSRuntime:
                 "traces": self.store.recent_traces(limit=100),
                 "dead-letters": self.store.list_dead_letters(limit=100),
                 "memory": [asdict(item) for item in self.store.list_memories(limit=100)],
+                "skill-usage": self.store.list_skill_usage(limit=100),
                 "capabilities": self.capabilities.as_dict(),
                 "skills": self.skills.catalog(self.capabilities) if self.settings.skills.enabled else [],
             })
@@ -142,6 +145,7 @@ class AIOSRuntime:
             model_round_cap = max(1, self.settings.budget.max_model_calls_per_cycle)
             all_actions = []
             all_results = []
+            skill_sequence = 0
             rounds = []
             observations = []
             protocol_messages = []
@@ -182,6 +186,9 @@ class AIOSRuntime:
                 }
                 context["_protocol_messages"] = protocol_messages
                 plan = self.controller.plan(intent, active_goals, context)
+                model_usage = plan.model_usage or {}
+                model_calls_used += int(model_usage.get("model_calls", 1))
+                model_tokens_total += int(model_usage.get("total_tokens", 0))
                 if plan.protocol_message:
                     protocol_messages.append(plan.protocol_message)
                 final_summary = plan.summary
@@ -205,12 +212,84 @@ class AIOSRuntime:
 
                 round_results = []
                 for action in actions:
+                    skill_invocation = None
+                    if action.tool == "bash" and isinstance(action.arguments.get("command"), str):
+                        try:
+                            described = self.sandbox.describe_skill_invocation(action.arguments["command"])
+                        except SandboxPolicyError:
+                            described = None
+                        if described is not None:
+                            skill_sequence += 1
+                            invocation_id = uuid.uuid4().hex
+                            catalog_entry = next(
+                                (
+                                    item for item in self.skills.catalog(self.capabilities)
+                                    if item["name"] == described["name"]
+                                ),
+                                None,
+                            )
+                            capability_assessment = (
+                                catalog_entry["capability_assessment"] if catalog_entry is not None
+                                else {"satisfied": False, "blocking": [{"name": "skill.manifest", "state": "missing"}], "needs_authority": []}
+                            )
+                            skill_invocation = {
+                                "invocation_id": invocation_id,
+                                "cycle_id": cycle_id,
+                                "task_id": int(task.id),
+                                "model_round": round_number,
+                                "sequence_index": skill_sequence,
+                                "skill_name": described["name"],
+                                "skill_version": described["version"],
+                                "input_digest": described["input_digest"],
+                                "input_keys": described["input_keys"],
+                                "required_capabilities": described["required_capabilities"],
+                                "capability_assessment": capability_assessment,
+                                "fallback_used": False,
+                                "model_calls_before": model_calls_used,
+                                "tokens_before": model_tokens_total,
+                            }
+                            self.store.trace(cycle_id, "SKILL_INVOKE", {
+                                key: value for key, value in skill_invocation.items()
+                                if key not in {"capability_assessment"}
+                            })
+                            self.store.trace(cycle_id, "SKILL_CAPABILITY_CHECK", {
+                                "invocation_id": invocation_id,
+                                "skill_name": described["name"],
+                                "skill_version": described["version"],
+                                "assessment": capability_assessment,
+                            })
                     result = self.executor.execute(action)
                     all_actions.append(action)
                     all_results.append(result)
                     round_results.append(result)
                     result_data = {"round": round_number, **asdict(result)}
                     self.store.trace(cycle_id, "action_result", result_data)
+                    if skill_invocation is not None:
+                        output = result.output if isinstance(result.output, dict) else {}
+                        exit_code = output.get("exit_code")
+                        assessment = skill_invocation["capability_assessment"]
+                        if result.ok:
+                            skill_status = "success"
+                        elif not assessment.get("satisfied", False):
+                            skill_status = "blocked_capability"
+                        else:
+                            skill_status = "failed"
+                        usage = {
+                            **skill_invocation,
+                            "status": skill_status,
+                            "duration_ms": result.duration_ms,
+                            "exit_code": exit_code,
+                        }
+                        usage_id = self.store.add_skill_usage(usage)
+                        self.store.trace(cycle_id, "SKILL_RESULT", {
+                            "usage_id": usage_id,
+                            "invocation_id": usage["invocation_id"],
+                            "skill_name": usage["skill_name"],
+                            "skill_version": usage["skill_version"],
+                            "status": skill_status,
+                            "duration_ms": result.duration_ms,
+                            "exit_code": exit_code,
+                        })
                     if action.call_id:
                         protocol_messages.append(
                             {
@@ -274,9 +353,18 @@ class AIOSRuntime:
                 final_output=final_output,
             )
             ok = bool(verification["passed"])
+            self.store.finalize_skill_usage(
+                cycle_id,
+                verifier_passed=ok,
+                task_outcome=str(verification.get("outcome", "unknown")),
+                model_calls_after=model_calls_used,
+                tokens_after=model_tokens_total,
+            )
             evidence = {
                 "success": ok,
                 "model_rounds": len(rounds),
+                "model_api_calls": model_calls_used,
+                "model_tokens": model_tokens_total,
                 "planned_actions": planned_count,
                 "executed_actions": len(all_results),
                 "failed_actions": sum(not result.ok for result in all_results),
@@ -299,7 +387,15 @@ class AIOSRuntime:
                 task_result["committed_files"] = committed
                 task_result["final_output"] = self._published_output(final_output, snapshot)
                 skill_candidates = (
-                    self.skills.ingest_workspace_candidates(self.settings.workspace, self.sandbox)
+                    self.skills.ingest_workspace_candidates(
+                        self.settings.workspace,
+                        self.sandbox,
+                        source_task_id=int(task.id),
+                        source_trace_ids=[
+                            item["id"] for item in self.store.recent_traces(limit=500)
+                            if item["cycle_id"] == cycle_id
+                        ],
+                    )
                     if self.settings.skills.enabled else []
                 )
                 if skill_candidates:
@@ -332,7 +428,11 @@ class AIOSRuntime:
                         check["name"] for check in verification["checks"] if not check["passed"]
                     ]
                     error = "Verification failed: " + ", ".join(failed_checks)
-                self._handle_failure(task, event, event_ids, error, cycle_id, task_result)
+                self._handle_failure(
+                    task, event, event_ids, error, cycle_id, task_result,
+                    model_calls_after=model_calls_used,
+                    tokens_after=model_tokens_total,
+                )
             return True
         except ControllerError as exc:
             self.sandbox.discard()
@@ -342,7 +442,11 @@ class AIOSRuntime:
             if task is None:
                 self.store.finish_events(event_ids, error=error)
             else:
-                self._handle_failure(task, event, event_ids, error, cycle_id)
+                self._handle_failure(
+                    task, event, event_ids, error, cycle_id,
+                    model_calls_after=model_calls_used,
+                    tokens_after=model_tokens_total,
+                )
             return True
         except Exception as exc:
             self.sandbox.discard()
@@ -352,7 +456,11 @@ class AIOSRuntime:
             if task is None:
                 self.store.finish_events(event_ids, error=error)
             else:
-                self._handle_failure(task, event, event_ids, error, cycle_id)
+                self._handle_failure(
+                    task, event, event_ids, error, cycle_id,
+                    model_calls_after=model_calls_used,
+                    tokens_after=model_tokens_total,
+                )
             return True
 
     @staticmethod
@@ -435,8 +543,17 @@ class AIOSRuntime:
         error: str,
         cycle_id: str,
         result: dict | None = None,
+        model_calls_after: int | None = None,
+        tokens_after: int | None = None,
     ) -> None:
         task_id = int(task.id)
+        self.store.finalize_skill_usage(
+            cycle_id,
+            verifier_passed=False,
+            task_outcome="failed_attempt",
+            model_calls_after=model_calls_after,
+            tokens_after=tokens_after,
+        )
         self.store.finish_events(event_ids, error=error)
         self.store.add_checkpoint(task_id, "failed_attempt", {"error": error, "cycle_id": cycle_id})
         evolution_result = self.evolution.observe_failure(task, error, result)

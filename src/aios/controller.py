@@ -105,6 +105,25 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 TOOL_SCHEMAS = CORE_TOOL_SCHEMAS
 
 
+def _normalized_usage(value: Any) -> dict[str, int]:
+    result: dict[str, int] = {"model_calls": 1}
+    if not isinstance(value, dict):
+        return result
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        item = value.get(key)
+        if isinstance(item, int) and item >= 0:
+            result[key] = item
+    return result
+
+
+def _merge_usage(*values: dict[str, int]) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for value in values:
+        for key, item in value.items():
+            result[key] = result.get(key, 0) + item
+    return result
+
+
 class ControllerError(RuntimeError):
     pass
 
@@ -207,6 +226,7 @@ class LLMController:
             thinking = self.config.thinking if self.config.thinking in {"enabled", "disabled"} else "disabled"
             request_data["thinking"] = {"type": thinking}
         response_data = self._send_request(request_data, key)
+        model_usage = _normalized_usage(response_data.get("usage"))
         try:
             choice = response_data["choices"][0]
             message = choice["message"]
@@ -227,13 +247,16 @@ class LLMController:
                     actions=actions,
                     done=False,
                     protocol_message=protocol_message,
+                    model_usage=model_usage,
                 )
             if use_tool_calling and isinstance(content, str) and content.strip():
                 if contains_serialized_tool_call(content):
                     budget = (context or {}).get("budget", {})
                     repairs = int(budget.get("protocol_repairs_remaining", 0))
                     if force_final and repairs > 0:
-                        return self._repair_final_answer(request_data, content, key)
+                        return self._repair_final_answer(
+                            request_data, content, key, initial_usage=model_usage
+                        )
                     raise ControllerError(
                         "Model emitted serialized tool-call markup instead of a native tool call or final answer"
                     )
@@ -241,9 +264,12 @@ class LLMController:
                     summary=content.strip(),
                     actions=[],
                     done=True,
+                    model_usage=model_usage,
                 )
             try:
-                return self._parse_plan_content(content)
+                plan = self._parse_plan_content(content)
+                plan.model_usage = model_usage
+                return plan
             except ControllerError as exc:
                 content_chars = len(content) if isinstance(content, str) else 0
                 finish_reason = choice.get("finish_reason", "unknown")
@@ -276,6 +302,7 @@ class LLMController:
         original_request: dict[str, Any],
         invalid_content: str,
         key: str,
+        initial_usage: dict[str, int],
     ) -> Plan:
         """Perform one no-tools synthesis retry without re-running completed actions."""
         messages = list(original_request.get("messages", []))
@@ -299,6 +326,7 @@ class LLMController:
         if "thinking" in original_request:
             repair_request["thinking"] = original_request["thinking"]
         response_data = self._send_request(repair_request, key)
+        combined_usage = _merge_usage(initial_usage, _normalized_usage(response_data.get("usage")))
         try:
             choice = response_data["choices"][0]
             message = choice["message"]
@@ -308,7 +336,10 @@ class LLMController:
                 raise ControllerError("Model protocol repair failed: native tool calls remained")
             if not isinstance(content, str) or not content.strip() or contains_serialized_tool_call(content):
                 raise ControllerError("Model protocol repair failed: no valid final answer")
-            return Plan(summary=content.strip(), actions=[], done=True)
+            return Plan(
+                summary=content.strip(), actions=[], done=True,
+                model_usage=combined_usage,
+            )
         except (KeyError, IndexError, TypeError) as exc:
             raise ControllerError("Model protocol repair failed: invalid response") from exc
 

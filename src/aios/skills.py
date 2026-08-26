@@ -32,6 +32,12 @@ class SkillManifest:
     input_schema: dict[str, Any] = field(default_factory=lambda: {"type": "object"})
     tests: list[dict[str, Any]] = field(default_factory=list)
     origin: str = "user"
+    parent_version: str | None = None
+    mutation_reason: str | None = None
+    source_task_ids: list[int] = field(default_factory=list)
+    source_trace_ids: list[int] = field(default_factory=list)
+    hypothesis: str | None = None
+    benchmark_delta: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "SkillManifest":
@@ -44,6 +50,12 @@ class SkillManifest:
             input_schema=dict(value.get("input_schema") or {"type": "object"}),
             tests=[dict(item) for item in value.get("tests", []) if isinstance(item, dict)],
             origin=str(value.get("origin", "user")),
+            parent_version=str(value["parent_version"]) if value.get("parent_version") is not None else None,
+            mutation_reason=str(value["mutation_reason"]) if value.get("mutation_reason") is not None else None,
+            source_task_ids=[int(item) for item in value.get("source_task_ids", [])],
+            source_trace_ids=[int(item) for item in value.get("source_trace_ids", [])],
+            hypothesis=str(value["hypothesis"]) if value.get("hypothesis") is not None else None,
+            benchmark_delta=dict(value.get("benchmark_delta") or {}),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -56,6 +68,7 @@ class SkillManager:
     SAFE_CAPABILITIES = {
         "filesystem.read", "filesystem.write", "process.sandbox_exec",
         "state.task_read", "state.trace_read", "state.dead_letter_read", "state.memory_read",
+        "state.skill_usage_read",
         "network.external",
     }
 
@@ -83,6 +96,8 @@ class SkillManager:
             raise SkillValidationError("Skill name must be lowercase snake_case")
         if not re.fullmatch(r"\d+\.\d+\.\d+", manifest.version):
             raise SkillValidationError("Skill version must use MAJOR.MINOR.PATCH")
+        if manifest.parent_version is not None and not re.fullmatch(r"\d+\.\d+\.\d+", manifest.parent_version):
+            raise SkillValidationError("Skill parent_version must use MAJOR.MINOR.PATCH")
         if not manifest.description or len(manifest.description) > 500:
             raise SkillValidationError("Skill description is required and limited to 500 characters")
         if manifest.entrypoint != "skill.py":
@@ -105,6 +120,11 @@ class SkillManager:
                 raise SkillValidationError("Each skill test input must be an object")
             if not isinstance(test.get("expect_exit", 0), int):
                 raise SkillValidationError("expect_exit must be an integer")
+        if any(item <= 0 for item in manifest.source_task_ids + manifest.source_trace_ids):
+            raise SkillValidationError("Skill lineage source IDs must be positive integers")
+        for text, label in ((manifest.mutation_reason, "mutation_reason"), (manifest.hypothesis, "hypothesis")):
+            if text is not None and (not text.strip() or len(text) > 1000):
+                raise SkillValidationError(f"Skill {label} must be non-empty and limited to 1000 characters")
         return manifest
 
     def propose(self, manifest_value: dict[str, Any], source: str) -> dict[str, Any]:
@@ -121,6 +141,9 @@ class SkillManager:
         self,
         workspace: Path,
         broker: DockerSandboxBroker,
+        *,
+        source_task_id: int | None = None,
+        source_trace_ids: list[int] | None = None,
     ) -> list[dict[str, Any]]:
         """Register Agent-authored packages after the task workspace is committed."""
         root = workspace.resolve() / "skill_candidates"
@@ -131,6 +154,10 @@ class SkillManager:
             try:
                 value = json.loads(manifest_path.read_text(encoding="utf-8"))
                 value["origin"] = "agent"
+                if source_task_id is not None and not value.get("source_task_ids"):
+                    value["source_task_ids"] = [source_task_id]
+                if source_trace_ids and not value.get("source_trace_ids"):
+                    value["source_trace_ids"] = source_trace_ids
                 source_path = manifest_path.parent / str(value.get("entrypoint", "skill.py"))
                 proposal = self.propose(value, source_path.read_text(encoding="utf-8"))
                 record: dict[str, Any] = proposal
@@ -184,6 +211,10 @@ class SkillManager:
                 raise SkillPromotionError(
                     f"Promotion requires a newer version than active {old_manifest.version}"
                 )
+            if manifest.parent_version != old_manifest.version:
+                raise SkillPromotionError(
+                    f"Mutation must declare parent_version={old_manifest.version}"
+                )
             archive = self.history / manifest.name / old_manifest.version
             if archive.exists():
                 shutil.rmtree(archive)
@@ -191,7 +222,17 @@ class SkillManager:
             shutil.move(str(destination), str(archive))
         shutil.copytree(package, destination)
         self._sync_runtime_skill(manifest.name)
-        return {"name": manifest.name, "version": manifest.version, "status": "active"}
+        return {
+            "name": manifest.name, "version": manifest.version, "status": "active",
+            "lineage": {
+                "parent_version": manifest.parent_version,
+                "mutation_reason": manifest.mutation_reason,
+                "source_task_ids": manifest.source_task_ids,
+                "source_trace_ids": manifest.source_trace_ids,
+                "hypothesis": manifest.hypothesis,
+                "benchmark_delta": manifest.benchmark_delta,
+            },
+        }
 
     def rollback(self, name: str, *, approved: bool) -> dict[str, Any]:
         if self.config.require_human_promotion and not approved:
@@ -284,6 +325,16 @@ class SkillManager:
             if not destination.exists():
                 destination.mkdir(parents=True)
                 self._write_package(destination, manifest, source)
+            else:
+                current = self._load_manifest(destination)
+                if _version_key(manifest.version) > _version_key(current.version):
+                    archive = self.history / manifest.name / current.version
+                    archive.parent.mkdir(parents=True, exist_ok=True)
+                    if archive.exists():
+                        shutil.rmtree(archive)
+                    shutil.move(str(destination), str(archive))
+                    destination.mkdir(parents=True)
+                    self._write_package(destination, manifest, source)
             self._sync_runtime_skill(manifest.name)
 
     def _candidate(self, candidate_id: str) -> tuple[Path, SkillManifest, str]:
@@ -414,27 +465,30 @@ print(json.dumps({"trace_count":len(traces),"trace_kinds":dict(kinds),"failed_to
 
 def _state_query_builtin() -> tuple[dict[str, Any], str]:
     manifest = {
-        "name": "state_query", "version": "1.0.0",
+        "name": "state_query", "version": "1.1.0",
         "description": "Query tasks, traces, dead letters, or memory through one reusable Skill.",
         "required_capabilities": [
             "state.task_read", "state.trace_read", "state.dead_letter_read",
-            "state.memory_read", "process.sandbox_exec",
+            "state.memory_read", "state.skill_usage_read", "process.sandbox_exec",
         ],
         "input_schema": {
             "type": "object",
             "properties": {
-                "resource": {"type": "string", "enum": ["tasks", "traces", "dead-letters", "memory"]},
+                "resource": {"type": "string", "enum": ["tasks", "traces", "dead-letters", "memory", "skill-usage"]},
                 "limit": {"type": "integer"},
             },
             "required": ["resource"],
         },
         "tests": [{"input": {"resource": "tasks", "limit": 1}, "expect_exit": 0, "stdout_contains": "[]"}],
         "origin": "builtin",
+        "parent_version": "1.0.0",
+        "mutation_reason": "Expose standardized Skill usage telemetry to sandboxed analysis.",
+        "hypothesis": "Queryable invocation history enables later experience analysis and utility scoring.",
     }
     source = '''import argparse,json
 from pathlib import Path
 p=argparse.ArgumentParser(); p.add_argument("--input-json",default="{}"); a=p.parse_args(); inp=json.loads(a.input_json)
-resource=str(inp.get("resource","")); allowed={"tasks","traces","dead-letters","memory"}
+resource=str(inp.get("resource","")); allowed={"tasks","traces","dead-letters","memory","skill-usage"}
 if resource not in allowed: print(json.dumps({"error":"invalid resource"})); raise SystemExit(2)
 limit=max(1,min(int(inp.get("limit",20)),500)); state=json.loads(Path("/aios-state/state.json").read_text(encoding="utf-8"))
 print(json.dumps(state.get(resource,[])[:limit],ensure_ascii=False))

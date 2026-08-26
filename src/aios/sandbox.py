@@ -58,6 +58,35 @@ class DockerSandboxBroker:
             return False
         return result.returncode == 0
 
+    def describe_skill_invocation(self, command: str) -> dict[str, Any] | None:
+        parsed = _parse_skill_command(command)
+        if parsed is None or parsed["operation"] != "run" or self.skills_root is None:
+            return None
+        payload = parsed.get("input", {})
+        canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        input_metadata = {
+            "input_digest": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+            "input_keys": sorted(str(key) for key in payload),
+        }
+        package = self.skills_root / "active" / parsed["name"]
+        manifest_path = package / "manifest.json"
+        if not manifest_path.is_file():
+            return {
+                **parsed,
+                "version": "unknown",
+                "required_capabilities": [],
+                "manifest_found": False,
+                **input_metadata,
+            }
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return {
+            **parsed,
+            "version": str(manifest.get("version", "unknown")),
+            "required_capabilities": [str(item) for item in manifest.get("required_capabilities", [])],
+            **input_metadata,
+            "manifest_found": True,
+        }
+
     def prepare(self, task_id: int, workspace: Path) -> Path:
         session_root = (self.root / f"task_{task_id}").resolve()
         if session_root.parent != self.root:
@@ -149,36 +178,7 @@ class DockerSandboxBroker:
 
     @staticmethod
     def _validate_command_scope(command: str) -> None:
-        if "/skills" in command:
-            try:
-                lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
-                lexer.whitespace_split = True
-                lexer.commenters = ""
-                tokens = list(lexer)
-            except ValueError as exc:
-                raise SandboxPolicyError("Invalid shell quoting in Skill invocation") from exc
-            operators = {token for token in tokens if token and set(token) <= set(";&|<>")}
-            skill_paths = [token for token in tokens if "/skills" in token]
-            if operators or not skill_paths or any(path != "/skills/skill.py" for path in skill_paths):
-                raise SandboxPolicyError(
-                    "Skill commands cannot be combined with shell operators or direct /skills access"
-                )
-            if len(tokens) < 3 or tokens[0] not in {"python", "python3"} or tokens[1] != "/skills/skill.py":
-                raise SandboxPolicyError("Skills must be invoked through python /skills/skill.py")
-            operation = tokens[2]
-            valid = (
-                (operation == "list" and len(tokens) == 3)
-                or (operation == "show" and len(tokens) == 4 and re.fullmatch(r"[a-z][a-z0-9_]{1,63}", tokens[3]))
-                or (operation == "run" and len(tokens) == 4 and re.fullmatch(r"[a-z][a-z0-9_]{1,63}", tokens[3]))
-                or (
-                    operation == "run" and len(tokens) == 6
-                    and re.fullmatch(r"[a-z][a-z0-9_]{1,63}", tokens[3])
-                    and tokens[4] == "--input-json"
-                    and _is_json_object(tokens[5])
-                )
-            )
-            if not valid:
-                raise SandboxPolicyError("Invalid or unsafe Skill dispatcher invocation")
+        _parse_skill_command(command)
         broad_root_patterns = (
             r"(?:^|[;&|]\s*)cd\s+/(?:\s|[;&|]|$)",
             r"\bfind\s+/(?:\s|$)",
@@ -246,3 +246,38 @@ def _is_json_object(value: str) -> bool:
         return isinstance(json.loads(value), dict)
     except (TypeError, json.JSONDecodeError):
         return False
+
+
+def _parse_skill_command(command: str) -> dict[str, Any] | None:
+    if "/skills" not in command:
+        return None
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError as exc:
+        raise SandboxPolicyError("Invalid shell quoting in Skill invocation") from exc
+    operators = {token for token in tokens if token and set(token) <= set(";&|<>")}
+    skill_paths = [token for token in tokens if "/skills" in token]
+    if operators or not skill_paths or any(path != "/skills/skill.py" for path in skill_paths):
+        raise SandboxPolicyError(
+            "Skill commands cannot be combined with shell operators or direct /skills access"
+        )
+    if len(tokens) < 3 or tokens[0] not in {"python", "python3"} or tokens[1] != "/skills/skill.py":
+        raise SandboxPolicyError("Skills must be invoked through python /skills/skill.py")
+    operation = tokens[2]
+    name = tokens[3] if len(tokens) >= 4 else None
+    payload: dict[str, Any] = {}
+    valid = operation == "list" and len(tokens) == 3
+    if operation == "show" and len(tokens) == 4 and isinstance(name, str):
+        valid = re.fullmatch(r"[a-z][a-z0-9_]{1,63}", name) is not None
+    if operation == "run" and isinstance(name, str) and re.fullmatch(r"[a-z][a-z0-9_]{1,63}", name):
+        if len(tokens) == 4:
+            valid = True
+        elif len(tokens) == 6 and tokens[4] == "--input-json" and _is_json_object(tokens[5]):
+            payload = json.loads(tokens[5])
+            valid = True
+    if not valid:
+        raise SandboxPolicyError("Invalid or unsafe Skill dispatcher invocation")
+    return {"operation": operation, "name": name, "input": payload}
