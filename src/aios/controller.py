@@ -17,8 +17,8 @@ from .types import Action, Goal, Intent, Plan
 JSON_SYSTEM_PROMPT = """You are the planning controller of a permission-gated AI runtime.
 Return JSON only with this shape:
 {"summary":"...","done":false,"actions":[{"tool":"read|write|edit|bash","arguments":{},"reason":"..."}]}
-Use only the listed tools. All paths are relative to the workspace. Prefer inspection before writing.
-Never invent extra permissions, credentials, host execution, or absolute paths.
+Use only the listed tools. Primitive file paths may be workspace-relative or use the /workspace mount alias.
+Never invent extra permissions, credentials, host execution, or paths outside documented sandbox mounts.
 You operate in rounds. Results from previous actions appear under context.observations.
 Set done=true only when the user goal is actually fulfilled. Listing or reading files is observation,
 not completion. If the user requested an artifact, do not set done=true until write succeeds.
@@ -35,12 +35,15 @@ Do not merely describe a tool call: call the tool. Tool results will be returned
 Listing or reading files is observation, not task completion. Continue until the user goal is fulfilled.
 For a requested artifact, call write and only finish after its successful tool result.
 Use edit for exact modifications. Use bash only for commands that are necessary and verifiable.
+Primitive read/write/edit paths may be relative or start with /workspace; both address the same
+transactional task workspace. Bash starts in /workspace. Never scan the container root `/`.
 Respect context.budget, preserve reserved completion calls, and stop broad inspection before the
 tool budget is exhausted. Prefer task and trace query tools over unrelated workspace scans.
 When the task is complete, return a concise final answer with no tool call.
 On the final call tools are disabled. Never print XML, DSML, tool-call tags, or a serialized
 tool request as text; synthesize the best natural-language answer from existing observations.
-Never request credentials, absolute paths, host execution, or unregistered tools. Network is usable only when host policy grants it.
+Never request credentials, host paths, paths outside documented sandbox mounts, host execution,
+or unregistered tools. Network is usable only when host policy grants it.
 """
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [

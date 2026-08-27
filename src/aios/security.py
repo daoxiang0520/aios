@@ -44,10 +44,26 @@ class SecurityKernel:
         return arguments
 
     def resolve_workspace_path(self, value: str) -> Path:
-        candidate = Path(value)
+        candidate = self.normalize_workspace_path(value)
         resolved = candidate.resolve() if candidate.is_absolute() else (self.workspace / candidate).resolve()
         try:
             resolved.relative_to(self.workspace)
         except ValueError as exc:
             raise PermissionDenied("Path escapes the configured workspace") from exc
         return resolved
+
+    @staticmethod
+    def normalize_workspace_path(value: str) -> Path:
+        """Map the Docker-visible /workspace mount to the primitive-tool workspace.
+
+        Primitive tools execute on the host-side transactional snapshot, while bash
+        sees that same snapshot mounted at /workspace. Accepting this one virtual
+        absolute prefix gives the model a single path vocabulary without widening
+        authority to other container or host paths.
+        """
+        raw = str(value).strip()
+        if raw == "/workspace" or raw == "/workspace/":
+            return Path(".")
+        if raw.startswith("/workspace/"):
+            return Path(raw[len("/workspace/"):])
+        return Path(raw)

@@ -16,6 +16,7 @@ from aios.plugins import PluginManager, PluginValidationError, state_query_manif
 from aios.runtime import AIOSRuntime
 from aios.security import PermissionDenied, SecurityKernel
 from aios.storage import StateStore
+from aios.tools import ToolExecutor, ToolRegistry
 from aios.types import Action, Event, Goal, GoalType, Intent, MemoryType, Plan, TaskStatus
 
 
@@ -72,6 +73,43 @@ class AIOSMVPTests(unittest.TestCase):
         kernel = SecurityKernel(self.settings.workspace, self.settings.permissions)
         with self.assertRaises(PermissionDenied):
             kernel.authorize(Action("read_file", {"path": "../secret.txt"}))
+
+    def test_workspace_mount_alias_matches_primitive_workspace_root(self) -> None:
+        self.settings.ensure_directories()
+        folder = self.settings.workspace / "MathModeling"
+        folder.mkdir()
+        (folder / "problem.txt").write_text("problem", encoding="utf-8")
+        self.settings.permissions.allowed_tools.extend(["read", "write", "edit"])
+        kernel = SecurityKernel(self.settings.workspace, self.settings.permissions)
+        root_arguments = kernel.authorize(Action("read", {"path": "/workspace"}))
+        nested_arguments = kernel.authorize(
+            Action("read", {"path": "/workspace/MathModeling/problem.txt"})
+        )
+        self.assertEqual(Path(root_arguments["path"]), self.settings.workspace.resolve())
+        self.assertEqual(Path(nested_arguments["path"]), (folder / "problem.txt").resolve())
+
+        executor = ToolExecutor(ToolRegistry(self.settings.permissions), kernel)
+        result = executor.execute(Action("read", {"path": "/workspace"}))
+        self.assertTrue(result.ok)
+        self.assertIn("MathModeling", {item["name"] for item in result.output})
+        written = executor.execute(Action("write", {"path": "/workspace/result.txt", "content": "old"}))
+        edited = executor.execute(Action("edit", {
+            "path": "/workspace/result.txt", "old_text": "old", "new_text": "new",
+        }))
+        self.assertTrue(written.ok)
+        self.assertTrue(edited.ok)
+        self.assertEqual((self.settings.workspace / "result.txt").read_text(encoding="utf-8"), "new")
+
+    def test_workspace_mount_alias_does_not_widen_path_authority(self) -> None:
+        self.settings.ensure_directories()
+        self.settings.permissions.allowed_tools.append("read")
+        kernel = SecurityKernel(self.settings.workspace, self.settings.permissions)
+        for path in (
+            "/workspace/../secret.txt", "/workspace//etc/passwd",
+            "/workspace-shadow/file.txt", "/aios-state/state.json",
+        ):
+            with self.subTest(path=path), self.assertRaises(PermissionDenied):
+                kernel.authorize(Action("read", {"path": path}))
 
     def test_processing_events_can_be_recovered(self) -> None:
         self.settings.ensure_directories()
