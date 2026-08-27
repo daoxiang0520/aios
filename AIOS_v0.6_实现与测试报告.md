@@ -1,5 +1,16 @@
 # AIOS v0.6 实现与测试报告
 
+## v0.6.4 Skill Utility & Replay Benchmark
+
+- 新增 `SkillUtilityEvaluator`，按成功、真实完成、Model Calls、Tokens、延迟和失败计算 Utility，并持久化 `skill_replay_reports`。
+- `skill replay` 在 Docker 中多次重放候选测试，记录成功率、中位/P95 延迟、输出确定性，并与 Manifest 明确列出的 `replay_task_ids` 真实任务指标比较。
+- 新增 `skill compare` 查询最新 Replay 报告，`skill utility` 从实际 Skill Telemetry 计算晋升后的关联性 Utility 与 Negative Transfer Rate。
+- Agent 候选的 Promote 门升级为 `Docker Benchmark Pass AND Replay Not Worse AND no Negative Transfer`；人工批准仍保留，且不自动晋升。
+- 缺少历史基线、基线任务无结果或基线已使用同名 Skill 时，证据级别为 `insufficient_historical_baseline` 并阻止 Agent 候选晋升。
+- 直接 Replay 无法观测端到端 Token，因此评分时将 Token 保持为基线值，不把未知值伪装为零；Skill-enabled Model Calls 明确标记为两次往返代理。
+- 当前属于 Execution Proxy + Historical Baseline，不宣称严格因果 A/B。精确 A/B 需要后续保存任务执行前 Workspace Capsule，再分别运行 baseline/skill-enabled Harness。
+- 构建副本与真实仓库均发现 60 项测试：59 项通过，1 项 Docker 实机用例因宿主 `com.docker.service` 停止且当前身份无启动权限而显式跳过。未将跳过计为实机通过；Docker 恢复后应单独复跑。
+
 ## v0.6.3 Skill Authoring Contract
 
 - 修复 Task 42 暴露的 Skill 创作预算浪费：候选包完整前不执行 Bash 探查，至少为 `manifest.json` 与 `skill.py` 保留写入额度。

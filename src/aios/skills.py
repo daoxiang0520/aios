@@ -39,6 +39,7 @@ class SkillManifest:
     source_trace_ids: list[int] = field(default_factory=list)
     hypothesis: str | None = None
     benchmark_delta: dict[str, Any] = field(default_factory=dict)
+    replay_task_ids: list[int] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "SkillManifest":
@@ -57,6 +58,7 @@ class SkillManifest:
             source_trace_ids=[int(item) for item in value.get("source_trace_ids", [])],
             hypothesis=str(value["hypothesis"]) if value.get("hypothesis") is not None else None,
             benchmark_delta=dict(value.get("benchmark_delta") or {}),
+            replay_task_ids=[int(item) for item in value.get("replay_task_ids", [])],
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -147,7 +149,7 @@ class SkillManager:
                 raise SkillValidationError("Each skill test input must be an object")
             if not isinstance(test.get("expect_exit", 0), int):
                 raise SkillValidationError("expect_exit must be an integer")
-        if any(item <= 0 for item in manifest.source_task_ids + manifest.source_trace_ids):
+        if any(item <= 0 for item in manifest.source_task_ids + manifest.source_trace_ids + manifest.replay_task_ids):
             raise SkillValidationError("Skill lineage source IDs must be positive integers")
         for text, label in ((manifest.mutation_reason, "mutation_reason"), (manifest.hypothesis, "hypothesis")):
             if text is not None and (not text.strip() or len(text) > 1000):
@@ -231,6 +233,13 @@ class SkillManager:
         report_path = self.reports / f"{candidate_id}.json"
         if not report_path.is_file() or not json.loads(report_path.read_text(encoding="utf-8")).get("passed"):
             raise SkillPromotionError("Candidate must pass sandbox benchmark before promotion")
+        if manifest.origin == "agent":
+            replay_path = self.reports / f"{candidate_id}.replay.json"
+            replay = json.loads(replay_path.read_text(encoding="utf-8")) if replay_path.is_file() else {}
+            if not replay.get("passed"):
+                raise SkillPromotionError(
+                    "Agent candidate must pass replay utility and negative-transfer gates before promotion"
+                )
         destination = self.active / manifest.name
         if destination.exists():
             old_manifest = self._load_manifest(destination)
@@ -258,6 +267,7 @@ class SkillManager:
                 "source_trace_ids": manifest.source_trace_ids,
                 "hypothesis": manifest.hypothesis,
                 "benchmark_delta": manifest.benchmark_delta,
+                "replay_task_ids": manifest.replay_task_ids,
             },
         }
 

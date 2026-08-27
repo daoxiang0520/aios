@@ -1,9 +1,8 @@
 # Self-Evolving AIOS v0.6
 
-Current release: **v0.6.3**. In addition to standardized Skill telemetry and lineage,
-it adds a deterministic Skill Authoring Contract that reserves candidate-package writes,
-blocks wasteful `/skills` inspection during authoring, and verifies both `manifest.json`
-and `skill.py` before candidate registration. These
+Current release: **v0.6.4**. It adds Docker candidate replay, historical-baseline
+utility comparison, observed post-promotion utility, negative-transfer detection,
+and a replay gate for Agent-authored Skill promotion. These
 records are the data foundation for replay benchmarks, utility scoring, experience
 analysis, mutation, selection, and quarantine in later v0.6 releases.
 
@@ -76,6 +75,9 @@ python -m aios --config config.json skill rollback <name> --approve
 python -m aios --config config.json skill deprecate <name> --approve
 python -m aios --config config.json skill telemetry --limit 50
 python -m aios --config config.json skill telemetry --name workspace_search --limit 20
+python -m aios --config config.json skill replay <candidate_id> --runs 3
+python -m aios --config config.json skill compare <candidate_id>
+python -m aios --config config.json skill utility <active_skill_name>
 ```
 
 Each `skill run` produces `SKILL_INVOKE`, `SKILL_CAPABILITY_CHECK`, and
@@ -86,6 +88,15 @@ read-only data with `aiosctl --config config.json skill-usage list`.
 Skill manifests can declare `parent_version`, `mutation_reason`, `source_task_ids`,
 `source_trace_ids`, `hypothesis`, and `benchmark_delta`. Promoting a new version of
 an existing Skill requires its `parent_version` to match the active version.
+`replay_task_ids` identifies explicit historical baseline tasks. Agent candidates must
+pass the regular Docker benchmark and the Replay/Negative-Transfer gate before promotion.
+Missing or contaminated baselines produce `insufficient_historical_baseline`, not a
+fabricated utility gain.
+
+The current replay is an **execution proxy**, not a strict causal end-to-end A/B: it
+repeats candidate test cases in Docker, compares them with real recorded task metrics,
+assumes two model calls for the Skill-enabled path, and holds unobserved replay Tokens
+equal to baseline. Prospective pre-task workspace capsules are still needed for exact A/B.
 
 Skill 不会产生权限。有效权限始终是 `Manifest 声明能力 ∩ Host 已授予能力`；例如声明 `network.external` 的 Skill 在默认配置下仍是 `needs_authority`。
 

@@ -19,6 +19,7 @@ from .skills import SkillManager
 from .runtime import AIOSRuntime
 from .storage import StateStore
 from .types import Action, ActionResult, Event, Goal, GoalStatus, GoalType, Memory, MemoryType, Task, TaskStatus
+from .utility import SkillUtilityEvaluator
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -142,6 +143,14 @@ def _parser() -> argparse.ArgumentParser:
     skill_telemetry = skill_commands.add_parser("telemetry")
     skill_telemetry.add_argument("--name")
     skill_telemetry.add_argument("--limit", type=int, default=50)
+    skill_replay = skill_commands.add_parser("replay")
+    skill_replay.add_argument("candidate_id")
+    skill_replay.add_argument("--runs", type=int, default=3)
+    skill_compare = skill_commands.add_parser("compare")
+    skill_compare.add_argument("candidate_id")
+    skill_utility = skill_commands.add_parser("utility")
+    skill_utility.add_argument("name")
+    skill_utility.add_argument("--limit", type=int, default=500)
     skill_commands.add_parser("bootstrap")
     return parser
 
@@ -395,6 +404,19 @@ def main(argv: list[str] | None = None) -> int:
             _print_json(manager.deprecate(args.name, approved=args.approve))
         elif args.skill_command == "telemetry":
             _print_json(store.list_skill_usage(limit=args.limit, skill_name=args.name))
+        elif args.skill_command == "replay":
+            _print_json(SkillUtilityEvaluator(store, manager, broker).replay(
+                args.candidate_id, runs=args.runs
+            ))
+        elif args.skill_command == "compare":
+            report = SkillUtilityEvaluator(store, manager, broker).latest_comparison(args.candidate_id)
+            if report is None:
+                raise SystemExit("No replay report exists; run skill replay first")
+            _print_json(report)
+        elif args.skill_command == "utility":
+            _print_json(SkillUtilityEvaluator(store, manager, broker).observed_utility(
+                args.name, limit=args.limit
+            ))
         elif args.skill_command == "bootstrap":
             manager.bootstrap_builtins()
             _print_json(manager.catalog(capabilities))

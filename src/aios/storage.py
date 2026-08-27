@@ -173,6 +173,23 @@ CREATE TABLE IF NOT EXISTS skill_usage (
 CREATE INDEX IF NOT EXISTS idx_skill_usage_name ON skill_usage(skill_name, id DESC);
 CREATE INDEX IF NOT EXISTS idx_skill_usage_task ON skill_usage(task_id, id ASC);
 CREATE INDEX IF NOT EXISTS idx_skill_usage_cycle ON skill_usage(cycle_id, id ASC);
+
+CREATE TABLE IF NOT EXISTS skill_replay_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate_id TEXT NOT NULL,
+    skill_name TEXT NOT NULL,
+    skill_version TEXT NOT NULL,
+    evidence_level TEXT NOT NULL,
+    passed INTEGER NOT NULL,
+    negative_transfer INTEGER NOT NULL DEFAULT 0,
+    utility_delta REAL,
+    report TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_skill_replay_candidate
+ON skill_replay_reports(candidate_id,id DESC);
+CREATE INDEX IF NOT EXISTS idx_skill_replay_name
+ON skill_replay_reports(skill_name,id DESC);
 """
 
 
@@ -378,6 +395,47 @@ class StateStore:
                 "verifier_passed": None if row["verifier_passed"] is None else bool(row["verifier_passed"]),
                 "task_outcome": row["task_outcome"], "created_at": row["created_at"],
             }
+            for row in rows
+        ]
+
+    def add_skill_replay_report(self, report: dict[str, Any]) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """INSERT INTO skill_replay_reports(
+                       candidate_id,skill_name,skill_version,evidence_level,passed,
+                       negative_transfer,utility_delta,report
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    report["candidate_id"], report["skill"], report["version"],
+                    report["evidence_level"], int(bool(report["passed"])),
+                    int(bool(report.get("negative_transfer", False))),
+                    report.get("utility_delta"),
+                    json.dumps(report, ensure_ascii=False, default=str),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def list_skill_replay_reports(
+        self, limit: int = 50, *, candidate_id: str | None = None,
+        skill_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if candidate_id:
+            conditions.append("candidate_id=?")
+            params.append(candidate_id)
+        if skill_name:
+            conditions.append("skill_name=?")
+            params.append(skill_name)
+        query = "SELECT * FROM skill_replay_reports"
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        with self.connect() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+        return [
+            {"id": int(row["id"]), **json.loads(row["report"]), "created_at": row["created_at"]}
             for row in rows
         ]
 
