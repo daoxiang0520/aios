@@ -13,6 +13,10 @@ from .capabilities import CapabilityRegistry
 from .diagnostics import Diagnoser
 from .evolution import EvolutionManager
 from .evaluation import Verifier
+from .experiments import (
+    CapsuleManager, ExperimentOrchestrator, ExperimentVariant, ModelSemanticJudge,
+    PairwiseSemanticJudge, RuntimeVariantRunner,
+)
 from .plugins import PluginManager
 from .sandbox import DockerSandboxBroker
 from .skills import SkillManager
@@ -151,7 +155,39 @@ def _parser() -> argparse.ArgumentParser:
     skill_utility = skill_commands.add_parser("utility")
     skill_utility.add_argument("name")
     skill_utility.add_argument("--limit", type=int, default=500)
+    skill_counterfactual = skill_commands.add_parser("counterfactual-replay")
+    skill_counterfactual.add_argument("candidate_id")
+    skill_counterfactual.add_argument("--capsule", required=True)
+    skill_counterfactual.add_argument("--runs", type=int)
     skill_commands.add_parser("bootstrap")
+
+    capsule = commands.add_parser("capsule", help="Manage immutable task execution capsules")
+    capsule_commands = capsule.add_subparsers(dest="capsule_command", required=True)
+    capsule_capture = capsule_commands.add_parser("capture")
+    capsule_capture.add_argument("task_id", type=int)
+    capsule_commands.add_parser("list")
+    capsule_show = capsule_commands.add_parser("show")
+    capsule_show.add_argument("capsule_id")
+    capsule_verify = capsule_commands.add_parser("verify")
+    capsule_verify.add_argument("capsule_id")
+    capsule_fork = capsule_commands.add_parser("fork")
+    capsule_fork.add_argument("capsule_id")
+    capsule_archive = capsule_commands.add_parser("archive")
+    capsule_archive.add_argument("capsule_id")
+    capsule_delete = capsule_commands.add_parser("delete")
+    capsule_delete.add_argument("capsule_id")
+
+    experiment = commands.add_parser("experiment", help="Run paired counterfactual experiments")
+    experiment_commands = experiment.add_subparsers(dest="experiment_command", required=True)
+    experiment_run = experiment_commands.add_parser("run")
+    experiment_run.add_argument("--capsule", required=True)
+    experiment_run.add_argument("--baseline", default="primitive", choices=["primitive"])
+    experiment_run.add_argument("--candidate", required=True, help="skill:<candidate_id>")
+    experiment_run.add_argument("--runs", type=int)
+    experiment_show = experiment_commands.add_parser("show")
+    experiment_show.add_argument("experiment_id")
+    experiment_compare = experiment_commands.add_parser("compare")
+    experiment_compare.add_argument("experiment_id")
     return parser
 
 
@@ -178,6 +214,38 @@ def _skill_services(settings: Settings) -> tuple[SkillManager, DockerSandboxBrok
         allowed_domains=settings.capabilities.allowed_domains,
     )
     return manager, broker, capabilities
+
+
+def _experiment_services(
+    settings: Settings, store: StateStore,
+) -> tuple[SkillManager, CapsuleManager, RuntimeVariantRunner]:
+    manager, _, capabilities = _skill_services(settings)
+    capsules = CapsuleManager(settings, store, manager, capabilities)
+    return manager, capsules, RuntimeVariantRunner(settings, manager)
+
+
+def _run_counterfactual(
+    settings: Settings, store: StateStore, candidate_id: str, capsule_id: str, runs: int | None,
+) -> dict[str, Any]:
+    manager, capsules, runner = _experiment_services(settings, store)
+    benchmark_path = manager.reports / f"{candidate_id}.json"
+    benchmark = json.loads(benchmark_path.read_text(encoding="utf-8")) if benchmark_path.is_file() else {}
+    if not benchmark.get("passed"):
+        raise SystemExit("Candidate must pass the Docker benchmark before counterfactual replay")
+    semantic = PairwiseSemanticJudge(
+        ModelSemanticJudge(settings.model) if settings.experiments.semantic_judge_enabled else None
+    )
+    report = ExperimentOrchestrator(store, capsules, runner, semantic_judge=semantic).run(
+        capsule_id,
+        ExperimentVariant("baseline", mutation={}),
+        ExperimentVariant("candidate", mutation={"candidate_id": candidate_id}),
+        runs_per_variant=runs or settings.experiments.default_runs_per_variant,
+        keep_worlds=settings.experiments.keep_worlds,
+    )
+    (manager.reports / f"{candidate_id}.counterfactual.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return report
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -349,6 +417,37 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "diagnose":
         _print_json(Diagnoser(store).report())
         return 0
+    if args.command == "capsule":
+        _, capsules, _ = _experiment_services(settings, store)
+        if args.capsule_command == "capture":
+            _print_json(capsules.capture(args.task_id))
+        elif args.capsule_command == "list":
+            _print_json(store.list_task_capsules())
+        elif args.capsule_command == "show":
+            _print_json(capsules.show(args.capsule_id))
+        elif args.capsule_command == "verify":
+            _print_json(capsules.verify_integrity(args.capsule_id))
+        elif args.capsule_command == "fork":
+            _print_json(capsules.fork(args.capsule_id))
+        elif args.capsule_command == "archive":
+            _print_json(capsules.archive(args.capsule_id))
+        elif args.capsule_command == "delete":
+            _print_json(capsules.delete(args.capsule_id))
+        return 0
+    if args.command == "experiment":
+        if args.experiment_command == "run":
+            prefix, separator, candidate_id = args.candidate.partition(":")
+            if prefix != "skill" or not separator or not candidate_id:
+                raise SystemExit("--candidate must use skill:<candidate_id>")
+            _print_json(_run_counterfactual(
+                settings, store, candidate_id, args.capsule, args.runs
+            ))
+        else:
+            experiment = store.get_experiment(args.experiment_id)
+            if experiment is None:
+                raise SystemExit(f"Unknown experiment: {args.experiment_id}")
+            _print_json(experiment if args.experiment_command == "show" else experiment.get("report"))
+        return 0
     if args.command == "evolution":
         manager = EvolutionManager(store)
         if args.evolution_command == "propose":
@@ -416,6 +515,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.skill_command == "utility":
             _print_json(SkillUtilityEvaluator(store, manager, broker).observed_utility(
                 args.name, limit=args.limit
+            ))
+        elif args.skill_command == "counterfactual-replay":
+            _print_json(_run_counterfactual(
+                settings, store, args.candidate_id, args.capsule, args.runs
             ))
         elif args.skill_command == "bootstrap":
             manager.bootstrap_builtins()
@@ -496,6 +599,12 @@ def _default_config() -> dict[str, Any]:
             "enabled": True,
             "root": "./skills",
             "require_human_promotion": True,
+        },
+        "experiments": {
+            "root": "./experiments",
+            "default_runs_per_variant": 3,
+            "keep_worlds": False,
+            "semantic_judge_enabled": False,
         },
         "evolution": {"enabled": False, "auto_promote": False},
     }

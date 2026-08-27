@@ -72,6 +72,14 @@ class SkillConfig:
 
 
 @dataclass(slots=True)
+class ExperimentConfig:
+    root: str = "./experiments"
+    default_runs_per_variant: int = 3
+    keep_worlds: bool = False
+    semantic_judge_enabled: bool = False
+
+
+@dataclass(slots=True)
 class Settings:
     root: Path
     database: Path
@@ -85,6 +93,7 @@ class Settings:
     capabilities: CapabilityConfig = field(default_factory=CapabilityConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     skills: SkillConfig = field(default_factory=SkillConfig)
+    experiments: ExperimentConfig = field(default_factory=ExperimentConfig)
 
     @classmethod
     def load(cls, path: str | Path) -> "Settings":
@@ -115,6 +124,7 @@ class Settings:
             capabilities=CapabilityConfig(**raw.get("capabilities", {})),
             sandbox=SandboxConfig(**raw.get("sandbox", {})),
             skills=SkillConfig(**raw.get("skills", {})),
+            experiments=ExperimentConfig(**raw.get("experiments", {})),
         )
 
     @property
@@ -132,9 +142,15 @@ class Settings:
         candidate = Path(self.skills.root)
         return (self.root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
 
+    @property
+    def experiments_root(self) -> Path:
+        candidate = Path(self.experiments.root)
+        return (self.root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+
     def ensure_directories(self) -> None:
         self.database.parent.mkdir(parents=True, exist_ok=True)
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.extensions.mkdir(parents=True, exist_ok=True)
         self.sandbox_root.mkdir(parents=True, exist_ok=True)
         self.skills_root.mkdir(parents=True, exist_ok=True)
+        self.experiments_root.mkdir(parents=True, exist_ok=True)

@@ -11,4 +11,5 @@ data/
 workspace/
 sandbox/
 skills/
+/experiments/
 .smoke/

@@ -35,6 +35,12 @@
     "max_source_bytes": 131072,
     "benchmark_timeout_seconds": 30
   },
+  "experiments": {
+    "root": "./experiments",
+    "default_runs_per_variant": 3,
+    "keep_worlds": false,
+    "semantic_judge_enabled": false
+  },
   "model": {
     "provider": "mock",
     "base_url": "https://api.openai.com/v1",

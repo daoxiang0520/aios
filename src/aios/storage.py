@@ -190,6 +190,77 @@ CREATE INDEX IF NOT EXISTS idx_skill_replay_candidate
 ON skill_replay_reports(candidate_id,id DESC);
 CREATE INDEX IF NOT EXISTS idx_skill_replay_name
 ON skill_replay_reports(skill_name,id DESC);
+
+CREATE TABLE IF NOT EXISTS task_capsules (
+    capsule_id TEXT PRIMARY KEY,
+    source_task_id INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    fidelity TEXT NOT NULL,
+    manifest TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(source_task_id) REFERENCES tasks(id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_capsules_task ON task_capsules(source_task_id,created_at DESC);
+
+CREATE TABLE IF NOT EXISTS capsule_objects (
+    object_hash TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS experiments (
+    experiment_id TEXT PRIMARY KEY,
+    capsule_id TEXT NOT NULL,
+    mutation_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    spec TEXT NOT NULL,
+    report TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(capsule_id) REFERENCES task_capsules(capsule_id)
+);
+
+CREATE TABLE IF NOT EXISTS experiment_variants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    experiment_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    mutation TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(experiment_id,name),
+    FOREIGN KEY(experiment_id) REFERENCES experiments(experiment_id)
+);
+
+CREATE TABLE IF NOT EXISTS experiment_runs (
+    run_id TEXT PRIMARY KEY,
+    experiment_id TEXT NOT NULL,
+    variant TEXT NOT NULL,
+    replicate INTEGER NOT NULL,
+    evidence TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(experiment_id) REFERENCES experiments(experiment_id)
+);
+CREATE INDEX IF NOT EXISTS idx_experiment_runs_experiment
+ON experiment_runs(experiment_id,variant,replicate);
+
+CREATE TABLE IF NOT EXISTS counterfactual_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    experiment_id TEXT NOT NULL UNIQUE,
+    promotion_state TEXT NOT NULL,
+    report TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(experiment_id) REFERENCES experiments(experiment_id)
+);
+
+CREATE TABLE IF NOT EXISTS semantic_judgements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    experiment_id TEXT NOT NULL,
+    judgement TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(experiment_id) REFERENCES experiments(experiment_id)
+);
 """
 
 
@@ -438,6 +509,170 @@ class StateStore:
             {"id": int(row["id"]), **json.loads(row["report"]), "created_at": row["created_at"]}
             for row in rows
         ]
+
+    def add_task_capsule(self, manifest: dict[str, Any]) -> str:
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT INTO task_capsules(
+                       capsule_id,source_task_id,status,fidelity,manifest
+                   ) VALUES(?,?,?,?,?)""",
+                (
+                    manifest["capsule_id"], int(manifest["source_task_id"]), manifest["status"],
+                    manifest["fidelity"], json.dumps(manifest, ensure_ascii=False, default=str),
+                ),
+            )
+        return str(manifest["capsule_id"])
+
+    def get_task_capsule(self, capsule_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM task_capsules WHERE capsule_id=?", (capsule_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        manifest = json.loads(row["manifest"])
+        manifest["status"] = str(row["status"])
+        manifest["fidelity"] = str(row["fidelity"])
+        manifest["created_at"] = str(row["created_at"])
+        return manifest
+
+    def list_task_capsules(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT capsule_id FROM task_capsules ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [self.get_task_capsule(str(row["capsule_id"])) for row in rows]
+
+    def update_task_capsule_status(self, capsule_id: str, status: str) -> None:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE task_capsules SET status=?,updated_at=CURRENT_TIMESTAMP WHERE capsule_id=?",
+                (status, capsule_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Unknown capsule: {capsule_id}")
+
+    def register_capsule_snapshot(self, snapshot: dict[str, Any]) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO capsule_objects(object_hash,kind,size_bytes,metadata)
+                   VALUES(?,?,?,?)""",
+                (
+                    snapshot["manifest_hash"], snapshot.get("kind", "content_addressed_tree_v1"),
+                    int(snapshot.get("total_bytes", 0)),
+                    json.dumps(snapshot, ensure_ascii=False, default=str),
+                ),
+            )
+
+    def create_experiment(self, spec: dict[str, Any]) -> str:
+        variants = spec.get("variants") or []
+        mutation_type = variants[0].get("mutation_type", "skill") if variants else "skill"
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT INTO experiments(
+                       experiment_id,capsule_id,mutation_type,status,spec
+                   ) VALUES(?,?,?,'running',?)""",
+                (
+                    spec["experiment_id"], spec["capsule_id"], mutation_type,
+                    json.dumps(spec, ensure_ascii=False, default=str),
+                ),
+            )
+        return str(spec["experiment_id"])
+
+    def add_experiment_variant(self, experiment_id: str, variant: dict[str, Any]) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO experiment_variants(experiment_id,name,mutation) VALUES(?,?,?)",
+                (
+                    experiment_id, variant["name"],
+                    json.dumps(variant, ensure_ascii=False, default=str),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def add_experiment_run(self, experiment_id: str, evidence: dict[str, Any]) -> str:
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT INTO experiment_runs(
+                       run_id,experiment_id,variant,replicate,evidence
+                   ) VALUES(?,?,?,?,?)""",
+                (
+                    evidence["run_id"], experiment_id, evidence["variant"], int(evidence["replicate"]),
+                    json.dumps(evidence, ensure_ascii=False, default=str),
+                ),
+            )
+        return str(evidence["run_id"])
+
+    def add_semantic_judgement(self, experiment_id: str, judgement: dict[str, Any]) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO semantic_judgements(experiment_id,judgement) VALUES(?,?)",
+                (experiment_id, json.dumps(judgement, ensure_ascii=False, default=str)),
+            )
+            return int(cursor.lastrowid)
+
+    def add_counterfactual_report(self, experiment_id: str, report: dict[str, Any]) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """INSERT INTO counterfactual_reports(experiment_id,promotion_state,report)
+                   VALUES(?,?,?)""",
+                (
+                    experiment_id, report["promotion_state"],
+                    json.dumps(report, ensure_ascii=False, default=str),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def update_experiment(self, experiment_id: str, status: str, report: dict[str, Any]) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """UPDATE experiments SET status=?,report=?,updated_at=CURRENT_TIMESTAMP
+                   WHERE experiment_id=?""",
+                (status, json.dumps(report, ensure_ascii=False, default=str), experiment_id),
+            )
+
+    def get_experiment(self, experiment_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM experiments WHERE experiment_id=?", (experiment_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            variants = connection.execute(
+                "SELECT mutation FROM experiment_variants WHERE experiment_id=? ORDER BY id", (experiment_id,)
+            ).fetchall()
+            runs = connection.execute(
+                "SELECT evidence FROM experiment_runs WHERE experiment_id=? ORDER BY variant,replicate",
+                (experiment_id,),
+            ).fetchall()
+        return {
+            "experiment_id": str(row["experiment_id"]), "capsule_id": str(row["capsule_id"]),
+            "mutation_type": str(row["mutation_type"]), "status": str(row["status"]),
+            "spec": json.loads(row["spec"]),
+            "report": json.loads(row["report"]) if row["report"] else None,
+            "variants": [json.loads(item["mutation"]) for item in variants],
+            "runs": [json.loads(item["evidence"]) for item in runs],
+            "created_at": str(row["created_at"]), "updated_at": str(row["updated_at"]),
+        }
+
+    def latest_counterfactual_report(self, candidate_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT report FROM counterfactual_reports ORDER BY id DESC"
+            ).fetchall()
+        for row in rows:
+            report = json.loads(row["report"])
+            variants = report.get("variants", {})
+            candidate_runs = variants.get("candidate", []) if isinstance(variants, dict) else []
+            if any(
+                run.get("skills", {}).get("candidate_id") == candidate_id
+                or candidate_id in run.get("skills", {}).get("variant_skills", [])
+                for run in candidate_runs
+            ):
+                return report
+            if report.get("candidate_id") == candidate_id:
+                return report
+        return None
 
     def create_task(self, task: Task) -> int:
         with self.connect() as connection:

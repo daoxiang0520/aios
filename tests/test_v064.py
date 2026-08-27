@@ -81,15 +81,15 @@ class V064UtilityTests(unittest.TestCase):
         self.manager.benchmark(candidate_id, Broker())
         return candidate_id
 
-    def test_replay_compares_real_baseline_and_opens_promotion_gate(self) -> None:
+    def test_historical_replay_is_retained_but_no_longer_opens_agent_promotion_gate(self) -> None:
         candidate_id = self.candidate([self.baseline_task()])
         evaluator = SkillUtilityEvaluator(self.store, self.manager, Broker())
         report = evaluator.replay(candidate_id, runs=3)
         self.assertTrue(report["passed"])
         self.assertGreater(report["utility_delta"], 0)
         self.assertEqual(report["evidence_level"], "historical_baseline_plus_execution_proxy")
-        promoted = self.manager.promote(candidate_id, approved=True)
-        self.assertEqual(promoted["status"], "active")
+        with self.assertRaises(SkillPromotionError):
+            self.manager.promote(candidate_id, approved=True)
 
     def test_missing_historical_baseline_blocks_agent_promotion(self) -> None:
         candidate_id = self.candidate([])

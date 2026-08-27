@@ -234,11 +234,19 @@ class SkillManager:
         if not report_path.is_file() or not json.loads(report_path.read_text(encoding="utf-8")).get("passed"):
             raise SkillPromotionError("Candidate must pass sandbox benchmark before promotion")
         if manifest.origin == "agent":
-            replay_path = self.reports / f"{candidate_id}.replay.json"
-            replay = json.loads(replay_path.read_text(encoding="utf-8")) if replay_path.is_file() else {}
-            if not replay.get("passed"):
+            counterfactual_path = self.reports / f"{candidate_id}.counterfactual.json"
+            counterfactual = (
+                json.loads(counterfactual_path.read_text(encoding="utf-8"))
+                if counterfactual_path.is_file() else {}
+            )
+            if (
+                counterfactual.get("candidate_id") != candidate_id
+                or counterfactual.get("promotion_state") != "PROMOTABLE"
+                or not counterfactual.get("same_initial_state")
+                or counterfactual.get("negative_transfer")
+            ):
                 raise SkillPromotionError(
-                    "Agent candidate must pass replay utility and negative-transfer gates before promotion"
+                    "Agent candidate requires PROMOTABLE paired counterfactual evidence before promotion"
                 )
         destination = self.active / manifest.name
         if destination.exists():

@@ -1,5 +1,21 @@
 # AIOS v0.6 实现与测试报告
 
+## v0.6.5 Task Capsule & Counterfactual Skill Evaluation
+
+- 新增 `experiments/` 子系统：`ContentAddressedSnapshotStore`、`CapsuleManager`、`ExperimentOrchestrator`、`RuntimeVariantRunner`、`CounterfactualEvaluator` 与 `PairwiseSemanticJudge`。
+- Capsule 以 Manifest + Immutable References 保存任务、执行前 Workspace、Active Skill 集、Capability、Harness、Model、Sandbox 镜像身份和外部依赖指纹；工作区与 Skill 文件按 SHA256 去重存储。
+- 完整初始状态哈希同时覆盖 Task、Workspace、Active Skills、Capability、Harness、Model 与 Environment。Baseline/Candidate 在应用显式 Skill Mutation 前必须具有相同状态哈希。
+- 每个变体默认独立恢复并真实重跑完整 Agent Loop 3 次；实验世界位于受管目录，运行后销毁，生产 Workspace 不会被 replay 修改。
+- Run Evidence 分离 Skill 执行、Task Verifier 和最终 Task 状态，并记录模型调用、Token、延迟、安全违规、产物哈希与 Trace。
+- Counterfactual Report 保留完成率、Verifier、调用数、Token、Median/P95 延迟等完整指标向量；Scalar Utility 不再是唯一判断依据。
+- 晋升状态升级为 `REJECTED / INSUFFICIENT_EVIDENCE / NEEDS_REVIEW / PROMOTABLE`。正确率下降或安全违规直接拒绝；质量提高但成本增加进入人工复核；Partial Fidelity 只能进入复核。
+- Semantic Judge 为可选 Tier-2 软证据，通过 A/B 顺序反转检测位置偏差；它不能覆盖 Tier-1 的安全、Verifier 和测量结果。
+- v0.6.4 Historical Replay 保留，但 Agent 生成的 Skill 不再能仅凭历史代理证据晋升；必须先通过 Docker Benchmark 和同起点 Paired Counterfactual Replay，之后仍需人工批准。
+- 新增 SQLite 表：`task_capsules`、`capsule_objects`、`experiments`、`experiment_variants`、`experiment_runs`、`counterfactual_reports`、`semantic_judgements`。
+- 新增 CLI：`capsule capture/show/list/verify/fork/archive/delete`、`experiment run/show/compare`、`skill counterfactual-replay`。
+- v0.6.5 专项 10 项测试全部通过，覆盖同起点、实验隔离、Host 不污染、单变量、3×2 重复运行、随机聚合、坏 Skill、质量成本冲突、Judge 位置偏差、Capsule 损坏和晋升证据门。
+- 构建副本与真实仓库完整回归均发现 71 项测试：70 项通过，1 项 Docker 实机用例因宿主 Docker 服务停止而显式跳过；未将跳过计为实机通过。
+
 ## v0.6.4 Skill Utility & Replay Benchmark
 
 - 新增 `SkillUtilityEvaluator`，按成功、真实完成、Model Calls、Tokens、延迟和失败计算 Utility，并持久化 `skill_replay_reports`。

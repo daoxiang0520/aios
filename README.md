@@ -1,10 +1,9 @@
 # Self-Evolving AIOS v0.6
 
-Current release: **v0.6.4**. It adds Docker candidate replay, historical-baseline
-utility comparison, observed post-promotion utility, negative-transfer detection,
-and a replay gate for Agent-authored Skill promotion. These
-records are the data foundation for replay benchmarks, utility scoring, experience
-analysis, mutation, selection, and quarantine in later v0.6 releases.
+Current release: **v0.6.5**. It adds immutable Task Capsules, content-addressed
+workspace and Skill snapshots, isolated baseline/candidate worlds, replicated
+counterfactual execution, multidimensional objective comparison, and an optional
+order-reversed semantic judge. Historical replay remains available as weaker evidence.
 
 > v0.6 将进化面从“增加专用 Tool Schema”迁移为“学习可执行、可测试、可版本化的 Skill”。模型的原生工具面仍固定为 `read / write / edit / bash`。
 
@@ -51,6 +50,12 @@ analysis, mutation, selection, and quarantine in later v0.6 releases.
 - Agent 可在 `workspace/skill_candidates/`产生候选 Skill，默认只注册、不自动执行或晋升；
 - 沙盒只读挂载 `skills/runtime`，不暴露候选、历史、报告和废弃代码；
 - 内置 `workspace_search`、`state_query`、`trace_failure_analyzer` 三个可复用 Skill。
+- Task Capsule：保存任务前 workspace、Skill、Capability、Harness、Model 与 Sandbox 身份；
+- 内容寻址对象存储：多个 Capsule 共享文件对象，不为每次实验复制完整项目；
+- Experiment Orchestrator：从同一 Capsule 分叉隔离世界，仅允许 Skill 作为 v0.6.5 实验变量；
+- Baseline/Candidate 默认各执行 3 次，记录完成率、Verifier、模型调用、Token、延迟、安全与产物证据；
+- Counterfactual Evaluator 输出完整指标向量和 `REJECTED / INSUFFICIENT_EVIDENCE / NEEDS_REVIEW / PROMOTABLE`；
+- 可选盲语义 Judge 会交换 A/B 顺序检测位置偏差，且不能覆盖安全和 Verifier 硬证据。
 
 ## Skill 使用与进化
 
@@ -78,6 +83,11 @@ python -m aios --config config.json skill telemetry --name workspace_search --li
 python -m aios --config config.json skill replay <candidate_id> --runs 3
 python -m aios --config config.json skill compare <candidate_id>
 python -m aios --config config.json skill utility <active_skill_name>
+python -m aios --config config.json capsule capture <queued_task_id>
+python -m aios --config config.json capsule verify <capsule_id>
+python -m aios --config config.json experiment run --capsule <capsule_id> --candidate skill:<candidate_id> --runs 3
+python -m aios --config config.json experiment compare <experiment_id>
+python -m aios --config config.json skill counterfactual-replay <candidate_id> --capsule <capsule_id> --runs 3
 ```
 
 Each `skill run` produces `SKILL_INVOKE`, `SKILL_CAPABILITY_CHECK`, and
@@ -88,15 +98,20 @@ read-only data with `aiosctl --config config.json skill-usage list`.
 Skill manifests can declare `parent_version`, `mutation_reason`, `source_task_ids`,
 `source_trace_ids`, `hypothesis`, and `benchmark_delta`. Promoting a new version of
 an existing Skill requires its `parent_version` to match the active version.
-`replay_task_ids` identifies explicit historical baseline tasks. Agent candidates must
-pass the regular Docker benchmark and the Replay/Negative-Transfer gate before promotion.
+`replay_task_ids` identifies explicit historical baseline tasks. Historical replay is
+retained for diagnosis and weak evidence, but it no longer opens the Agent-candidate
+promotion gate. Agent candidates must pass the regular Docker benchmark and produce a
+`PROMOTABLE` paired counterfactual report from the same initial state before manual promotion.
 Missing or contaminated baselines produce `insufficient_historical_baseline`, not a
 fabricated utility gain.
 
-The current replay is an **execution proxy**, not a strict causal end-to-end A/B: it
+The v0.6.4 historical replay is an **execution proxy**, not a strict causal end-to-end A/B: it
 repeats candidate test cases in Docker, compares them with real recorded task metrics,
 assumes two model calls for the Skill-enabled path, and holds unobserved replay Tokens
-equal to baseline. Prospective pre-task workspace capsules are still needed for exact A/B.
+equal to baseline. v0.6.5 counterfactual replay instead restores a prospective pre-task
+Capsule and re-executes the complete Model → Agent → Tools/Skill → Verifier trajectory.
+Post-hoc captures and unresolved container identities are marked `PARTIAL` and cannot
+become `PROMOTABLE` without review.
 
 Skill 不会产生权限。有效权限始终是 `Manifest 声明能力 ∩ Host 已授予能力`；例如声明 `network.external` 的 Skill 在默认配置下仍是 `needs_authority`。
 
