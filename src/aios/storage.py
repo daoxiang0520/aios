@@ -373,12 +373,13 @@ class StateStore:
                 (status.value, goal_id),
             )
 
-    def trace(self, cycle_id: str, kind: str, data: dict[str, Any]) -> None:
+    def trace(self, cycle_id: str, kind: str, data: dict[str, Any]) -> int:
         with self.connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 "INSERT INTO traces(cycle_id,kind,data) VALUES(?,?,?)",
                 (cycle_id, kind, json.dumps(data, ensure_ascii=False, default=str)),
             )
+            return int(cursor.lastrowid)
 
     def recent_traces(self, limit: int = 20) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -424,7 +425,7 @@ class StateStore:
         self,
         cycle_id: str,
         *,
-        verifier_passed: bool,
+        verifier_passed: bool | None,
         task_outcome: str,
         model_calls_after: int | None = None,
         tokens_after: int | None = None,
@@ -434,7 +435,7 @@ class StateStore:
                 """UPDATE skill_usage
                    SET verifier_passed=?,task_outcome=?,model_calls_after=?,tokens_after=?
                    WHERE cycle_id=? AND verifier_passed IS NULL""",
-                (int(verifier_passed), task_outcome, model_calls_after, tokens_after, cycle_id),
+                (None if verifier_passed is None else int(verifier_passed), task_outcome, model_calls_after, tokens_after, cycle_id),
             )
 
     def list_skill_usage(self, limit: int = 50, skill_name: str | None = None) -> list[dict[str, Any]]:
@@ -708,14 +709,21 @@ class StateStore:
             rows = connection.execute(query, params).fetchall()
         return [self._task_from_row(row) for row in rows]
 
-    def start_task_attempt(self, task_id: int) -> Task:
+    def start_task_attempt(self, task_id: int, *, increment_attempt: bool = True) -> Task:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                """UPDATE tasks SET status=?,attempts=attempts+1,result=NULL,error=NULL,
-                   updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-                (TaskStatus.RUNNING.value, task_id),
-            )
+            if increment_attempt:
+                connection.execute(
+                    """UPDATE tasks SET status=?,attempts=attempts+1,result=NULL,error=NULL,
+                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (TaskStatus.RUNNING.value, task_id),
+                )
+            else:
+                connection.execute(
+                    """UPDATE tasks SET status=?,error=NULL,updated_at=CURRENT_TIMESTAMP
+                       WHERE id=?""",
+                    (TaskStatus.RUNNING.value, task_id),
+                )
             row = connection.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if row is None:
             raise KeyError(f"Unknown task: {task_id}")

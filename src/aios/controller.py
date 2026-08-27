@@ -32,18 +32,27 @@ Never list, read, write, or inspect `/skills` directly, and never combine a Skil
 invocation with another shell command, pipe, or redirection.
 Skills do not grant permissions; if a required capability is unavailable, report the block.
 Do not merely describe a tool call: call the tool. Tool results will be returned to you.
+Use context.workspace_inventory as the authoritative initial file listing. Do not spend separate
+rounds on `ls`, `find`, or `file` for paths and extensions already present there. The `read`
+primitive already adapts directories, text/code, CSV, ZIP, PDF, and XLSX into structured observations;
+call `read` directly instead of installing parsers or building format-specific shell pipelines.
 Listing or reading files is observation, not task completion. Continue until the user goal is fulfilled.
 For a requested artifact, call write and only finish after its successful tool result.
 Use edit for exact modifications. Use bash only for commands that are necessary and verifiable.
 Primitive read/write/edit paths may be relative or start with /workspace; both address the same
 transactional task workspace. Bash starts in /workspace. Never scan the container root `/`.
 Respect context.budget, preserve reserved completion calls, and stop broad inspection before the
-tool budget is exhausted. Prefer task and trace query tools over unrelated workspace scans.
+tool budget is exhausted. A cycle boundary is not a task deadline: checkpoint continuation may
+resume the task with fresh HOT context. Prefer task and trace query tools over unrelated scans.
 When the task is complete, return a concise final answer with no tool call.
-On the final call tools are disabled. Never print XML, DSML, tool-call tags, or a serialized
+Only when context.budget.force_final is true are tools disabled. Never print XML, DSML, tool-call tags, or a serialized
 tool request as text; synthesize the best natural-language answer from existing observations.
 Never request credentials, host paths, paths outside documented sandbox mounts, host execution,
 or unregistered tools. Network is usable only when host policy grants it.
+The governed scientific Python environment already provides numpy, pandas, scipy, statsmodels,
+openpyxl, and pypdf when the task needs them. Do not install those packages. Missing pure-Python
+packages for novel formats may use `python -m pip install --target /deps PACKAGE` when network is
+available. `/deps` persists across continuation cycles and is discarded only at a true task end.
 """
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
@@ -221,7 +230,7 @@ class LLMController:
         if use_tool_calling:
             request_data["tools"] = self.tool_schemas
             budget = (context or {}).get("budget", {})
-            force_final = budget.get("remaining_model_calls_after_this") == 0
+            force_final = bool(budget.get("force_final", False))
             request_data["tool_choice"] = "none" if force_final else "auto"
         else:
             request_data["response_format"] = {"type": "json_object"}
@@ -338,13 +347,11 @@ class LLMController:
             if isinstance(tool_calls, list) and tool_calls:
                 raise ControllerError("Model protocol repair failed: native tool calls remained")
             if not isinstance(content, str) or not content.strip() or contains_serialized_tool_call(content):
-                reasoning = message.get("reasoning_content")
-                raise ControllerError(
-                    "Model protocol repair failed: no valid final answer; "
-                    f"finish_reason={choice.get('finish_reason', 'unknown')}; "
-                    f"content_type={type(content).__name__}; "
-                    f"content_chars={len(content) if isinstance(content, str) else 0}; "
-                    f"reasoning_chars={len(reasoning) if isinstance(reasoning, str) else 0}"
+                return Plan(
+                    summary=self._protocol_failure_fallback(messages),
+                    actions=[],
+                    done=True,
+                    model_usage=combined_usage,
                 )
             return Plan(
                 summary=content.strip(), actions=[], done=True,
@@ -352,6 +359,34 @@ class LLMController:
             )
         except (KeyError, IndexError, TypeError) as exc:
             raise ControllerError("Model protocol repair failed: invalid response") from exc
+
+    @staticmethod
+    def _protocol_failure_fallback(messages: list[dict[str, Any]]) -> str:
+        """Return a protocol-clean degraded answer while preserving the last observed failure."""
+        detail = "No usable tool result was available."
+        for item in reversed(messages):
+            if item.get("role") != "tool" or not isinstance(item.get("content"), str):
+                continue
+            try:
+                payload = json.loads(item["content"])
+            except json.JSONDecodeError:
+                payload = {}
+            error = payload.get("error")
+            output = payload.get("output")
+            fragments = [str(error)] if error else []
+            if isinstance(output, dict):
+                for name in ("stderr", "stdout"):
+                    value = output.get(name)
+                    if isinstance(value, str) and value.strip():
+                        fragments.append(value.strip())
+            if fragments:
+                detail = " | ".join(fragments)[:1200]
+            break
+        return (
+            "Unable to complete the task with the available observations. The model's final "
+            "response remained an invalid serialized tool request after one no-tools protocol "
+            f"repair. Last observed tool result: {detail}"
+        )
 
     @classmethod
     def _parse_tool_calls(cls, tool_calls: Any) -> list[Action]:

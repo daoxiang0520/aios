@@ -1,5 +1,100 @@
 # AIOS v0.6 实现与测试报告
 
+## v0.6.6.1 Runtime Hardening（2026-08-28）
+
+Task 55 的失败链已定位为 Runtime 复合故障：`python ... | head` 由末端命令覆盖退出码；模型请求 180 秒却被旧的 60 秒配置上限静默截断；科学依赖在任务私有环境中重复安装；第六轮仅因 CycleBudget 耗尽就强制 `tool_choice=none`；XLSX 默认大预览与历史 Tool Result 持续堆入 HOT context。它不是“建模能力缺失”。
+
+本版实现：
+
+1. Docker Bash 固定使用 `bash -o pipefail -lc`。
+2. `default_timeout_seconds=60` 与 `max_timeout_seconds=300` 分离，并兼容读取旧 `timeout_seconds`。
+3. 显式引入 `CycleBudget` 与 `TaskBudget`；默认 Task 上限为 24 Model Calls、32 Tool Calls、300000 Tokens、6 Cycles。
+4. 非终态周期耗尽写入 `budget_deferred` checkpoint，提交阶段性 Workspace，并投递 `TASK_CONTINUE`；continuation 不增加 attempts。
+5. Controller 仅在 `budget.force_final=true` 的真实 TaskBudget 终点禁用工具，Cycle 最后一轮保持 Tool Calling。
+6. Resource Observation 默认压缩为：text/PDF 12000 字符、CSV 5 行、XLSX 每 Sheet 3 行；显式 offset/limit 仍可分页读取。
+7. Tool Result 全量进入 Trace，模型侧只保留受限 Observation；超过 HOT 窗口的旧结果降为摘要与 `trace:<id>` 引用。
+8. 新增可复用 `scientific-py312-v1` 环境，固定 numpy、pandas、scipy、statsmodels、openpyxl、pypdf；首次准备后跨任务只读复用。任务私有 `/deps` 则跨 continuation 保留至真实终态。
+9. 新增累计指标：Task Cycles、Model Calls、Tokens、Rounds To First Computation、Dependency Provision Latency。
+
+确定性回归新增 5 项，覆盖 timeout 迁移、180 秒请求、pipefail 启动参数、checkpoint continuation/attempt 不增加、HOT context compaction；Docker 可用环境另执行真实 `python ... | head` 失败传播测试。Task 55 原题作为最终真实模型验收，不以单元模拟代替。
+
+实际仓库验收结果：完整 86 项测试全部通过、无跳过。真实 Docker 探针 `python -c "import sys; sys.exit(7)" | head -5` 返回 `exit_code=7`，ToolExecutor 记录 `ok=false / Command exited with 7`。科学环境首次准备耗时 203725 ms（超过旧 60 秒阈值但在新 300 秒上限内完成），紧接着第二次加载命中缓存，仅 0.073 ms。
+
+Task 55 已恢复为 queued，等待真实模型重跑。该验收会把 `workspace/MathModeling/题目分析.md` 与 `附件.xlsx` 的任务相关内容发送到用户配置的外部模型；由于这属于本地数据外发，需单独明确授权后才能执行，不能用“已允许联网/安装依赖”替代数据发送授权。
+
+## v0.6.6 Resource Adapter & Harness Perception
+
+### 迭代动机
+
+任务 52、53 暴露的主要问题不是模型缺少任务求解知识，而是环境发现与数据接入成本过高：Agent 在真正阅读题目前，连续使用 `ls`、`find`、`file`、Python Import 探测和依赖安装，消耗了大部分 Model Round。任务 53 在第 5 轮成功安装 `pymupdf/openpyxl`，但第 6 轮已被强制收尾，最终只能进入 `degraded`。
+
+本次迭代采用以下边界：
+
+```text
+Specialize Perception, not Cognition
+
+模型可见：read / write / edit / bash
+                    │
+                    ▼
+             Resource Adapter
+       ┌────────┬─────┬─────┬─────┬─────┐
+       ▼        ▼     ▼     ▼     ▼     ▼
+   directory  text   CSV   ZIP   PDF   XLSX
+```
+
+Harness 负责稳定、重复的数据接入；模型仍然决定读取范围、分析方法、是否继续取样以及如何完成用户任务。系统没有加入 `read_pdf`、`read_excel` 等专用 Tool，也没有硬编码“数模题分析流程”。
+
+### 实现内容
+
+- 新增 `ResourceAdapter`，置于既有 `read` Primitive 下方；模型 Tool Schema 仍精确保持 `read/write/edit/bash` 四项。
+- `read` 统一返回 `resource.path / type / metadata / representations` 结构：
+  - Directory：条目类型、工作区相对路径、大小和修改时间；
+  - Text/Code：字符总数、有界文本表示、Offset 与截断标记；
+  - CSV：行列规模与最多 100 行的有界预览；
+  - ZIP：最多 200 个归档条目及压缩前后大小；
+  - PDF：页数、文本字符数、加密状态和有界文本表示；
+  - XLSX：工作表名称、行列规模及每个 Sheet 的有界行预览。
+- 旧版隐藏接口 `list_files/read_file` 继续通过兼容投影返回原有列表或文本，避免破坏 legacy Plugin。
+- Capability Registry 新增 `resource.read=available`，并声明 `directory/text/csv/zip/pdf/xlsx` Adapter；它是环境接口能力，不是可自主晋升的任务 Skill。
+- Runtime 首轮上下文新增有界 Workspace Inventory：最多 200 个文件的相对路径与大小，排除 `.aios` 内部路径，并明确要求模型不要对已知路径重复执行 `ls/find/file`。
+- PDF/XLSX 通过固定、非模型生成的 Python Adapter 在 Docker 内解析：
+  - 工作区与依赖目录只读挂载；
+  - 丢弃全部 Linux Capabilities，启用 `no-new-privileges`；
+  - 正式解析阶段强制 `--network none`；
+  - 路径必须是工作区相对路径，拒绝绝对路径和 `..`；
+  - Adapter 只输出结构化观察，不执行总结或任务策略。
+- 任务级 `/deps` 在同一任务的多次 Docker 调用之间持久，任务结束时删除；缺少 PDF/XLSX 依赖时，仅安装固定版本 `pypdf==5.4.0`、`openpyxl==3.1.5`。它不污染宿主 Python，也不会进入 Workspace 提交结果。
+- `capabilities.network_enabled=true` 时允许依赖安装使用 Docker Bridge；关闭时安装会明确失败，不回退宿主 Shell。依赖安装完成后的资源解析始终断网。
+- 默认与示例 `max_model_calls_per_cycle` 从 4 调整为 6；Tool Call 上限仍为 8，最终回答仍保留一轮。
+- 最终轮连续产生序列化 Tool Markup 时，一次无 Tools 修复后若仍失败，Controller 生成协议干净、携带最后工具证据的受限回答；Verifier 将其标记为 `degraded`，不再因为相同协议污染直接进入死信。
+- 包版本升级为 `0.6.6`，README 同步记录 Resource Adapter 的职责与“不替代认知策略”边界。
+
+### 测试与真实验证
+
+- 完整回归共发现 81 项测试，81 项全部通过，无跳过。
+- 新增/更新测试覆盖：
+  - 模型可见 Tool 仍只有四项；
+  - `/workspace` 路径语义与目录结构化返回；
+  - Workspace Inventory 的 200 项上限、截断标记和 `.aios` 排除；
+  - Text Offset/Limit、CSV Preview、ZIP Listing；
+  - PDF/XLSX 固定路由到 Sandbox Adapter；
+  - `/deps` 在两次独立真实 Docker 调用之间可见；
+  - Docker Bridge 开关、依赖环境变量和只读边界；
+  - 两次 DSML 最终回答失败转为协议干净的 `degraded` 结果。
+- 使用真实工作区文件进行不调用模型的集成验证：
+  - `MathModeling/C题.pdf` 成功识别为 `application/pdf`，页数为 2，并按 `limit=2000` 返回 2000 个文本字符；
+  - `MathModeling/附件.xlsx` 成功识别为 OOXML Spreadsheet，发现 2 个工作表，并按每表 3 行生成预览；
+  - 验证过程只输出页数、类型、Sheet 数和预览行数等元数据，没有把文档内容发送给外部模型。
+
+### 当前限制
+
+- PDF Adapter 当前只做文本层提取；扫描版 PDF 尚无 OCR，复杂表格和版面结构也未还原。
+- XLSX 当前提供 Sheet 元数据和有界行预览，不直接生成 DataFrame、公式依赖图或全表统计；模型可按需继续分页读取。
+- Image、音视频及非 ZIP Archive 尚未进入 Resource Adapter；未知二进制格式只返回元数据与“无已注册表示”说明。
+- `/deps` 是任务级而非跨任务缓存，同一依赖在新任务中可能重新下载；这是隔离性与启动成本之间的当前取舍。
+- 当前 Budget 仍以 Model Round 与 Tool Call 数量为主，尚未实现按 Execution Cost、Observation Cost 加权的成本模型。
+- `resource.read` 已进入 Root Capability，但“运行中发现新格式→能力重评估→生成候选 Adapter/Skill”的动态进化闭环仍未实现。
+
 ## v0.6.5 Task Capsule & Counterfactual Skill Evaluation
 
 - 路径语义热修复：Primitive 文件工具现在把容器路径 `/workspace` 和 `/workspace/...` 安全映射到 Host 侧事务 Workspace；相对路径行为保持不变，`/workspace/..`、相似前缀、`/aios-state` 与其他绝对路径仍拒绝。任务 50 的失败调用 `read({"path":"/workspace"})` 已加入回归测试。
@@ -65,7 +160,7 @@ v0.6 将高阶能力的进化从“增加模型可见 Tool Schema”迁移到 Sk
 Root Capability → Primitive Tool → Skill → Workflow → Harness
 ```
 
-本版只进化 Skill 层。模型可见的 Primitive Tool 仍精确为 `read`、`write`、`edit`、`bash`。
+v0.6.0–v0.6.5 只进化 Skill 层；v0.6.6 新增的 Resource Adapter 是不可由 Agent 绕过治理门修改的基础环境感知层，不是任务 Workflow。模型可见的 Primitive Tool 仍精确为 `read`、`write`、`edit`、`bash`。
 
 ## 已实现
 
@@ -86,14 +181,16 @@ Root Capability → Primitive Tool → Skill → Workflow → Harness
 ## 验收结果
 
 - Python 源码与测试编译检查通过。
-- v0.6.2 发布时在真实目标仓库中共 53 项单元/集成测试全部通过，无跳过。
-- Docker Engine 可用，真实通过了只读 Skill Dispatcher、`workspace_search` 执行和直接源文件调用拒绝测试。
-- 测试覆盖：四原语不增殖、Manifest 与 Lineage 验证、确定性候选、Benchmark 门、人工晋升门、单调版本、回滚、废弃、权限交集、Agent 候选注册、Skill 遥测与标准 Trace、模型调用/token 计数、Runtime 目录隔离和旧版回归。
+- 当前 v0.6.6 在真实目标仓库中共 81 项单元/集成测试全部通过，无跳过；v0.6.2 发布时的 53 项记录保留在版本历史中。
+- Docker Engine 可用，真实通过只读 Skill Dispatcher、`workspace_search`、直接源文件调用拒绝、任务级 `/deps` 跨调用持久性，以及真实 PDF/XLSX Resource Adapter 测试。
+- 测试覆盖：四原语不增殖、结构化资源观察、Workspace Inventory、路径隔离、Manifest 与 Lineage、确定性候选、Benchmark/Counterfactual/人工晋升门、单调版本、回滚、废弃、权限交集、Agent 候选注册、Skill 遥测与标准 Trace、模型调用/Token 计数、Runtime 目录隔离和旧版回归。
 
 ## 边界与后续
 
 - v0.6 不实现 Workflow Evolution；计划属于 v0.7。
 - v0.6 不实现 Harness Evolution；计划属于 v0.8。
-- 默认没有外部网络代理，因此声明 `network.external` 的 Skill 仍会进入 `needs_authority`。
+- 示例配置默认关闭网络；当前用户配置已显式启用完全出网，Docker 使用 unrestricted Bridge。系统尚无域名白名单代理，`allowed_domains` 目前不构成强制约束。
 - 当 Docker 不可用时，Skill Benchmark 和沙盒任务会明确失败/阻断，不回退到宿主 Shell。
+- PDF/XLSX Adapter 依赖 Docker；依赖尚未安装且网络关闭时会明确失败。已安装依赖后的解析过程固定断网。
+- Resource Adapter 特化数据接入，不特化任务思考；数模分析、文献综述、仓库分析等仍属于 Model/Skill/Workflow 层。
 - Python `compile()` 只是静态语法门，不代表安全证明；真实行为安全仍由 Docker 边界和 Capability 检查保证。

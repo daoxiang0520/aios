@@ -33,6 +33,7 @@ class TaskStatus(StrEnum):
     FAILED = "failed"
     DEAD_LETTER = "dead_letter"
     DEGRADED = "degraded"
+    DEFERRED = "budget_deferred"
     BLOCKED_CAPABILITY = "blocked_capability"
     NEEDS_AUTHORITY = "needs_authority"
     RETRYABLE_FAILURE = "retryable_failure"

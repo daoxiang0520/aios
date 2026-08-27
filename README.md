@@ -1,6 +1,7 @@
 # Self-Evolving AIOS v0.6
 
-Current release: **v0.6.5**. It adds immutable Task Capsules, content-addressed
+Current release: **v0.6.6**. It adds a Resource Adapter layer beneath the unchanged `read` primitive,
+while retaining v0.6.5 immutable Task Capsules, content-addressed
 workspace and Skill snapshots, isolated baseline/candidate worlds, replicated
 counterfactual execution, multidimensional objective comparison, and an optional
 order-reversed semantic judge. Historical replay remains available as weaker evidence.
@@ -58,6 +59,12 @@ order-reversed semantic judge. Historical replay remains available as weaker evi
 - 可选盲语义 Judge 会交换 A/B 顺序检测位置偏差，且不能覆盖安全和 Verifier 硬证据。
 - 统一沙盒路径语义：`read/write/edit` 同时接受相对路径与 `/workspace/...`，两者映射到同一事务快照；其他绝对路径和路径逃逸仍被 Security Kernel 拒绝。
 - 可选完全出网：`capabilities.network_enabled=true` 时 Docker 使用 `bridge`，`network.external` 标记为 `available/unrestricted`；关闭时继续强制 `--network none`。当前没有域名白名单代理。
+- 任务级 Python 依赖层：沙箱中的 `/deps` 在同一任务各轮间持久、任务结束即销毁；完全出网时 Agent 可用 `pip --target /deps` 临时组合 PDF/XLSX 等解析能力，不污染宿主环境。
+- 有界工作区清单：Runtime 在首轮上下文中提供最多 200 个文件的相对路径与大小，减少模型用 `ls/find/file` 重复发现文件造成的轮次浪费。
+- Resource Adapter：模型仍只看到 `read/write/edit/bash`；`read` 可结构化读取目录、文本/代码、CSV、ZIP、PDF 和 XLSX。PDF/XLSX 解析在只读 Docker 中运行，模型仍自行决定读取范围和分析策略。
+
+`read` 返回统一的资源观察：`resource.path / type / metadata / representations`。目录条目使用工作区相对路径；PDF 表示包含页数和可分页文本；XLSX 表示包含工作表维度与有界行预览。适配器只改善数据接入，不自动总结、建模或选择求解流程。
+- 最终回答协议修复连续失败时，不再直接把任务送入死信；系统生成协议干净、带最后工具证据的受限回答，并由 Verifier 标记为 `degraded`。
 
 ## Skill 使用与进化
 
@@ -280,3 +287,13 @@ python -m unittest discover -s tests -v
 ## 当前阶段
 
 v0.6 已开始 Skill Evolution：Trace 或重复任务可以被沉淀为候选 Skill，但是只有通过沙盒测试和晋升门的版本才会进入运行时。它是受约束的能力学习，不是任意宿主源码自修改。
+
+## v0.6.6.1 Runtime Hardening
+
+- Bash 固定由 `bash -o pipefail -lc` 执行，pipeline 中前段失败不再被 `head` 等末端命令掩盖。
+- 沙盒命令超时拆为 `default_timeout_seconds` 与 `max_timeout_seconds`；旧 `timeout_seconds` 配置会自动迁移，任务请求的较长超时不再被默认值静默压回。
+- `CycleBudget` 只控制单周期资源，`TaskBudget` 控制完整任务；周期耗尽产生 `budget_deferred` checkpoint 和 `TASK_CONTINUE`，不增加任务 attempt。
+- 只有任务真正完成、明确失败或 TaskBudget 到达终点才进入 Verifier/finalization；周期最后一轮不再自动禁用工具。
+- PDF/XLSX/CSV/text 采用 metadata-first 小预览，Tool Result 有字符预算；旧的大结果从 HOT context 压缩成摘要与 `trace:<id>` 引用。
+- 首次需要科学计算时，Host Provider 构建固定版本的 numpy/pandas/scipy/statsmodels/openpyxl/pypdf 环境；后续任务只读复用。任务私有 `/deps` 跨 continuation 保留，真正终态才清理。
+- Evidence 新增任务累计 Model Calls、Tokens、Task Cycles、首次计算轮次与依赖准备延迟。

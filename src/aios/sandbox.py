@@ -7,11 +7,68 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .config import SandboxConfig
+
+
+RESOURCE_READER_SCRIPT = r'''import datetime,json,sys
+from pathlib import Path
+
+kind, relative, raw_offset, raw_limit, raw_max = sys.argv[1:]
+root = Path('/workspace').resolve()
+target = (root / relative).resolve()
+target.relative_to(root)
+offset = max(0, int(raw_offset))
+limit = int(raw_limit)
+max_output = max(1, int(raw_max))
+
+def safe(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (datetime.date, datetime.datetime, datetime.time)):
+        return value.isoformat()
+    return str(value)
+
+if kind == 'pdf':
+    from pypdf import PdfReader
+    reader = PdfReader(str(target))
+    pages = []
+    for number, page in enumerate(reader.pages, start=1):
+        pages.append(f'\n--- page {number} ---\n' + (page.extract_text() or ''))
+    text = ''.join(pages)
+    cap = max_output if limit < 0 else min(max_output, max(0, limit))
+    selected = text[offset:offset + cap]
+    result = {'resource': {
+        'path': relative, 'type': 'application/pdf',
+        'metadata': {'size': target.stat().st_size, 'pages': len(reader.pages), 'characters': len(text), 'encrypted': bool(reader.is_encrypted)},
+        'representations': [{'kind': 'text', 'offset': offset, 'text': selected, 'truncated': offset + len(selected) < len(text)}],
+    }}
+elif kind == 'xlsx':
+    from openpyxl import load_workbook
+    workbook = load_workbook(target, read_only=True, data_only=True)
+    row_limit = 3 if limit < 0 else min(100, max(0, limit))
+    sheets = []
+    previews = []
+    for sheet in workbook.worksheets:
+        sheets.append({'name': sheet.title, 'rows': sheet.max_row, 'columns': sheet.max_column})
+        rows = []
+        if row_limit:
+            for row in sheet.iter_rows(min_row=offset + 1, max_row=offset + row_limit, max_col=min(sheet.max_column or 1, 50), values_only=True):
+                rows.append([safe(value) for value in row])
+        previews.append({'kind': 'sheet_preview', 'sheet': sheet.title, 'row_offset': offset, 'rows': rows, 'truncated': offset + len(rows) < (sheet.max_row or 0)})
+    result = {'resource': {
+        'path': relative, 'type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'metadata': {'size': target.stat().st_size, 'sheets': sheets},
+        'representations': previews,
+    }}
+else:
+    raise ValueError('Unsupported resource kind')
+print(json.dumps(result, ensure_ascii=False))
+'''
 
 
 class SandboxUnavailable(RuntimeError):
@@ -27,6 +84,7 @@ class SandboxSession:
     task_id: int
     path: Path
     state_path: Path
+    dependencies_path: Path
 
 
 class DockerSandboxBroker:
@@ -46,6 +104,8 @@ class DockerSandboxBroker:
         self.skills_root = skills_root.resolve() if skills_root is not None else None
         self.network_enabled = bool(network_enabled)
         self.session: SandboxSession | None = None
+        self.dependencies_root = (self.root / "task_dependencies").resolve()
+        self.scientific_environment = (self.root / "environments" / "scientific-py312-v1").resolve()
 
     def available(self) -> bool:
         if self.config.backend != "docker" or shutil.which("docker") is None:
@@ -100,9 +160,11 @@ class DockerSandboxBroker:
         session_root.mkdir(parents=True)
         snapshot = session_root / "workspace"
         state_path = session_root / "state"
+        dependencies_path = (self.dependencies_root / f"task_{task_id}").resolve()
         shutil.copytree(workspace, snapshot, dirs_exist_ok=True)
         state_path.mkdir()
-        self.session = SandboxSession(task_id, snapshot, state_path)
+        dependencies_path.mkdir(parents=True, exist_ok=True)
+        self.session = SandboxSession(task_id, snapshot, state_path, dependencies_path)
         return snapshot
 
     def run(self, command: str, timeout_seconds: int | None = None) -> dict[str, Any]:
@@ -112,7 +174,7 @@ class DockerSandboxBroker:
         if not self.available():
             raise SandboxUnavailable("Docker sandbox is unavailable; host execution is forbidden")
         before = self._manifest(self.session.path)
-        timeout = min(timeout_seconds or self.config.timeout_seconds, self.config.timeout_seconds)
+        timeout = self._effective_timeout(timeout_seconds)
         args = [
             "docker", "run", "--rm", "--network", self.network_mode, "--read-only",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
@@ -120,10 +182,15 @@ class DockerSandboxBroker:
             "--pids-limit", str(self.config.pids_limit),
             "--mount", f"type=bind,src={self.session.path},dst=/workspace",
             "--mount", f"type=bind,src={self.session.state_path},dst=/aios-state,readonly",
+            "--mount", f"type=bind,src={self.session.dependencies_path},dst=/deps",
+            "--env", "PYTHONPATH=/deps:/opt/aios-scientific", "--env", "PIP_TARGET=/deps",
+            "--tmpfs", "/tmp:rw,nosuid,size=128m",
         ]
+        if self.scientific_environment.exists():
+            args.extend(["--mount", f"type=bind,src={self.scientific_environment},dst=/opt/aios-scientific,readonly"])
         if self.skills_root is not None and self.skills_root.exists():
             args.extend(["--mount", f"type=bind,src={self.skills_root},dst=/skills,readonly"])
-        args.extend(["--workdir", "/workspace", self.config.image, "sh", "-lc", command])
+        args.extend(["--workdir", "/workspace", self.config.image, "bash", "-o", "pipefail", "-lc", command])
         try:
             result = subprocess.run(
                 args,
@@ -160,7 +227,7 @@ class DockerSandboxBroker:
                 json.dumps({"tasks": [], "traces": [], "dead-letters": [], "memory": [], "capabilities": {}}, ensure_ascii=False),
                 encoding="utf-8",
             )
-            timeout = min(timeout_seconds, self.config.timeout_seconds)
+            timeout = self._effective_timeout(timeout_seconds)
             args = [
                 "docker", "run", "--rm", "--network", self.network_mode, "--read-only",
                 "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
@@ -169,7 +236,7 @@ class DockerSandboxBroker:
                 "--mount", f"type=bind,src={workspace},dst=/workspace",
                 "--mount", f"type=bind,src={state},dst=/aios-state,readonly",
                 "--mount", f"type=bind,src={package.resolve()},dst=/candidate,readonly",
-                "--workdir", "/workspace", self.config.image, "sh", "-lc", command,
+                "--workdir", "/workspace", self.config.image, "bash", "-o", "pipefail", "-lc", command,
             ]
             try:
                 result = subprocess.run(
@@ -179,6 +246,107 @@ class DockerSandboxBroker:
             except subprocess.TimeoutExpired as exc:
                 raise TimeoutError(f"Skill benchmark exceeded {timeout}s") from exc
             return {"exit_code": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
+
+    def read_resource(
+        self, relative_path: str, *, kind: str, offset: int = 0,
+        limit: int | None = None, max_output_bytes: int = 1_048_576,
+    ) -> dict[str, Any]:
+        """Run a fixed resource adapter; no model-generated shell is involved."""
+        if self.session is None:
+            raise SandboxUnavailable("No active sandbox session")
+        packages = {"pdf": ("pypdf", "pypdf==5.4.0"), "xlsx": ("openpyxl", "openpyxl==3.1.5")}
+        if kind not in packages:
+            raise SandboxPolicyError(f"Unsupported resource adapter: {kind}")
+        path = Path(relative_path)
+        if path.is_absolute() or ".." in path.parts:
+            raise SandboxPolicyError("Resource adapter path must be workspace-relative")
+        if not self.available():
+            raise SandboxUnavailable("Docker sandbox is unavailable; resource adapters cannot run on host")
+
+        module, requirement = packages[kind]
+        if not (self.session.dependencies_path / module).exists() and not (self.scientific_environment / module).exists():
+            install = self.run(
+                f"python -m pip install --disable-pip-version-check --no-input --target /deps {requirement}"
+            )
+            if install.get("exit_code") != 0:
+                raise SandboxUnavailable(
+                    "Resource adapter dependency installation failed: "
+                    + str(install.get("stderr") or install.get("stdout") or "unknown error")[-2000:]
+                )
+
+        script = self.session.state_path / "resource_reader.py"
+        script.write_text(RESOURCE_READER_SCRIPT, encoding="utf-8")
+        args = [
+            "docker", "run", "--rm", "--network", "none", "--read-only",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+            "--memory", f"{self.config.memory_mb}m", "--cpus", str(self.config.cpus),
+            "--pids-limit", str(self.config.pids_limit),
+            "--mount", f"type=bind,src={self.session.path},dst=/workspace,readonly",
+            "--mount", f"type=bind,src={self.session.state_path},dst=/aios-state,readonly",
+            "--mount", f"type=bind,src={self.session.dependencies_path},dst=/deps,readonly",
+            "--env", "PYTHONPATH=/deps:/opt/aios-scientific", "--tmpfs", "/tmp:rw,nosuid,size=128m",
+            "--workdir", "/workspace", self.config.image,
+            "python", "/aios-state/resource_reader.py", kind, path.as_posix(),
+            str(max(0, offset)), str(-1 if limit is None else limit), str(max_output_bytes),
+        ]
+        if self.scientific_environment.exists():
+            insert_at = args.index("--workdir")
+            args[insert_at:insert_at] = ["--mount", f"type=bind,src={self.scientific_environment},dst=/opt/aios-scientific,readonly"]
+        try:
+            result = subprocess.run(
+                args, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=self.config.default_timeout_seconds, check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(f"Resource adapter exceeded {self.config.default_timeout_seconds}s") from exc
+        return {"exit_code": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
+
+    def ensure_scientific_environment(self) -> dict[str, Any]:
+        """Provision the governed scientific stack once, then mount it read-only for tasks."""
+        started = time.perf_counter()
+        sentinel = self.scientific_environment / ".aios-environment.json"
+        if sentinel.is_file():
+            return {"ready": True, "cache_hit": True, "latency_ms": (time.perf_counter() - started) * 1000}
+        if not self.network_enabled:
+            return {"ready": False, "cache_hit": False, "error": "Network authority is required to provision the scientific environment"}
+        if not self.available():
+            return {"ready": False, "cache_hit": False, "error": "Docker sandbox is unavailable"}
+        self.scientific_environment.mkdir(parents=True, exist_ok=True)
+        requirements = [
+            "numpy==2.2.6", "pandas==2.2.3", "scipy==1.15.3",
+            "statsmodels==0.14.4", "openpyxl==3.1.5", "pypdf==5.4.0",
+        ]
+        args = [
+            "docker", "run", "--rm", "--network", self.network_mode,
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+            "--memory", f"{self.config.memory_mb}m", "--cpus", str(self.config.cpus),
+            "--pids-limit", str(self.config.pids_limit),
+            "--mount", f"type=bind,src={self.scientific_environment},dst=/environment",
+            "--tmpfs", "/tmp:rw,nosuid,size=512m", self.config.image,
+            "python", "-m", "pip", "install", "--disable-pip-version-check", "--no-input",
+            "--target", "/environment", *requirements,
+        ]
+        try:
+            result = subprocess.run(
+                args, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=self.config.max_timeout_seconds, check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(f"Scientific environment provisioning exceeded {self.config.max_timeout_seconds}s") from exc
+        latency = (time.perf_counter() - started) * 1000
+        if result.returncode != 0:
+            return {"ready": False, "cache_hit": False, "latency_ms": latency, "error": (result.stderr or result.stdout)[-4000:]}
+        sentinel.write_text(json.dumps({"requirements": requirements}, ensure_ascii=False), encoding="utf-8")
+        return {"ready": True, "cache_hit": False, "latency_ms": latency, "requirements": requirements}
+
+    def purge_task_dependencies(self, task_id: int) -> None:
+        path = (self.dependencies_root / f"task_{task_id}").resolve()
+        if path.parent == self.dependencies_root and path.exists():
+            shutil.rmtree(path)
+
+    def _effective_timeout(self, requested: int | None) -> int:
+        value = self.config.default_timeout_seconds if requested is None else int(requested)
+        return max(1, min(value, self.config.max_timeout_seconds))
 
     @property
     def network_mode(self) -> str:

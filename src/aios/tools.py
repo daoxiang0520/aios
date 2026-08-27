@@ -7,6 +7,7 @@ from typing import Any
 
 from .config import PermissionConfig
 from .plugins import PluginManager
+from .resources import ResourceAdapter
 from .sandbox import DockerSandboxBroker
 from .security import SecurityKernel
 from .types import Action, ActionResult
@@ -14,7 +15,7 @@ from .types import Action, ActionResult
 Tool = Callable[..., Any]
 
 CORE_TOOL_SCHEMAS: list[dict[str, Any]] = [
-    {"type": "function", "function": {"name": "read", "description": "Read a UTF-8 file or list a directory in the task workspace. Use a relative path or /workspace/...; /workspace is the workspace root.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}}, "required": ["path"], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "read", "description": "Read a workspace resource through the Resource Adapter. Supports structured directory listings, UTF-8 text/code, CSV previews, ZIP listings, PDF text, and XLSX sheet previews. Use a relative path or /workspace/...; /workspace is the workspace root. offset/limit select text characters, CSV/XLSX rows, or PDF text characters depending on representation.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}}, "required": ["path"], "additionalProperties": False}}},
     {"type": "function", "function": {"name": "write", "description": "Create or replace a UTF-8 file in the task workspace. Use a relative path or /workspace/....", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"], "additionalProperties": False}}},
     {"type": "function", "function": {"name": "edit", "description": "Replace exact text in an existing UTF-8 workspace file. Use a relative path or /workspace/....", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}, "replace_all": {"type": "boolean"}}, "required": ["path", "old_text", "new_text"], "additionalProperties": False}}},
     {"type": "function", "function": {"name": "bash", "description": "Run a command inside the configured strong sandbox with /workspace as its working directory. Never runs on the host and must not scan container root.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "timeout_seconds": {"type": "integer"}}, "required": ["command"], "additionalProperties": False}}},
@@ -25,6 +26,7 @@ class ToolRegistry:
     def __init__(self, permissions: PermissionConfig, plugins: PluginManager | None = None, sandbox: DockerSandboxBroker | None = None):
         self.permissions = permissions
         self.sandbox = sandbox
+        self.resources = ResourceAdapter(permissions, sandbox)
         self._tools: dict[str, Tool] = {}
         self._schemas = {item["function"]["name"]: item for item in CORE_TOOL_SCHEMAS}
         for name, tool in (("read", self.read), ("write", self.write), ("edit", self.edit), ("bash", self.bash), ("echo", self.echo), ("list_files", self.list_files), ("read_file", self.read_file), ("write_file", self.write_file), ("append_file", self.append_file)):
@@ -53,14 +55,7 @@ class ToolRegistry:
         return {"message": message}
 
     def read(self, path: str, offset: int = 0, limit: int | None = None) -> Any:
-        target = Path(path)
-        if target.is_dir():
-            return [{"name": child.name, "is_dir": child.is_dir(), "size": child.stat().st_size if child.is_file() else None} for child in sorted(target.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower()))]
-        if target.stat().st_size > self.permissions.max_read_bytes:
-            raise ValueError(f"File exceeds {self.permissions.max_read_bytes} bytes")
-        text = target.read_text(encoding="utf-8")
-        start = max(0, offset)
-        return text[start : start + limit if limit is not None else None]
+        return self.resources.read(path, offset, limit)
 
     @staticmethod
     def write(path: str, content: str) -> dict[str, Any]:
@@ -87,10 +82,10 @@ class ToolRegistry:
         return self.sandbox.run(command, timeout_seconds)
 
     def list_files(self, path: str = ".") -> Any:
-        return self.read(path)
+        return self.resources.legacy_list(path)
 
     def read_file(self, path: str) -> str:
-        return self.read(path)
+        return self.resources.legacy_text(path)
 
     @staticmethod
     def write_file(path: str, content: str, overwrite: bool = False) -> dict[str, Any]:

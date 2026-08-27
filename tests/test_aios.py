@@ -91,7 +91,9 @@ class AIOSMVPTests(unittest.TestCase):
         executor = ToolExecutor(ToolRegistry(self.settings.permissions), kernel)
         result = executor.execute(Action("read", {"path": "/workspace"}))
         self.assertTrue(result.ok)
-        self.assertIn("MathModeling", {item["name"] for item in result.output})
+        entries = result.output["resource"]["representations"][0]["entries"]
+        self.assertEqual(result.output["resource"]["type"], "directory")
+        self.assertIn("MathModeling", {item["name"] for item in entries})
         written = executor.execute(Action("write", {"path": "/workspace/result.txt", "content": "old"}))
         edited = executor.execute(Action("edit", {
             "path": "/workspace/result.txt", "old_text": "old", "new_text": "new",

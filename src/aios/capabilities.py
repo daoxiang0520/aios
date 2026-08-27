@@ -103,6 +103,17 @@ class EvidenceContract:
             if any(marker in text for marker in ("测试", "pytest", "test")) and not skill_authoring:
                 evidence.append(EvidenceRequirement("command_success"))
 
+        scientific_markers = (
+            "建模", "数学模型", "优化模型", "数据分析", "回归", "拟合", "统计分析",
+            "numpy", "pandas", "scipy", "statsmodels", "scientific python",
+        )
+        if any(marker in text for marker in scientific_markers):
+            capabilities.append(CapabilityRequirement(
+                "execution.python.scientific",
+                "Task requires the governed scientific Python environment",
+            ))
+            capabilities.append(CapabilityRequirement("process.sandbox_exec", "Scientific computation runs in Docker"))
+
         output_artifacts = list(dict.fromkeys(artifacts or []))
         for artifact in output_artifacts:
             evidence.append(EvidenceRequirement("artifact", artifact))
@@ -125,13 +136,24 @@ class CapabilityRegistry:
         sandbox_available: bool,
         network_enabled: bool,
         allowed_domains: list[str] | None = None,
+        scientific_available: bool | None = None,
     ) -> "CapabilityRegistry":
         domains = allowed_domains or []
         network_state = CapabilityState.AVAILABLE if network_enabled else CapabilityState.NEEDS_AUTHORITY
         sandbox_state = CapabilityState.AVAILABLE if sandbox_available else CapabilityState.MISSING
+        scientific_state = (
+            CapabilityState.AVAILABLE
+            if sandbox_available and (network_enabled or scientific_available)
+            else CapabilityState.NEEDS_AUTHORITY if sandbox_available else CapabilityState.MISSING
+        )
         return cls(
             [
                 Capability("filesystem.read", CapabilityState.AVAILABLE, "read", "Workspace snapshot only"),
+                Capability(
+                    "resource.read", CapabilityState.AVAILABLE, "read",
+                    "Structured directory/text/CSV/ZIP observations; PDF/XLSX adapters run in Docker",
+                    {"adapters": ["directory", "text", "csv", "zip", "pdf", "xlsx"]},
+                ),
                 Capability("filesystem.write", CapabilityState.AVAILABLE, "write/edit", "Workspace snapshot only"),
                 Capability(
                     "filesystem.outside_workspace",
@@ -140,6 +162,11 @@ class CapabilityRegistry:
                     "Host and parent paths are outside the Agent authority boundary",
                 ),
                 Capability("process.sandbox_exec", sandbox_state, "bash", "Docker sandbox required"),
+                Capability(
+                    "execution.python.scientific", scientific_state, "python",
+                    "Pinned reusable numpy/pandas/scipy/statsmodels environment",
+                    {"provider": "scientific-py312-v1", "reusable": True},
+                ),
                 Capability(
                     "network.external",
                     network_state,

@@ -4,8 +4,14 @@
   "poll_interval_seconds": 2.0,
   "max_actions_per_cycle": 8,
   "budget": {
-    "max_model_calls_per_cycle": 4,
+    "max_model_calls_per_cycle": 6,
     "max_tool_calls_per_cycle": 8,
+    "max_model_calls_per_task": 24,
+    "max_tool_calls_per_task": 32,
+    "max_tokens_per_task": 300000,
+    "max_cycles_per_task": 6,
+    "tool_observation_characters": 12000,
+    "hot_tool_results": 4,
     "reserved_completion_tool_calls": 1
   },
   "evolution": {
@@ -22,7 +28,8 @@
   "sandbox": {
     "backend": "docker",
     "image": "python:3.12-slim",
-    "timeout_seconds": 60,
+    "default_timeout_seconds": 60,
+    "max_timeout_seconds": 300,
     "memory_mb": 512,
     "cpus": 1.0,
     "pids_limit": 128,

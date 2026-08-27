@@ -31,9 +31,15 @@ class PermissionConfig:
 
 @dataclass(slots=True)
 class BudgetConfig:
-    max_model_calls_per_cycle: int = 4
+    max_model_calls_per_cycle: int = 6
     max_tool_calls_per_cycle: int = 8
+    max_model_calls_per_task: int = 24
+    max_tool_calls_per_task: int = 32
+    max_tokens_per_task: int = 300_000
+    max_cycles_per_task: int = 6
     reserved_completion_tool_calls: int = 1
+    tool_observation_characters: int = 12_000
+    hot_tool_results: int = 4
 
 
 @dataclass(slots=True)
@@ -55,7 +61,8 @@ class CapabilityConfig:
 class SandboxConfig:
     backend: str = "docker"
     image: str = "python:3.12-slim"
-    timeout_seconds: int = 60
+    default_timeout_seconds: int = 60
+    max_timeout_seconds: int = 300
     memory_mb: int = 512
     cpus: float = 1.0
     pids_limit: int = 128
@@ -122,10 +129,20 @@ class Settings:
             budget=BudgetConfig(**raw.get("budget", {})),
             evolution=EvolutionConfig(**raw.get("evolution", {})),
             capabilities=CapabilityConfig(**raw.get("capabilities", {})),
-            sandbox=SandboxConfig(**raw.get("sandbox", {})),
+            sandbox=SandboxConfig(**cls._sandbox_values(raw.get("sandbox", {}))),
             skills=SkillConfig(**raw.get("skills", {})),
             experiments=ExperimentConfig(**raw.get("experiments", {})),
         )
+
+    @staticmethod
+    def _sandbox_values(value: dict[str, Any]) -> dict[str, Any]:
+        """Accept the pre-v0.6.6.1 timeout key without preserving its broken semantics."""
+        result = dict(value)
+        legacy = result.pop("timeout_seconds", None)
+        if legacy is not None:
+            result.setdefault("default_timeout_seconds", int(legacy))
+            result.setdefault("max_timeout_seconds", max(300, int(legacy)))
+        return result
 
     @property
     def extensions(self) -> Path:

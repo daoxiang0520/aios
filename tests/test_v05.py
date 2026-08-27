@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
@@ -13,6 +14,7 @@ from aios.controller import ControllerError, LLMController
 from aios.evaluation import Verifier
 from aios.runtime import AIOSRuntime
 from aios.sandbox import SandboxPolicyError, SandboxUnavailable
+from aios.tools import ToolRegistry
 from aios.types import Action, ActionResult, Event, Intent, MemoryType, Plan, Task, TaskStatus
 
 
@@ -56,6 +58,12 @@ class V05Tests(unittest.TestCase):
             runtime.sandbox.run("python -c \"print('ok')\"")
         docker_args = run.call_args.args[0]
         self.assertEqual(docker_args[docker_args.index("--network") + 1], "bridge")
+        self.assertIn("PYTHONPATH=/deps:/opt/aios-scientific", docker_args)
+        self.assertIn("PIP_TARGET=/deps", docker_args)
+        self.assertIn(
+            f"type=bind,src={runtime.sandbox.session.dependencies_path},dst=/deps",
+            docker_args,
+        )
         runtime.sandbox.discard()
 
     def test_disabled_network_keeps_docker_network_none(self) -> None:
@@ -63,6 +71,81 @@ class V05Tests(unittest.TestCase):
         self.assertEqual(runtime.sandbox.network_mode, "none")
         network = runtime.capabilities.as_dict()["network.external"]
         self.assertEqual(network["state"], "needs_authority")
+
+    def test_task_dependencies_persist_across_real_docker_calls(self) -> None:
+        runtime = AIOSRuntime(self.settings)
+        if not runtime.sandbox.available():
+            self.skipTest("Docker engine unavailable")
+        runtime.sandbox.prepare(1, self.settings.workspace)
+        try:
+            created = runtime.sandbox.run("printf 'VALUE = 42\\n' > /deps/aios_task_dep_probe.py")
+            loaded = runtime.sandbox.run(
+                'python -c "import aios_task_dep_probe; print(aios_task_dep_probe.VALUE)"'
+            )
+        finally:
+            runtime.sandbox.discard()
+        self.assertEqual(created["exit_code"], 0, created)
+        self.assertEqual(loaded["exit_code"], 0, loaded)
+        self.assertEqual(loaded["stdout"].strip(), "42")
+
+    def test_workspace_inventory_is_bounded_and_excludes_internal_paths(self) -> None:
+        root = self.settings.workspace
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "MathModeling").mkdir()
+        (root / "MathModeling" / "problem.pdf").write_bytes(b"pdf")
+        (root / "data.xlsx").write_bytes(b"xlsx")
+        (root / ".aios").mkdir()
+        (root / ".aios" / "private.txt").write_text("hidden", encoding="utf-8")
+
+        inventory = AIOSRuntime._workspace_inventory(root, limit=1)
+
+        self.assertEqual(inventory["total_files"], 2)
+        self.assertTrue(inventory["truncated"])
+        paths = [item["path"] for item in inventory["files"]]
+        self.assertNotIn(".aios/private.txt", paths)
+
+    def test_read_resource_adapts_text_csv_and_zip_without_new_tools(self) -> None:
+        self.settings.ensure_directories()
+        root = self.settings.workspace
+        (root / "note.txt").write_text("abcdef", encoding="utf-8")
+        (root / "data.csv").write_text("name,value\na,1\nb,2\n", encoding="utf-8")
+        with zipfile.ZipFile(root / "bundle.zip", "w") as archive:
+            archive.writestr("inside.txt", "ok")
+        registry = ToolRegistry(self.settings.permissions)
+
+        text_value = registry.read(str(root / "note.txt"), offset=1, limit=3)
+        csv_value = registry.read(str(root / "data.csv"), limit=2)
+        zip_value = registry.read(str(root / "bundle.zip"))
+
+        self.assertEqual(text_value["resource"]["representations"][0]["text"], "bcd")
+        self.assertEqual(csv_value["resource"]["metadata"]["columns"], 2)
+        self.assertEqual(csv_value["resource"]["representations"][0]["rows"][0], ["name", "value"])
+        self.assertEqual(zip_value["resource"]["representations"][0]["entries"][0]["path"], "inside.txt")
+
+    def test_pdf_and_xlsx_read_route_through_fixed_sandbox_adapter(self) -> None:
+        self.settings.ensure_directories()
+        target = self.settings.workspace / "problem.pdf"
+        target.write_bytes(b"%PDF fixture")
+        sandbox = Mock()
+        sandbox.session.path = self.settings.workspace
+        sandbox.read_resource.return_value = {
+            "exit_code": 0,
+            "stdout": json.dumps({"resource": {
+                "path": "problem.pdf", "type": "application/pdf",
+                "metadata": {"pages": 1},
+                "representations": [{"kind": "text", "text": "problem"}],
+            }}),
+            "stderr": "",
+        }
+        registry = ToolRegistry(self.settings.permissions, sandbox=sandbox)
+
+        value = registry.read(str(target))
+
+        self.assertEqual(value["resource"]["metadata"]["pages"], 1)
+        sandbox.read_resource.assert_called_once_with(
+            "problem.pdf", kind="pdf", offset=0, limit=None,
+            max_output_bytes=12000,
+        )
 
     def test_explicit_outside_workspace_path_is_forbidden_before_model(self) -> None:
         for request in ("读取../config.json并告诉我内容", r"读取C:\Users\person\secret.txt", "读取/etc/passwd"):
@@ -170,7 +253,7 @@ class V05Tests(unittest.TestCase):
         check = next(item for item in task.result["evidence"]["verification"]["checks"] if item["name"] == "tool_failures_recovered")
         self.assertTrue(check["passed"])
 
-    def test_last_model_round_forces_final_answer_without_tools(self) -> None:
+    def test_only_terminal_task_budget_forces_final_answer_without_tools(self) -> None:
         config = self.settings.model
         config.provider = "deepseek"
         config.api_key_env = "TEST_DEEPSEEK_KEY"
@@ -186,7 +269,7 @@ class V05Tests(unittest.TestCase):
             captured.update(json.loads(request.data.decode("utf-8")))
             return response
 
-        context = {"budget": {"remaining_model_calls_after_this": 0}}
+        context = {"budget": {"remaining_model_calls_after_this": 0, "force_final": True}}
         with patch.dict(os.environ, {"TEST_DEEPSEEK_KEY": "test-only"}), patch("urllib.request.urlopen", side_effect=fake_open):
             plan = controller.plan(Intent("test", "test", None, []), [], context)
         self.assertEqual(captured["tool_choice"], "none")
@@ -247,7 +330,7 @@ class V05Tests(unittest.TestCase):
             payloads.append(json.loads(request.data.decode("utf-8")))
             return next(replies)
 
-        context = {"budget": {"remaining_model_calls_after_this": 0, "protocol_repairs_remaining": 1}}
+        context = {"budget": {"remaining_model_calls_after_this": 0, "force_final": True, "protocol_repairs_remaining": 1}}
         with patch.dict(os.environ, {"TEST_DEEPSEEK_KEY": "test-only"}), patch(
             "urllib.request.urlopen", side_effect=fake_open
         ):
@@ -259,6 +342,43 @@ class V05Tests(unittest.TestCase):
         self.assertEqual(payloads[0]["tool_choice"], "none")
         self.assertNotIn("tools", payloads[1])
         self.assertNotIn("tool_choice", payloads[1])
+
+    def test_repeated_final_dsml_becomes_protocol_clean_degraded_plan(self) -> None:
+        config = self.settings.model
+        config.provider = "deepseek"
+        config.api_key_env = "TEST_DEEPSEEK_KEY"
+        controller = LLMController(config)
+
+        def response(content: str):
+            value = MagicMock()
+            value.read.return_value = json.dumps({
+                "choices": [{"message": {"content": content, "tool_calls": []}, "finish_reason": "stop"}]
+            }).encode("utf-8")
+            value.__enter__.return_value = value
+            return value
+
+        replies = iter([
+            response('<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="bash">'),
+            response('<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="bash">again'),
+        ])
+        context = {
+            "budget": {"remaining_model_calls_after_this": 0, "force_final": True, "protocol_repairs_remaining": 1},
+            "_protocol_messages": [{
+                "role": "tool", "tool_call_id": "call_1",
+                "content": json.dumps({"ok": False, "error": "Command exited with 1"}),
+            }],
+        }
+        with patch.dict(os.environ, {"TEST_DEEPSEEK_KEY": "test-only"}), patch(
+            "urllib.request.urlopen", side_effect=lambda request, timeout: next(replies)
+        ):
+            plan = controller.plan(Intent("test", "test", None, []), [], context)
+
+        self.assertTrue(plan.done)
+        self.assertEqual(plan.actions, [])
+        self.assertIn("Unable to complete", plan.summary)
+        self.assertIn("Command exited with 1", plan.summary)
+        verification = Verifier().verify([], [], planned_count=0, task_done=True, final_output=plan.summary)
+        self.assertEqual(verification["outcome"], "degraded")
 
     def test_failed_protocol_repair_is_terminal_without_full_task_retries(self) -> None:
         runtime = AIOSRuntime(self.settings)
