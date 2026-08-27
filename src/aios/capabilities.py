@@ -92,7 +92,11 @@ class EvidenceContract:
                 capabilities.append(CapabilityRequirement("process.sandbox_exec", "State CLI is accessed through sandbox bash"))
                 evidence.append(EvidenceRequirement(evidence_kind))
 
-        process_markers = ("运行", "执行", "测试", "pytest", "python", "shell", "bash", "命令")
+        # A request about Python source files is still a filesystem task. Requiring
+        # Docker merely because the language name appears creates a false preflight
+        # block when read/list primitives are sufficient. Execution verbs retain
+        # the strong-sandbox requirement.
+        process_markers = ("运行", "执行", "测试", "pytest", "shell", "bash", "命令", "run ", "execute")
         if any(marker in text for marker in process_markers):
             capabilities.append(CapabilityRequirement("process.sandbox_exec", "Task requires executable commands"))
             skill_authoring = is_skill_authoring_request(request)

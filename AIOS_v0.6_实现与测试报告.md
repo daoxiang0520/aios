@@ -9,7 +9,8 @@
 - 缺少历史基线、基线任务无结果或基线已使用同名 Skill 时，证据级别为 `insufficient_historical_baseline` 并阻止 Agent 候选晋升。
 - 直接 Replay 无法观测端到端 Token，因此评分时将 Token 保持为基线值，不把未知值伪装为零；Skill-enabled Model Calls 明确标记为两次往返代理。
 - 当前属于 Execution Proxy + Historical Baseline，不宣称严格因果 A/B。精确 A/B 需要后续保存任务执行前 Workspace Capsule，再分别运行 baseline/skill-enabled Harness。
-- 构建副本与真实仓库均发现 60 项测试：59 项通过，1 项 Docker 实机用例因宿主 `com.docker.service` 停止且当前身份无启动权限而显式跳过。未将跳过计为实机通过；Docker 恢复后应单独复跑。
+- 修复能力预检误报：仅提及 Python 源文件不再要求 `process.sandbox_exec`；只有运行、执行、测试、Shell/Bash/命令等执行语义才要求 Docker 沙盒。任务 48 的原始提示词已加入回归测试。
+- 构建副本与真实仓库均发现 61 项测试：60 项通过，1 项 Docker 实机用例因宿主 `com.docker.service` 停止且当前身份无启动权限而显式跳过。未将跳过计为实机通过；Docker 恢复后应单独复跑。
 
 ## v0.6.3 Skill Authoring Contract
 

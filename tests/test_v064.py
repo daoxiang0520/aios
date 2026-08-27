@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from aios.config import Settings
+from aios.capabilities import EvidenceContract
 from aios.skills import SkillManager, SkillPromotionError
 from aios.storage import StateStore
 from aios.types import Task, TaskStatus
@@ -122,6 +123,18 @@ class V064UtilityTests(unittest.TestCase):
         self.assertEqual(report["metrics"]["success_rate"], 1.0)
         self.assertEqual(report["metrics"]["true_completion_rate"], 0.0)
         self.assertEqual(report["negative_transfer_rate"], 1.0)
+
+    def test_python_source_analysis_does_not_require_process_sandbox(self) -> None:
+        contract = EvidenceContract.from_request(
+            "找出 workspace 中所有包含 TODO/FIXME 的 Python 文件，"
+            "统计每个目录的数量，并输出 JSON。"
+        )
+        names = {item.name for item in contract.capabilities}
+        self.assertNotIn("process.sandbox_exec", names)
+
+        execution = EvidenceContract.from_request("运行 Python 程序并执行测试。")
+        execution_names = {item.name for item in execution.capabilities}
+        self.assertIn("process.sandbox_exec", execution_names)
 
 
 if __name__ == "__main__":
