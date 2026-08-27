@@ -125,7 +125,14 @@ class Verifier:
         pairs = [(action, result) for action, result in zip(actions, results, strict=False) if result.ok]
         searchable = " ".join(f"{action.arguments} {result.output}" for action, result in pairs).lower()
         if kind == "network_request":
-            return any(action.tool == "bash" and re.search(r"\b(curl|wget)\b", str(action.arguments.get("command", ""))) for action, _ in pairs)
+            clients = r"\b(?:curl|wget)\b|urllib\.request|http\.client|requests\.(?:get|post|request)"
+            return any(
+                action.tool == "bash"
+                and isinstance(result.output, dict)
+                and result.output.get("exit_code") == 0
+                and re.search(clients, str(action.arguments.get("command", "")), re.IGNORECASE)
+                for action, result in pairs
+            )
         if kind == "source_domain":
             return bool(value) and value.lower() in searchable and Verifier._has_evidence("network_request", None, actions, results)
         mapping = {"trace_query": "aiosctl.py traces", "dead_letter_query": "aiosctl.py dead-letters", "task_query": "aiosctl.py tasks", "memory_query": "aiosctl.py memory"}

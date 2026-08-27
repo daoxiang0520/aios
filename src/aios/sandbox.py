@@ -37,10 +37,14 @@ class DockerSandboxBroker:
     the host.
     """
 
-    def __init__(self, root: Path, config: SandboxConfig, skills_root: Path | None = None):
+    def __init__(
+        self, root: Path, config: SandboxConfig, skills_root: Path | None = None,
+        *, network_enabled: bool = False,
+    ):
         self.root = root.resolve()
         self.config = config
         self.skills_root = skills_root.resolve() if skills_root is not None else None
+        self.network_enabled = bool(network_enabled)
         self.session: SandboxSession | None = None
 
     def available(self) -> bool:
@@ -110,7 +114,7 @@ class DockerSandboxBroker:
         before = self._manifest(self.session.path)
         timeout = min(timeout_seconds or self.config.timeout_seconds, self.config.timeout_seconds)
         args = [
-            "docker", "run", "--rm", "--network", "none", "--read-only",
+            "docker", "run", "--rm", "--network", self.network_mode, "--read-only",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "--memory", f"{self.config.memory_mb}m", "--cpus", str(self.config.cpus),
             "--pids-limit", str(self.config.pids_limit),
@@ -158,7 +162,7 @@ class DockerSandboxBroker:
             )
             timeout = min(timeout_seconds, self.config.timeout_seconds)
             args = [
-                "docker", "run", "--rm", "--network", "none", "--read-only",
+                "docker", "run", "--rm", "--network", self.network_mode, "--read-only",
                 "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
                 "--memory", f"{self.config.memory_mb}m", "--cpus", str(self.config.cpus),
                 "--pids-limit", str(self.config.pids_limit),
@@ -176,6 +180,11 @@ class DockerSandboxBroker:
                 raise TimeoutError(f"Skill benchmark exceeded {timeout}s") from exc
             return {"exit_code": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
 
+    @property
+    def network_mode(self) -> str:
+        """Docker egress mode. `bridge` is intentionally unrestricted."""
+        return "bridge" if self.network_enabled else "none"
+
     @staticmethod
     def _validate_command_scope(command: str) -> None:
         _parse_skill_command(command)
@@ -189,6 +198,7 @@ class DockerSandboxBroker:
             raise SandboxPolicyError(
                 "Broad container-root access is forbidden; inspect /workspace or /aios-state only"
             )
+
     def expose_read_only_state(self, state: dict[str, Any]) -> None:
         if self.session is None:
             raise SandboxUnavailable("No active sandbox session")

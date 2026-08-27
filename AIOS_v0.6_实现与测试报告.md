@@ -3,6 +3,7 @@
 ## v0.6.5 Task Capsule & Counterfactual Skill Evaluation
 
 - 路径语义热修复：Primitive 文件工具现在把容器路径 `/workspace` 和 `/workspace/...` 安全映射到 Host 侧事务 Workspace；相对路径行为保持不变，`/workspace/..`、相似前缀、`/aios-state` 与其他绝对路径仍拒绝。任务 50 的失败调用 `read({"path":"/workspace"})` 已加入回归测试。
+- 完全出网热修复：`capabilities.network_enabled=true` 现在真实传递到 Runtime、Skill Benchmark 与 `aiosctl`，Docker 从 `--network none` 切换为 `--network bridge`，Capability Registry 同步标记 `network.external=available` 和 `mode=unrestricted`。关闭时仍保持 `none/needs_authority`；`allowed_domains` 当前不执行白名单约束。
 - 新增 `experiments/` 子系统：`ContentAddressedSnapshotStore`、`CapsuleManager`、`ExperimentOrchestrator`、`RuntimeVariantRunner`、`CounterfactualEvaluator` 与 `PairwiseSemanticJudge`。
 - Capsule 以 Manifest + Immutable References 保存任务、执行前 Workspace、Active Skill 集、Capability、Harness、Model、Sandbox 镜像身份和外部依赖指纹；工作区与 Skill 文件按 SHA256 去重存储。
 - 完整初始状态哈希同时覆盖 Task、Workspace、Active Skills、Capability、Harness、Model 与 Environment。Baseline/Candidate 在应用显式 Skill Mutation 前必须具有相同状态哈希。
@@ -15,7 +16,7 @@
 - 新增 SQLite 表：`task_capsules`、`capsule_objects`、`experiments`、`experiment_variants`、`experiment_runs`、`counterfactual_reports`、`semantic_judgements`。
 - 新增 CLI：`capsule capture/show/list/verify/fork/archive/delete`、`experiment run/show/compare`、`skill counterfactual-replay`。
 - v0.6.5 专项 10 项测试全部通过，覆盖同起点、实验隔离、Host 不污染、单变量、3×2 重复运行、随机聚合、坏 Skill、质量成本冲突、Judge 位置偏差、Capsule 损坏和晋升证据门。
-- 构建副本在受限测试环境中发现 73 项测试：72 项通过，1 项 Docker 实机用例显式跳过；真实仓库在宿主权限下 73 项全部通过，包含 Docker Skill Dispatcher 实机边界测试。
+- 构建副本在受限测试环境中发现 76 项测试：75 项通过，1 项 Docker 实机用例显式跳过；真实仓库在宿主权限下 76 项全部通过。额外以 `python:3.12-slim`、只读根文件系统、Drop ALL Capabilities 和 Docker Bridge 实测访问 `https://example.com` 返回 HTTP 200。新增测试分别锁定“开启即 bridge/available/unrestricted”、“关闭仍 none/needs_authority”，以及成功的 Python `urllib.request` 调用可形成 Verifier 网络证据。
 
 ## v0.6.4 Skill Utility & Replay Benchmark
 

@@ -127,9 +127,7 @@ class CapabilityRegistry:
         allowed_domains: list[str] | None = None,
     ) -> "CapabilityRegistry":
         domains = allowed_domains or []
-        # v0.5 does not yet ship the allow-listed network proxy. Enabling the
-        # config cannot silently turn Docker's --network none into open egress.
-        network_state = CapabilityState.MISSING if network_enabled else CapabilityState.NEEDS_AUTHORITY
+        network_state = CapabilityState.AVAILABLE if network_enabled else CapabilityState.NEEDS_AUTHORITY
         sandbox_state = CapabilityState.AVAILABLE if sandbox_available else CapabilityState.MISSING
         return cls(
             [
@@ -145,9 +143,17 @@ class CapabilityRegistry:
                 Capability(
                     "network.external",
                     network_state,
-                    "sandbox network broker",
-                    "Network is disabled; an allow-listed network broker is not implemented yet",
-                    {"allowed_domains": domains},
+                    "docker bridge egress" if network_enabled else "none",
+                    (
+                        "Unrestricted Docker egress is enabled by host policy"
+                        if network_enabled
+                        else "Network is disabled and requires host authority"
+                    ),
+                    {
+                        "mode": "unrestricted" if network_enabled else "disabled",
+                        "allowed_domains": domains,
+                        "domain_allowlist_enforced": False,
+                    },
                 ),
                 Capability("state.task_read", CapabilityState.COMPOSABLE, "python /aios-state/aiosctl.py tasks", "Read-only snapshot"),
                 Capability("state.trace_read", CapabilityState.COMPOSABLE, "python /aios-state/aiosctl.py traces", "Read-only snapshot"),

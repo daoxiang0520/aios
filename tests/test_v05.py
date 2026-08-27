@@ -37,6 +37,33 @@ class V05Tests(unittest.TestCase):
         self.assertEqual(runtime.store.list_memories(), [])
         runtime.controller.plan.assert_not_called()
 
+    def test_enabled_network_is_available_and_uses_unrestricted_docker_bridge(self) -> None:
+        self.settings.capabilities.network_enabled = True
+        runtime = AIOSRuntime(self.settings)
+        contract = EvidenceContract.from_request("联网查询最新资料")
+        assessment = runtime.capabilities.assess(contract)
+        self.assertTrue(assessment["satisfied"])
+        network = runtime.capabilities.as_dict()["network.external"]
+        self.assertEqual(network["state"], "available")
+        self.assertEqual(network["policy"]["mode"], "unrestricted")
+        self.assertFalse(network["policy"]["domain_allowlist_enforced"])
+        self.assertEqual(runtime.sandbox.network_mode, "bridge")
+
+        runtime.sandbox.prepare(1, self.settings.workspace)
+        runtime.sandbox.available = Mock(return_value=True)
+        completed = __import__("subprocess").CompletedProcess([], 0, stdout="ok", stderr="")
+        with patch("aios.sandbox.subprocess.run", return_value=completed) as run:
+            runtime.sandbox.run("python -c \"print('ok')\"")
+        docker_args = run.call_args.args[0]
+        self.assertEqual(docker_args[docker_args.index("--network") + 1], "bridge")
+        runtime.sandbox.discard()
+
+    def test_disabled_network_keeps_docker_network_none(self) -> None:
+        runtime = AIOSRuntime(self.settings)
+        self.assertEqual(runtime.sandbox.network_mode, "none")
+        network = runtime.capabilities.as_dict()["network.external"]
+        self.assertEqual(network["state"], "needs_authority")
+
     def test_explicit_outside_workspace_path_is_forbidden_before_model(self) -> None:
         for request in ("读取../config.json并告诉我内容", r"读取C:\Users\person\secret.txt", "读取/etc/passwd"):
             with self.subTest(request=request):
@@ -90,6 +117,20 @@ class V05Tests(unittest.TestCase):
         result = Verifier().verify([Action("write", {"path": "latest.md"})], [ActionResult("write", True, {"path": str(path)})], planned_count=1, task_done=True, request="搜索 arXiv 最新论文并生成 latest.md", final_output=str(path))
         self.assertFalse(result["passed"])
         self.assertFalse(result["evidence_satisfied"])
+
+    def test_successful_python_urllib_call_is_network_evidence(self) -> None:
+        action = Action("bash", {
+            "command": "python -c \"import urllib.request; print(urllib.request.urlopen('https://example.com').status)\""
+        })
+        result = ActionResult("bash", True, {
+            "exit_code": 0, "stdout": "200 https://example.com", "stderr": "", "changes": [],
+        })
+        verification = Verifier().verify(
+            [action], [result], planned_count=1, task_done=True,
+            request="联网查询 example.com 的最新信息", final_output="example.com returned HTTP 200",
+        )
+        self.assertTrue(verification["passed"])
+        self.assertTrue(verification["evidence_satisfied"])
 
     def test_native_final_text_is_not_converted_to_removed_echo_tool(self) -> None:
         config = self.settings.model

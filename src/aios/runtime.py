@@ -41,7 +41,10 @@ class AIOSRuntime:
         self.skills = SkillManager(settings.skills_root, settings.skills)
         if settings.skills.enabled:
             self.skills.bootstrap_builtins()
-        self.sandbox = DockerSandboxBroker(settings.sandbox_root, settings.sandbox, self.skills.runtime)
+        self.sandbox = DockerSandboxBroker(
+            settings.sandbox_root, settings.sandbox, self.skills.runtime,
+            network_enabled=settings.capabilities.network_enabled,
+        )
         self.capabilities = CapabilityRegistry.default(
             sandbox_available=self.sandbox.available(),
             network_enabled=settings.capabilities.network_enabled,

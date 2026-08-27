@@ -207,7 +207,10 @@ def _skill_services(settings: Settings) -> tuple[SkillManager, DockerSandboxBrok
     manager = SkillManager(settings.skills_root, settings.skills)
     if settings.skills.enabled:
         manager.bootstrap_builtins()
-    broker = DockerSandboxBroker(settings.sandbox_root, settings.sandbox, manager.runtime)
+    broker = DockerSandboxBroker(
+        settings.sandbox_root, settings.sandbox, manager.runtime,
+        network_enabled=settings.capabilities.network_enabled,
+    )
     capabilities = CapabilityRegistry.default(
         sandbox_available=broker.available(),
         network_enabled=settings.capabilities.network_enabled,

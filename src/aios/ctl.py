@@ -31,7 +31,10 @@ def main(argv: list[str] | None = None) -> int:
     elif args.resource == "skill-usage":
         payload = store.list_skill_usage(limit=args.limit)
     else:
-        sandbox = DockerSandboxBroker(settings.sandbox_root, settings.sandbox)
+        sandbox = DockerSandboxBroker(
+            settings.sandbox_root, settings.sandbox,
+            network_enabled=settings.capabilities.network_enabled,
+        )
         payload = CapabilityRegistry.default(
             sandbox_available=sandbox.available(),
             network_enabled=settings.capabilities.network_enabled,

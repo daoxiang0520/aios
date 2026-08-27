@@ -57,6 +57,7 @@ order-reversed semantic judge. Historical replay remains available as weaker evi
 - Counterfactual Evaluator 输出完整指标向量和 `REJECTED / INSUFFICIENT_EVIDENCE / NEEDS_REVIEW / PROMOTABLE`；
 - 可选盲语义 Judge 会交换 A/B 顺序检测位置偏差，且不能覆盖安全和 Verifier 硬证据。
 - 统一沙盒路径语义：`read/write/edit` 同时接受相对路径与 `/workspace/...`，两者映射到同一事务快照；其他绝对路径和路径逃逸仍被 Security Kernel 拒绝。
+- 可选完全出网：`capabilities.network_enabled=true` 时 Docker 使用 `bridge`，`network.external` 标记为 `available/unrestricted`；关闭时继续强制 `--network none`。当前没有域名白名单代理。
 
 ## Skill 使用与进化
 
@@ -114,11 +115,11 @@ Capsule and re-executes the complete Model → Agent → Tools/Skill → Verifie
 Post-hoc captures and unresolved container identities are marked `PARTIAL` and cannot
 become `PROMOTABLE` without review.
 
-Skill 不会产生权限。有效权限始终是 `Manifest 声明能力 ∩ Host 已授予能力`；例如声明 `network.external` 的 Skill 在默认配置下仍是 `needs_authority`。
+Skill 不会产生权限。有效权限始终是 `Manifest 声明能力 ∩ Host 已授予能力`。默认示例配置关闭网络；宿主显式设置 `capabilities.network_enabled=true` 后，任务和 Skill 容器获得不受域名限制的 Docker Bridge 出网能力。
 
 ## 安全边界与尚未实现
 
-v0.6 继续冻结 v0.4 的 Tool Evolution，旧插件仅保留兼容且不再暴露给模型。模型生成的命令和 Skill 测试只能进入 Docker 强沙盒；Docker 不可用时绝不降级到宿主 PowerShell。网络默认关闭。域名代理、凭据代理、Workflow Evolution、Harness Evolution 与生产发布审批仍未实现。
+v0.6 继续冻结 v0.4 的 Tool Evolution，旧插件仅保留兼容且不再暴露给模型。模型生成的命令和 Skill 测试只能进入 Docker 强沙盒；Docker 不可用时绝不降级到宿主 PowerShell。网络默认关闭，但可由宿主显式开启完全出网；域名代理、凭据代理、Workflow Evolution、Harness Evolution 与生产发布审批仍未实现。完全出网时，沙盒代码能够把 Workspace 内容发送到任意地址，应视为显著的信任边界扩张。
 
 ## 快速开始
 
