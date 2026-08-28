@@ -70,6 +70,52 @@ else:
 print(json.dumps(result, ensure_ascii=False))
 '''
 
+HTTP_READER_SCRIPT = r'''import hashlib,json,sys,urllib.request
+from urllib.parse import urlsplit
+
+url, raw_offset, raw_limit, raw_max = sys.argv[1:]
+parsed = urlsplit(url)
+if parsed.scheme.lower() not in {'http', 'https'} or not parsed.hostname:
+    raise ValueError('Only absolute http/https URLs are supported')
+if parsed.username or parsed.password or (parsed.port not in {None, 80, 443}):
+    raise ValueError('URL credentials and non-standard ports are forbidden')
+offset = max(0, int(raw_offset))
+limit = int(raw_limit)
+max_output = max(1, int(raw_max))
+request = urllib.request.Request(url, headers={
+    'User-Agent': 'AIOS-ResourceAdapter/1.0 (+governed-read)',
+    'Accept': 'text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.5',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.5',
+})
+with urllib.request.urlopen(request, timeout=20) as response:
+    raw = response.read(max_output + offset + 1)
+    status = int(getattr(response, 'status', 200))
+    final_url = response.geturl()
+    content_type = response.headers.get_content_type()
+    charset = response.headers.get_content_charset() or 'utf-8'
+text = raw.decode(charset, errors='replace')
+cap = max_output if limit < 0 else min(max_output, max(0, limit))
+selected = text[offset:offset + cap]
+result = {'resource': {
+    'path': url,
+    'type': content_type,
+    'metadata': {
+        'status': status,
+        'requested_url': url,
+        'final_url': final_url,
+        'source_domain': parsed.hostname.lower().removeprefix('www.'),
+        'bytes_observed': len(raw),
+        'content_digest': hashlib.sha256(raw).hexdigest(),
+        'characters_observed': len(text),
+    },
+    'representations': [{
+        'kind': 'text', 'offset': offset, 'text': selected,
+        'truncated': offset + len(selected) < len(text) or len(raw) > max_output + offset,
+    }],
+}}
+print(json.dumps(result, ensure_ascii=False))
+'''
+
 
 class SandboxUnavailable(RuntimeError):
     pass
@@ -106,9 +152,27 @@ class DockerSandboxBroker:
         self.session: SandboxSession | None = None
         self.dependencies_root = (self.root / "task_dependencies").resolve()
         self.scientific_environment = (self.root / "environments" / "scientific-py312-v1").resolve()
+        self._health_state = "unknown"
+        self._health_checked_at = 0.0
+        self._health_probe_count = 0
+        self._health_error: str | None = None
 
-    def available(self) -> bool:
+    def available(self, *, force: bool = False) -> bool:
+        ttl = max(0, int(self.config.health_ttl_seconds))
+        if (
+            not force
+            and self._health_state != "unknown"
+            and time.monotonic() - self._health_checked_at <= ttl
+        ):
+            return self._health_state == "ready"
+        return self._probe_health()
+
+    def _probe_health(self) -> bool:
+        self._health_probe_count += 1
         if self.config.backend != "docker" or shutil.which("docker") is None:
+            self._health_state = "unavailable"
+            self._health_checked_at = time.monotonic()
+            self._health_error = "docker executable unavailable"
             return False
         try:
             result = subprocess.run(
@@ -118,9 +182,34 @@ class DockerSandboxBroker:
                 timeout=8,
                 check=False,
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self._health_state = "unavailable"
+            self._health_checked_at = time.monotonic()
+            self._health_error = f"{type(exc).__name__}: {exc}"
             return False
-        return result.returncode == 0
+        ready = result.returncode == 0
+        self._health_state = "ready" if ready else "unavailable"
+        self._health_checked_at = time.monotonic()
+        self._health_error = None if ready else str(result.stderr or result.stdout)[-1000:]
+        return ready
+
+    def invalidate_health(self, reason: str = "explicit_invalidation") -> None:
+        self._health_state = "unknown"
+        self._health_checked_at = 0.0
+        self._health_error = reason
+
+    @property
+    def health_probe_count(self) -> int:
+        return self._health_probe_count
+
+    def health_snapshot(self) -> dict[str, Any]:
+        return {
+            "state": self._health_state,
+            "checked_at_monotonic": self._health_checked_at,
+            "probe_count": self._health_probe_count,
+            "error": self._health_error,
+            "session_task_id": self.session.task_id if self.session is not None else None,
+        }
 
     def describe_skill_invocation(self, command: str) -> dict[str, Any] | None:
         parsed = _parse_skill_command(command)
@@ -165,6 +254,8 @@ class DockerSandboxBroker:
         state_path.mkdir()
         dependencies_path.mkdir(parents=True, exist_ok=True)
         self.session = SandboxSession(task_id, snapshot, state_path, dependencies_path)
+        self.invalidate_health("session_created")
+        self.available(force=True)
         return snapshot
 
     def run(self, command: str, timeout_seconds: int | None = None) -> dict[str, Any]:
@@ -261,7 +352,9 @@ class DockerSandboxBroker:
         if path.is_absolute() or ".." in path.parts:
             raise SandboxPolicyError("Resource adapter path must be workspace-relative")
         if not self.available():
-            raise SandboxUnavailable("Docker sandbox is unavailable; resource adapters cannot run on host")
+            self.invalidate_health("adapter_preflight_unavailable")
+            if not self.available(force=True):
+                raise SandboxUnavailable("Docker sandbox is unavailable; resource adapters cannot run on host")
 
         module, requirement = packages[kind]
         if not (self.session.dependencies_path / module).exists() and not (self.scientific_environment / module).exists():
@@ -292,14 +385,101 @@ class DockerSandboxBroker:
         if self.scientific_environment.exists():
             insert_at = args.index("--workdir")
             args[insert_at:insert_at] = ["--mount", f"type=bind,src={self.scientific_environment},dst=/opt/aios-scientific,readonly"]
-        try:
-            result = subprocess.run(
-                args, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=self.config.default_timeout_seconds, check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise TimeoutError(f"Resource adapter exceeded {self.config.default_timeout_seconds}s") from exc
-        return {"exit_code": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
+        for attempt in (1, 2):
+            try:
+                result = subprocess.run(
+                    args, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    timeout=self.config.default_timeout_seconds, check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise TimeoutError(f"Resource adapter exceeded {self.config.default_timeout_seconds}s") from exc
+            output = {
+                "exit_code": result.returncode, "stdout": result.stdout, "stderr": result.stderr,
+                "attempts": attempt, "retry_count": attempt - 1,
+                "transient_recovered": attempt > 1 and result.returncode == 0,
+            }
+            if result.returncode == 0 or attempt == 2 or not self._transient_docker_failure(output):
+                return output
+            self.invalidate_health("transient_adapter_failure")
+            if not self.available(force=True):
+                return output
+        raise AssertionError("unreachable adapter retry state")
+
+    def read_http(
+        self, url: str, *, offset: int = 0, limit: int | None = None,
+        max_output_bytes: int = 12_000,
+    ) -> dict[str, Any]:
+        """Read an HTTP resource with fixed host-owned code behind `read(URL)`."""
+        if self.session is None:
+            raise SandboxUnavailable("No active sandbox session")
+        if not self.network_enabled:
+            raise SandboxPolicyError("External network authority is not granted")
+        from urllib.parse import urlsplit
+        parsed = urlsplit(str(url).strip())
+        if (
+            parsed.scheme.casefold() not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port not in {None, 80, 443}
+        ):
+            raise SandboxPolicyError("HTTP adapter accepts absolute http/https URLs without credentials or non-standard ports")
+        if not self.available():
+            raise SandboxUnavailable("Docker sandbox is unavailable; HTTP resources cannot be read")
+        script = self.session.state_path / "http_reader.py"
+        script.write_text(HTTP_READER_SCRIPT, encoding="utf-8")
+        args = [
+            "docker", "run", "--rm", "--network", self.network_mode, "--read-only",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+            "--memory", f"{self.config.memory_mb}m", "--cpus", str(self.config.cpus),
+            "--pids-limit", str(self.config.pids_limit),
+            "--mount", f"type=bind,src={self.session.state_path},dst=/aios-state,readonly",
+            "--tmpfs", "/tmp:rw,nosuid,size=32m", self.config.image,
+            "python", "/aios-state/http_reader.py", str(url), str(max(0, offset)),
+            str(-1 if limit is None else limit), str(max(1, max_output_bytes)),
+        ]
+        for attempt in (1, 2):
+            try:
+                result = subprocess.run(
+                    args, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    timeout=self.config.default_timeout_seconds, check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise TimeoutError(f"HTTP resource adapter exceeded {self.config.default_timeout_seconds}s") from exc
+            output = {
+                "exit_code": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "attempts": attempt,
+                "retry_count": attempt - 1,
+                "transient_recovered": attempt > 1 and result.returncode == 0,
+            }
+            if result.returncode == 0 or attempt == 2 or not self._transient_http_failure(output):
+                return output
+        raise AssertionError("unreachable HTTP adapter retry state")
+
+    @staticmethod
+    def _transient_http_failure(result: dict[str, Any]) -> bool:
+        text = f"{result.get('stderr', '')} {result.get('stdout', '')}".casefold()
+        return any(marker in text for marker in (
+            "temporary failure in name resolution",
+            "name or service not known",
+            "connection reset",
+            "connection refused",
+            "timed out",
+            "remote end closed connection",
+        ))
+
+    @staticmethod
+    def _transient_docker_failure(result: dict[str, Any]) -> bool:
+        if int(result.get("exit_code", 0)) not in {125, 126, 127}:
+            return False
+        text = f"{result.get('stderr', '')} {result.get('stdout', '')}".casefold()
+        return any(marker in text for marker in (
+            "cannot connect to the docker daemon", "error during connect",
+            "connection refused", "docker daemon", "context deadline exceeded",
+            "docker desktop", "the system cannot find the file specified",
+        ))
 
     def ensure_scientific_environment(self) -> dict[str, Any]:
         """Provision the governed scientific stack once, then mount it read-only for tasks."""

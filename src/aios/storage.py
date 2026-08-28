@@ -31,7 +31,10 @@ CREATE TABLE IF NOT EXISTS events (
     status TEXT NOT NULL DEFAULT 'pending',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    error TEXT
+    error TEXT,
+    task_id INTEGER,
+    checkpoint_id INTEGER,
+    continuation_generation INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_events_queue
     ON events(status, priority DESC, id ASC);
@@ -75,7 +78,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     result TEXT,
     error TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    current_checkpoint_id INTEGER,
+    continuation_generation INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_status
     ON tasks(status, priority DESC, id DESC);
@@ -191,6 +196,49 @@ ON skill_replay_reports(candidate_id,id DESC);
 CREATE INDEX IF NOT EXISTS idx_skill_replay_name
 ON skill_replay_reports(skill_name,id DESC);
 
+CREATE TABLE IF NOT EXISTS components (
+    component_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    active_version TEXT NOT NULL,
+    trust_class TEXT NOT NULL,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(kind,name)
+);
+CREATE INDEX IF NOT EXISTS idx_components_kind_status ON components(kind,status,name);
+
+CREATE TABLE IF NOT EXISTS component_versions (
+    version_id TEXT PRIMARY KEY,
+    component_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(component_id,version),
+    FOREIGN KEY(component_id) REFERENCES components(component_id)
+);
+
+CREATE TABLE IF NOT EXISTS component_capabilities (
+    component_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    direction TEXT NOT NULL CHECK(direction IN ('requires','provides')),
+    capability TEXT NOT NULL,
+    PRIMARY KEY(component_id,version,direction,capability),
+    FOREIGN KEY(component_id) REFERENCES components(component_id)
+);
+CREATE INDEX IF NOT EXISTS idx_component_capability
+ON component_capabilities(capability,direction,component_id);
+
+CREATE TABLE IF NOT EXISTS capability_implications (
+    stronger TEXT NOT NULL,
+    weaker TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(stronger,weaker)
+);
+
 CREATE TABLE IF NOT EXISTS task_capsules (
     capsule_id TEXT PRIMARY KEY,
     source_task_id INTEGER NOT NULL,
@@ -261,6 +309,12 @@ CREATE TABLE IF NOT EXISTS semantic_judgements (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(experiment_id) REFERENCES experiments(experiment_id)
 );
+
+CREATE TABLE IF NOT EXISTS runtime_metrics (
+    name TEXT PRIMARY KEY,
+    value INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
@@ -285,19 +339,241 @@ class StateStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            self._migrate_runtime_correctness(connection)
             existing = connection.execute("SELECT id FROM harness_versions LIMIT 1").fetchone()
             if existing is None:
                 connection.execute(
                     "INSERT INTO harness_versions(version,settings,status) VALUES(1,'{}','active')"
                 )
 
+    @staticmethod
+    def _migrate_runtime_correctness(connection: sqlite3.Connection) -> None:
+        event_columns = {
+            str(row["name"]) for row in connection.execute("PRAGMA table_info(events)")
+        }
+        for name, declaration in (
+            ("task_id", "INTEGER"),
+            ("checkpoint_id", "INTEGER"),
+            ("continuation_generation", "INTEGER"),
+        ):
+            if name not in event_columns:
+                connection.execute(f"ALTER TABLE events ADD COLUMN {name} {declaration}")
+        task_columns = {
+            str(row["name"]) for row in connection.execute("PRAGMA table_info(tasks)")
+        }
+        if "current_checkpoint_id" not in task_columns:
+            connection.execute("ALTER TABLE tasks ADD COLUMN current_checkpoint_id INTEGER")
+        if "continuation_generation" not in task_columns:
+            connection.execute(
+                "ALTER TABLE tasks ADD COLUMN continuation_generation INTEGER NOT NULL DEFAULT 0"
+            )
+        rows = connection.execute(
+            "SELECT id,payload FROM events WHERE type='TASK_CONTINUE'"
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"])
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            connection.execute(
+                """UPDATE events SET task_id=?,checkpoint_id=?,continuation_generation=?
+                   WHERE id=?""",
+                (
+                    payload.get("task_id"), payload.get("checkpoint_id"),
+                    payload.get("generation", 0), int(row["id"]),
+                ),
+            )
+        duplicate_tasks = connection.execute(
+            """SELECT task_id FROM events
+               WHERE type='TASK_CONTINUE' AND status IN ('pending','processing')
+                 AND task_id IS NOT NULL
+               GROUP BY task_id HAVING COUNT(*) > 1"""
+        ).fetchall()
+        for row in duplicate_tasks:
+            active = connection.execute(
+                """SELECT id FROM events WHERE type='TASK_CONTINUE' AND task_id=?
+                   AND status IN ('pending','processing') ORDER BY id DESC""",
+                (row["task_id"],),
+            ).fetchall()
+            stale_ids = [int(item["id"]) for item in active[1:]]
+            if stale_ids:
+                placeholders = ",".join("?" for _ in stale_ids)
+                connection.execute(
+                    f"UPDATE events SET status='stale',error='duplicate_continuation_migration' "
+                    f"WHERE id IN ({placeholders})",
+                    tuple(stale_ids),
+                )
+        connection.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_active_continuation_task
+               ON events(task_id)
+               WHERE type='TASK_CONTINUE' AND status IN ('pending','processing')"""
+        )
+
     def add_event(self, event: Event) -> int:
         with self.connect() as connection:
             cursor = connection.execute(
-                "INSERT INTO events(type,payload,priority,status) VALUES(?,?,?,?)",
-                (event.type, json.dumps(event.payload, ensure_ascii=False), event.priority, event.status.value),
+                """INSERT INTO events(
+                       type,payload,priority,status,task_id,checkpoint_id,continuation_generation
+                   ) VALUES(?,?,?,?,?,?,?)""",
+                (
+                    event.type, json.dumps(event.payload, ensure_ascii=False),
+                    event.priority, event.status.value,
+                    event.payload.get("task_id"), event.payload.get("checkpoint_id"),
+                    event.payload.get("generation"),
+                ),
             )
             return int(cursor.lastrowid)
+
+    @staticmethod
+    def _increment_metric(
+        connection: sqlite3.Connection, name: str, amount: int = 1,
+    ) -> None:
+        connection.execute(
+            """INSERT INTO runtime_metrics(name,value) VALUES(?,?)
+               ON CONFLICT(name) DO UPDATE SET
+                 value=value+excluded.value,updated_at=CURRENT_TIMESTAMP""",
+            (name, amount),
+        )
+
+    def runtime_metrics(self) -> dict[str, int]:
+        with self.connect() as connection:
+            rows = connection.execute("SELECT name,value FROM runtime_metrics").fetchall()
+        return {str(row["name"]): int(row["value"]) for row in rows}
+
+    def enqueue_continuation(
+        self, task_id: int, checkpoint_id: int, message: str, priority: int,
+    ) -> tuple[int | None, str]:
+        terminal = {
+            TaskStatus.COMPLETED.value, TaskStatus.FAILED.value,
+            TaskStatus.DEAD_LETTER.value, TaskStatus.DEGRADED.value,
+            TaskStatus.BLOCKED_CAPABILITY.value, TaskStatus.NEEDS_AUTHORITY.value,
+            TaskStatus.TERMINAL_FAILURE.value, TaskStatus.NEEDS_REVIEW.value,
+        }
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = connection.execute(
+                "SELECT status,current_checkpoint_id,continuation_generation FROM tasks WHERE id=?",
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise KeyError(f"Unknown task: {task_id}")
+            if str(task["status"]) in terminal:
+                self._increment_metric(connection, "stale_continuations_discarded")
+                return None, "terminal_task"
+            existing = connection.execute(
+                """SELECT id,checkpoint_id FROM events WHERE type='TASK_CONTINUE'
+                   AND task_id=? AND status IN ('pending','processing') ORDER BY id DESC LIMIT 1""",
+                (task_id,),
+            ).fetchone()
+            if existing is not None and int(existing["checkpoint_id"] or -1) == checkpoint_id:
+                self._increment_metric(connection, "continuation_duplicates_suppressed")
+                return int(existing["id"]), "duplicate_suppressed"
+            if existing is not None:
+                connection.execute(
+                    """UPDATE events SET status='stale',error='superseded_checkpoint',
+                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (int(existing["id"]),),
+                )
+                self._increment_metric(connection, "stale_continuations_discarded")
+            generation = int(task["continuation_generation"] or 0) + 1
+            payload = {
+                "task_id": task_id, "message": message, "continuation": True,
+                "checkpoint_id": checkpoint_id, "generation": generation,
+            }
+            cursor = connection.execute(
+                """INSERT INTO events(
+                       type,payload,priority,status,task_id,checkpoint_id,continuation_generation
+                   ) VALUES('TASK_CONTINUE',?,?,'pending',?,?,?)""",
+                (
+                    json.dumps(payload, ensure_ascii=False), priority,
+                    task_id, checkpoint_id, generation,
+                ),
+            )
+            connection.execute(
+                """UPDATE tasks SET current_checkpoint_id=?,continuation_generation=?,
+                   updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (checkpoint_id, generation, task_id),
+            )
+            return int(cursor.lastrowid), "queued"
+
+    def fence_continuation(self, event: Event) -> tuple[bool, str]:
+        task_id = int(event.payload.get("task_id"))
+        checkpoint_id = event.payload.get("checkpoint_id")
+        generation = event.payload.get("generation")
+        terminal = {
+            TaskStatus.COMPLETED.value, TaskStatus.FAILED.value,
+            TaskStatus.DEAD_LETTER.value, TaskStatus.DEGRADED.value,
+            TaskStatus.BLOCKED_CAPABILITY.value, TaskStatus.NEEDS_AUTHORITY.value,
+            TaskStatus.TERMINAL_FAILURE.value, TaskStatus.NEEDS_REVIEW.value,
+        }
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = connection.execute(
+                "SELECT status,current_checkpoint_id,continuation_generation FROM tasks WHERE id=?",
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                reason = "unknown_task"
+            elif str(task["status"]) in terminal:
+                reason = "terminal_task"
+            elif checkpoint_id is None or int(checkpoint_id) != int(task["current_checkpoint_id"] or -1):
+                reason = "stale_checkpoint"
+            elif generation is None or int(generation) != int(task["continuation_generation"] or 0):
+                reason = "stale_generation"
+            else:
+                return True, "current"
+            if event.id is not None:
+                connection.execute(
+                    """UPDATE events SET status='stale',error=?,updated_at=CURRENT_TIMESTAMP
+                       WHERE id=?""",
+                    (reason, int(event.id)),
+                )
+            self._increment_metric(connection, "stale_continuations_discarded")
+            return False, reason
+
+    def discard_event(self, event: Event, reason: str) -> None:
+        if event.id is None:
+            return
+        with self.connect() as connection:
+            connection.execute(
+                """UPDATE events SET status='stale',error=?,updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (reason, int(event.id)),
+            )
+
+    def quarantine_task(self, task_id: int, reason: str) -> int:
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = connection.execute("SELECT result FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if task is None:
+                raise KeyError(f"Unknown task: {task_id}")
+            result = json.loads(task["result"]) if task["result"] else {}
+            result["experience_validity"] = {
+                "agent_behavior": "invalid_for_learning",
+                "runtime_regression": True,
+                "reason": reason,
+                "cost_metrics": "contaminated",
+            }
+            cursor = connection.execute(
+                """UPDATE events SET status='stale',error=?,updated_at=CURRENT_TIMESTAMP
+                   WHERE type='TASK_CONTINUE' AND task_id=?
+                     AND status IN ('pending','processing')""",
+                (reason, task_id),
+            )
+            if cursor.rowcount:
+                self._increment_metric(
+                    connection, "stale_continuations_discarded", int(cursor.rowcount)
+                )
+            connection.execute(
+                """UPDATE tasks SET status=?,result=?,error=?,current_checkpoint_id=NULL,
+                   continuation_generation=continuation_generation+1,
+                   updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (
+                    TaskStatus.NEEDS_REVIEW.value,
+                    json.dumps(result, ensure_ascii=False, default=str), reason, task_id,
+                ),
+            )
+            return int(cursor.rowcount)
 
     def claim_events(self, limit: int = 20) -> list[Event]:
         with self.connect() as connection:
@@ -510,6 +786,143 @@ class StateStore:
             {"id": int(row["id"]), **json.loads(row["report"]), "created_at": row["created_at"]}
             for row in rows
         ]
+
+    def traces_for_cycles(self, cycle_ids: list[str]) -> list[dict[str, Any]]:
+        if not cycle_ids:
+            return []
+        placeholders = ",".join("?" for _ in cycle_ids)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM traces WHERE cycle_id IN ({placeholders}) ORDER BY id",
+                tuple(cycle_ids),
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]), "cycle_id": str(row["cycle_id"]),
+                "kind": str(row["kind"]), "data": json.loads(row["data"]),
+                "created_at": str(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    def upsert_component(self, manifest: dict[str, Any]) -> str:
+        component_id = str(manifest["component_id"])
+        version_id = str(manifest["version_id"])
+        metadata = manifest["metadata"]
+        version = str(metadata["version"])
+        payload = json.dumps(manifest, ensure_ascii=False, sort_keys=True, default=str)
+        with self.connect() as connection:
+            existing = connection.execute(
+                "SELECT version_id,manifest_json FROM component_versions WHERE component_id=? AND version=?",
+                (component_id, version),
+            ).fetchone()
+            if existing is not None and str(existing["version_id"]) != version_id:
+                previous = json.loads(existing["manifest_json"])
+                if previous.get("manifest_schema") == "component/v1.1":
+                    raise ValueError("A Component version is immutable once registered")
+                # One-time migration from the pre-v1.1 manifest shape. Once migrated,
+                # normal same-version immutability is enforced again.
+                connection.execute(
+                    "DELETE FROM component_capabilities WHERE component_id=? AND version=?",
+                    (component_id, version),
+                )
+                connection.execute(
+                    "DELETE FROM component_versions WHERE component_id=? AND version=?",
+                    (component_id, version),
+                )
+            connection.execute(
+                """INSERT INTO components(component_id,kind,name,status,active_version,trust_class,metadata)
+                   VALUES(?,?,?,?,?,?,?)
+                   ON CONFLICT(component_id) DO UPDATE SET
+                     status=excluded.status,active_version=excluded.active_version,
+                     trust_class=excluded.trust_class,metadata=excluded.metadata,
+                     updated_at=CURRENT_TIMESTAMP""",
+                (
+                    component_id, manifest["kind"], metadata["name"], metadata["status"],
+                    version, manifest["trust_policy"]["trust_class"],
+                    json.dumps(metadata, ensure_ascii=False, default=str),
+                ),
+            )
+            connection.execute(
+                """INSERT OR IGNORE INTO component_versions(
+                       version_id,component_id,version,manifest_json,content_digest
+                   ) VALUES(?,?,?,?,?)""",
+                (version_id, component_id, version, payload, manifest["content_digest"]),
+            )
+            connection.execute(
+                "DELETE FROM component_capabilities WHERE component_id=? AND version=?",
+                (component_id, version),
+            )
+            for direction in ("requires", "provides"):
+                connection.executemany(
+                    """INSERT INTO component_capabilities(component_id,version,direction,capability)
+                       VALUES(?,?,?,?)""",
+                    [
+                        (component_id, version, direction, capability)
+                        for capability in manifest["capabilities"][direction]
+                    ],
+                )
+        return component_id
+
+    def get_component(self, component_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT v.manifest_json,c.status FROM components c
+                   JOIN component_versions v ON v.component_id=c.component_id AND v.version=c.active_version
+                   WHERE c.component_id=?""",
+                (component_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = json.loads(row["manifest_json"])
+        result["metadata"] = {**result["metadata"], "status": str(row["status"])}
+        return result
+
+    def list_components(self, *, kind: str | None = None) -> list[dict[str, Any]]:
+        query = """SELECT v.manifest_json,c.status FROM components c
+                   JOIN component_versions v ON v.component_id=c.component_id AND v.version=c.active_version"""
+        params: tuple[Any, ...] = ()
+        if kind is not None:
+            query += " WHERE c.kind=?"
+            params = (kind,)
+        query += " ORDER BY c.kind,c.name"
+        with self.connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        result = []
+        for row in rows:
+            manifest = json.loads(row["manifest_json"])
+            manifest["metadata"] = {**manifest["metadata"], "status": str(row["status"])}
+            result.append(manifest)
+        return result
+
+    def update_component_status(self, component_id: str, status: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE components SET status=?,updated_at=CURRENT_TIMESTAMP WHERE component_id=?",
+                (status, component_id),
+            )
+
+    def list_component_versions(self, component_id: str) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT manifest_json FROM component_versions WHERE component_id=? ORDER BY created_at,version",
+                (component_id,),
+            ).fetchall()
+        return [json.loads(row["manifest_json"]) for row in rows]
+
+    def add_capability_implication(self, stronger: str, weaker: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO capability_implications(stronger,weaker) VALUES(?,?)",
+                (stronger, weaker),
+            )
+
+    def list_capability_implications(self) -> list[tuple[str, str]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT stronger,weaker FROM capability_implications ORDER BY stronger,weaker"
+            ).fetchall()
+        return [(str(row["stronger"]), str(row["weaker"])) for row in rows]
 
     def add_task_capsule(self, manifest: dict[str, Any]) -> str:
         with self.connect() as connection:
@@ -737,17 +1150,44 @@ class StateStore:
         result: dict[str, Any] | None = None,
         error: str | None = None,
     ) -> None:
+        terminal = status in {
+            TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.DEAD_LETTER,
+            TaskStatus.DEGRADED, TaskStatus.BLOCKED_CAPABILITY,
+            TaskStatus.NEEDS_AUTHORITY, TaskStatus.TERMINAL_FAILURE,
+            TaskStatus.NEEDS_REVIEW,
+        }
         with self.connect() as connection:
             connection.execute(
-                """UPDATE tasks SET status=?,result=?,error=?,updated_at=CURRENT_TIMESTAMP
+                """UPDATE tasks SET status=?,result=?,error=?,
+                   current_checkpoint_id=CASE WHEN ? THEN NULL ELSE current_checkpoint_id END,
+                   continuation_generation=continuation_generation+CASE WHEN ? THEN 1 ELSE 0 END,
+                   updated_at=CURRENT_TIMESTAMP
                    WHERE id=?""",
                 (
                     status.value,
                     json.dumps(result, ensure_ascii=False, default=str) if result is not None else None,
                     error,
+                    int(terminal), int(terminal),
                     task_id,
                 ),
             )
+            if terminal:
+                continuation_row = connection.execute(
+                    """SELECT COUNT(*) AS n FROM events WHERE type='TASK_CONTINUE'
+                       AND task_id=? AND status IN ('pending','processing')""",
+                    (task_id,),
+                ).fetchone()
+                connection.execute(
+                    """UPDATE events SET status='stale',error='terminal_task',
+                       updated_at=CURRENT_TIMESTAMP WHERE task_id=?
+                       AND status IN ('pending','processing')""",
+                    (task_id,),
+                )
+                stale_continuations = int(continuation_row["n"])
+                if stale_continuations:
+                    self._increment_metric(
+                        connection, "stale_continuations_discarded", stale_continuations
+                    )
 
     def add_checkpoint(self, task_id: int, phase: str, data: dict[str, Any]) -> int:
         with self.connect() as connection:
@@ -826,7 +1266,15 @@ class StateStore:
             raise KeyError(f"Unknown task: {task_id}")
         with self.connect() as connection:
             connection.execute(
+                """UPDATE events SET status='stale',error='manual_retry_reset',
+                   updated_at=CURRENT_TIMESTAMP WHERE type='TASK_CONTINUE' AND task_id=?
+                   AND status IN ('pending','processing')""",
+                (task_id,),
+            )
+            connection.execute(
                 """UPDATE tasks SET status=?,attempts=0,result=NULL,error=NULL,
+                   current_checkpoint_id=NULL,
+                   continuation_generation=continuation_generation+1,
                    updated_at=CURRENT_TIMESTAMP WHERE id=?""",
                 (TaskStatus.QUEUED.value, task_id),
             )

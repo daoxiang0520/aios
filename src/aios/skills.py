@@ -64,6 +64,36 @@ class SkillManifest:
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    def as_component_manifest(self, *, content_digest: str = "", status: str = "active"):
+        """Compatibility projection; Skill lifecycle and runner remain unchanged."""
+        from .components import ComponentEvaluation, ComponentKind, ComponentLineage, ComponentManifest
+
+        return ComponentManifest(
+            kind=ComponentKind.SKILL,
+            name=self.name,
+            version=self.version,
+            description=self.description,
+            requires=tuple(self.required_capabilities),
+            provides=(f"procedure.{self.name}",),
+            runtime={"plane": "agent", "isolation": "sandbox", "runner_kind": "skill"},
+            spec={"entrypoint": self.entrypoint},
+            interface={"input_schema": self.input_schema, "output_schema": {}},
+            evolution={"mutable": True, "auto_candidate": True, "auto_promote": False},
+            lineage=ComponentLineage(
+                parent_version=self.parent_version,
+                hypothesis=self.hypothesis,
+                mutation_reason=self.mutation_reason,
+                source_task_ids=tuple(self.source_task_ids),
+                source_trace_ids=tuple(self.source_trace_ids),
+            ).as_dict(),
+            evaluation=ComponentEvaluation(
+                benchmark_delta=self.benchmark_delta,
+                replay_task_ids=tuple(self.replay_task_ids),
+            ).as_dict(),
+            status=status,
+            content_digest=content_digest,
+        )
+
 
 class SkillManager:
     """Versioned executable assets. Skills never become model Tool Schemas."""
@@ -322,6 +352,15 @@ class SkillManager:
                 except (OSError, json.JSONDecodeError, SkillValidationError):
                     continue
         return result
+
+    def component_manifests(self):
+        """Project active SkillRegistry state into the unified ComponentRegistry."""
+        values = []
+        for manifest in self.active_skills():
+            source_path = self.active / manifest.name / manifest.entrypoint
+            digest = hashlib.sha256(source_path.read_bytes()).hexdigest() if source_path.is_file() else ""
+            values.append(manifest.as_component_manifest(content_digest=digest, status="active"))
+        return values
 
     def list_candidates(self) -> list[dict[str, Any]]:
         values: list[dict[str, Any]] = []

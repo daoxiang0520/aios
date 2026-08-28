@@ -6,9 +6,12 @@ import signal
 import time
 import uuid
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
+from .answers import CanonicalAnswer
 from .config import Settings
 from .capabilities import CapabilityRegistry, EvidenceContract
+from .components import build_component_registry
 from .controller import ControllerError, LLMController
 from .evolution import AutonomousEvolutionEngine
 from .evaluation import Verifier
@@ -16,11 +19,12 @@ from .goals import GoalManager, IntentArbiter
 from .memory import ContextComposer, MemoryManager
 from .plugins import PluginManager
 from .security import SecurityKernel
+from .situation import SituationResolver, coverage_labels, normalize_resource_path
 from .sandbox import DockerSandboxBroker, SandboxPolicyError
 from .skills import SkillManager
 from .storage import StateStore
 from .tools import ToolExecutor, ToolRegistry
-from .types import ActionResult, Event, MemoryType, Task, TaskStatus
+from .types import Action, ActionResult, Event, MemoryType, Task, TaskStatus
 
 LOGGER = logging.getLogger("aios.runtime")
 
@@ -76,7 +80,14 @@ class AIOSRuntime:
             network_enabled=settings.capabilities.network_enabled,
             allowed_domains=settings.capabilities.allowed_domains,
             scientific_available=(self.sandbox.scientific_environment / ".aios-environment.json").is_file(),
+            http_read_available=self.sandbox.available(),
         )
+        self.components = build_component_registry(
+            self.capabilities,
+            store=self.store,
+            skill_manifests=self.skills.component_manifests() if settings.skills.enabled else (),
+        )
+        self.situations = SituationResolver(self.components)
         registry = ToolRegistry(settings.permissions, self.plugins, self.sandbox)
         self.controller.set_tool_schemas(registry.schemas())
         self.security = SecurityKernel(settings.workspace, settings.permissions)
@@ -115,6 +126,36 @@ class AIOSRuntime:
         try:
             task = self._load_or_create_task(event)
             continuation = event.type == "TASK_CONTINUE" or bool(event.payload.get("continuation"))
+            terminal_statuses = {
+                TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.DEAD_LETTER,
+                TaskStatus.DEGRADED, TaskStatus.BLOCKED_CAPABILITY,
+                TaskStatus.NEEDS_AUTHORITY, TaskStatus.TERMINAL_FAILURE,
+                TaskStatus.NEEDS_REVIEW,
+            }
+            if not continuation and task.status in terminal_statuses:
+                self.store.discard_event(event, "terminal_task")
+                self.store.trace(cycle_id, "terminal_task_event_discarded", {
+                    "task_id": int(task.id), "event_id": event.id,
+                    "event_type": event.type,
+                })
+                LOGGER.warning(
+                    "Task %s event %s discarded before execution: terminal_task",
+                    task.id, event.id,
+                )
+                return True
+            if continuation:
+                current, reason = self.store.fence_continuation(event)
+                if not current:
+                    self.store.trace(cycle_id, "stale_continuation_discarded", {
+                        "task_id": int(task.id), "event_id": event.id, "reason": reason,
+                        "checkpoint_id": event.payload.get("checkpoint_id"),
+                        "generation": event.payload.get("generation"),
+                    })
+                    LOGGER.warning(
+                        "Task %s continuation event %s discarded before execution: %s",
+                        task.id, event.id, reason,
+                    )
+                    return True
             task = self.store.start_task_attempt(int(task.id), increment_attempt=not continuation)
             task_budget = self._task_budget(int(task.id))
             task_metrics = self._task_metrics(int(task.id))
@@ -151,7 +192,9 @@ class AIOSRuntime:
                 LOGGER.warning("Task %s stopped at preflight: %s", task.id, status.value)
                 return True
 
+            cycle_health_probe_start = self.sandbox.health_probe_count
             snapshot = self.sandbox.prepare(int(task.id), self.settings.workspace)
+            task_metrics["sandbox_sessions"] = int(task_metrics.get("sandbox_sessions", 0)) + 1
             environment_observation = None
             if any(item.name == "execution.python.scientific" for item in contract.capabilities):
                 environment_observation = self.sandbox.ensure_scientific_environment()
@@ -161,6 +204,9 @@ class AIOSRuntime:
                     raise RuntimeError(str(environment_observation.get("error") or "Scientific environment provisioning failed"))
                 task_metrics["dependency_provision_latency_ms"] += float(environment_observation.get("latency_ms", 0.0))
                 working_state["execution_environment"] = {"scientific_python": "ready"}
+                operational = working_state.setdefault("operational", {})
+                if isinstance(operational, dict):
+                    operational["environment"] = {"scientific_python": "ready"}
             self.sandbox.expose_read_only_state({
                 "tasks": [asdict(item) for item in self.store.list_tasks(limit=100)],
                 "traces": self.store.recent_traces(limit=100),
@@ -183,8 +229,6 @@ class AIOSRuntime:
             full_skills = self.skills.catalog(self.capabilities) if self.settings.skills.enabled else []
             context["workspace_inventory"] = full_workspace_inventory
             context["evidence_contract"] = contract.as_dict()
-            context["capabilities"] = full_capabilities
-            context["skills"] = full_skills
             skill_authoring = (
                 self.skills.authoring_context(task.request) if self.settings.skills.enabled else None
             )
@@ -196,6 +240,10 @@ class AIOSRuntime:
             context["task_working_state"] = self._working_state_projection(working_state)
             if environment_observation is not None:
                 context["environment"] = {"scientific_python": environment_observation}
+            context["situation_map"] = self.situations.resolve(
+                task.request, full_workspace_inventory, contract, working_state, full_skills,
+                context.get("environment") if isinstance(context.get("environment"), dict) else None,
+            )
             self.store.trace(cycle_id, "context_composed", context)
             harness_action_cap = harness_settings.get(
                 "max_actions_per_cycle", self.settings.max_actions_per_cycle
@@ -229,13 +277,15 @@ class AIOSRuntime:
                 first_task_call = task_budget.used_model_calls == 0 and round_number == 1
                 if not first_task_call:
                     context["workspace_inventory"] = self._relevant_workspace_map(full_workspace_inventory, working_state)
-                    context["capabilities"] = self._differential_capabilities(full_capabilities)
-                    context["skills"] = self._differential_skills(full_skills)
                     context["retrieved_memories"] = []
                     context["characters"] = 0
                     if environment_observation is not None:
                         context["environment"] = {"scientific_python": "ready"}
                 context["task_working_state"] = self._working_state_projection(working_state)
+                context["situation_map"] = self.situations.resolve(
+                    task.request, full_workspace_inventory, contract, working_state, full_skills,
+                    context.get("environment") if isinstance(context.get("environment"), dict) else None,
+                )
                 remaining_before_round = max(0, action_cap - len(all_actions))
                 artifact_written = any(
                     action.tool in {"write", "write_file"} and result.ok
@@ -294,7 +344,8 @@ class AIOSRuntime:
                 model_tokens_total += int(model_usage.get("total_tokens", 0))
                 for attribution in plan.model_attributions:
                     repeated_tokens = 0
-                    for block in attribution.get("blocks", {}).values():
+                    attribution_blocks = attribution.get("blocks", {})
+                    for block in attribution_blocks.values():
                         repeated = block.get("sha256") in seen_context_hashes
                         block["repeated"] = repeated
                         if repeated:
@@ -306,6 +357,13 @@ class AIOSRuntime:
                     attribution_totals["prompt_tokens"] += prompt_tokens
                     attribution_totals["repeated_tokens"] += repeated_tokens
                     attribution_totals["calls"] += 1
+                    if "protocol_repair" in attribution_blocks:
+                        task_metrics["protocol_repair_calls"] = int(
+                            task_metrics.get("protocol_repair_calls", 0)
+                        ) + 1
+                        task_metrics["protocol_repair_tokens"] = int(
+                            task_metrics.get("protocol_repair_tokens", 0)
+                        ) + prompt_tokens
                     self.store.trace(cycle_id, "model_call_attribution", {
                         "task_id": int(task.id), "task_cycle": task_budget.used_cycles,
                         "round": round_number, **attribution,
@@ -315,6 +373,9 @@ class AIOSRuntime:
                 final_summary = plan.summary
                 completion_metadata = plan.completion_metadata
                 working_state["semantic_state"] = {"latest_model_summary": plan.summary[:2000]}
+                semantic = working_state.setdefault("semantic", {})
+                if isinstance(semantic, dict):
+                    semantic["latest_model_summary"] = plan.summary[:2000]
                 actions, deferred_actions = self._select_actions(
                     plan.actions,
                     remaining_before_round,
@@ -345,6 +406,21 @@ class AIOSRuntime:
 
                 round_results = []
                 for action in actions:
+                    routing_signal = self.situations.classify_action(
+                        action.tool, action.arguments, working_state
+                    )
+                    if routing_signal is not None:
+                        signal_kind = str(routing_signal["kind"])
+                        self.store.trace(cycle_id, signal_kind, {
+                            "task_id": int(task.id), "round": round_number, **routing_signal,
+                        })
+                        metric_name = {
+                            "repeated_resource_read": "repeated_resource_reads",
+                            "redundant_resource_bypass": "redundant_resource_bypasses",
+                            "environment_probe": "environment_probe_calls",
+                        }.get(signal_kind)
+                        if metric_name is not None:
+                            task_metrics[metric_name] = int(task_metrics.get(metric_name, 0)) + 1
                     if action.tool == "bash" and task_metrics["rounds_to_first_computation"] is None:
                         task_metrics["rounds_to_first_computation"] = task_budget.used_model_calls + round_number
                     skill_invocation = None
@@ -399,7 +475,51 @@ class AIOSRuntime:
                     round_results.append(result)
                     result_data = {"round": round_number, **asdict(result)}
                     result_trace_id = self.store.trace(cycle_id, "action_result", result_data)
+                    cache_metadata = (
+                        result.output.get("observation_cache")
+                        if result.ok and isinstance(result.output, dict) else None
+                    )
+                    if isinstance(cache_metadata, dict):
+                        self.executor.registry.resources.attach_observation_ref(
+                            result.output, result_trace_id
+                        )
+                        if cache_metadata.get("hit"):
+                            task_metrics["observation_reuse_hits"] = int(
+                                task_metrics.get("observation_reuse_hits", 0)
+                            ) + 1
+                            self.store.trace(cycle_id, "observation_reused", {
+                                "task_id": int(task.id), "round": round_number,
+                                "path": cache_metadata.get("path"),
+                                "cache_key": cache_metadata.get("key"),
+                                "source_observation_ref": cache_metadata.get("source_observation_ref"),
+                                "request_observation_ref": f"trace:{result_trace_id}",
+                            })
+                        elif routing_signal is not None and routing_signal.get("kind") == "repeated_resource_read":
+                            task_metrics["repeated_resource_executions"] = int(
+                                task_metrics.get("repeated_resource_executions", 0)
+                            ) + 1
+                    elif routing_signal is not None and routing_signal.get("kind") == "repeated_resource_read":
+                        task_metrics["repeated_resource_executions"] = int(
+                            task_metrics.get("repeated_resource_executions", 0)
+                        ) + 1
+                    adapter_runtime = (
+                        result.output.get("adapter_runtime")
+                        if result.ok and isinstance(result.output, dict) else None
+                    )
+                    if isinstance(adapter_runtime, dict) and not (
+                        isinstance(cache_metadata, dict) and cache_metadata.get("hit")
+                    ):
+                        task_metrics["adapter_retries"] = int(
+                            task_metrics.get("adapter_retries", 0)
+                        ) + int(adapter_runtime.get("retry_count", 0))
+                        if adapter_runtime.get("transient_recovered"):
+                            task_metrics["adapter_transient_recoveries"] = int(
+                                task_metrics.get("adapter_transient_recoveries", 0)
+                            ) + 1
                     self._update_working_state(working_state, action, result, result_trace_id)
+                    self._record_contract_evidence(
+                        working_state, contract, action, result, result_trace_id,
+                    )
                     if skill_invocation is not None:
                         output = result.output if isinstance(result.output, dict) else {}
                         exit_code = output.get("exit_code")
@@ -485,6 +605,36 @@ class AIOSRuntime:
                 has_final_action = any(action.tool in {"write", "edit", "echo", "write_file", "append_file"} for action in actions)
                 task_done = bool(plan.done and (has_final_action or not actions))
                 if task_done:
+                    provisional_situation = self.situations.resolve(
+                        task.request, full_workspace_inventory, contract, working_state, full_skills,
+                        context.get("environment") if isinstance(context.get("environment"), dict) else None,
+                    )
+                    provisional_coverage = self.situations.assess_coverage(
+                        provisional_situation, plan.summary
+                    )
+                    if provisional_coverage.get("passed"):
+                        context.pop("coverage_feedback", None)
+                    if (
+                        provisional_coverage.get("required")
+                        and not provisional_coverage.get("passed")
+                        and round_number < model_round_cap
+                    ):
+                        task_done = False
+                        context["coverage_feedback"] = {
+                            **provisional_coverage,
+                            "instruction": (
+                                "Completion was withheld: read the selected evidence for any missing-evidence "
+                                "target, then revise the final answer to cover every missing topic. "
+                                "Do not reread complete resources."
+                            ),
+                        }
+                        working_state["pending"] = ["repair_goal_coverage"]
+                        self.store.trace(cycle_id, "coverage_repair_requested", {
+                            "task_id": int(task.id), "round": round_number,
+                            "coverage": provisional_coverage,
+                        })
+                        continue
+                if task_done:
                     working_state["pending"] = []
                 if task_done:
                     break
@@ -496,6 +646,9 @@ class AIOSRuntime:
             task_budget.used_model_calls += model_calls_used
             task_budget.used_tool_calls += len(all_results)
             task_budget.used_tokens += model_tokens_total
+            task_metrics["sandbox_health_probes"] = int(
+                task_metrics.get("sandbox_health_probes", 0)
+            ) + max(0, self.sandbox.health_probe_count - cycle_health_probe_start)
             remaining_task_budget = task_budget.remaining()
             written_artifact_names = {
                 str(result.output.get("path", "")).replace("\\", "/").rsplit("/", 1)[-1].casefold()
@@ -561,14 +714,14 @@ class AIOSRuntime:
                 )
                 self.store.finish_events(event_ids)
                 self.store.update_task(int(task.id), TaskStatus.DEFERRED, result=deferred_result)
-                continue_id = self.store.add_event(Event(
-                    "TASK_CONTINUE",
-                    {"task_id": int(task.id), "message": task.request, "continuation": True, "checkpoint_id": checkpoint_id},
-                    task.priority,
-                ))
+                continue_id, continuation_decision = self.store.enqueue_continuation(
+                    int(task.id), checkpoint_id, task.request, task.priority,
+                )
                 self.store.trace(cycle_id, "budget_deferred", {
                     "task_id": int(task.id), "checkpoint_id": checkpoint_id,
-                    "continuation_event_id": continue_id, "remaining": remaining_task_budget,
+                    "continuation_event_id": continue_id,
+                    "continuation_decision": continuation_decision,
+                    "remaining": remaining_task_budget,
                 })
                 LOGGER.info(
                     "Task %s deferred at cycle budget; checkpoint %s, continuation event %s queued",
@@ -577,6 +730,16 @@ class AIOSRuntime:
                 return True
 
             final_output = self._final_output(final_summary, all_actions, all_results)
+            canonical_answer = CanonicalAnswer.bind(
+                final_summary, all_actions, all_results, contract, Path(snapshot),
+            )
+            final_situation = self.situations.resolve(
+                task.request, full_workspace_inventory, contract, working_state, full_skills,
+                context.get("environment") if isinstance(context.get("environment"), dict) else None,
+            )
+            coverage_assessment = self.situations.assess_coverage(
+                final_situation, canonical_answer.body,
+            )
             verification = self.verifier.verify(
                 all_actions,
                 all_results,
@@ -584,11 +747,31 @@ class AIOSRuntime:
                 task_done=task_done,
                 request=task.request,
                 contract=contract,
-                final_output=final_output,
+                final_output=canonical_answer.body,
                 capability_assessment=preflight_assessment,
                 completion_metadata=completion_metadata,
+                coverage_assessment=coverage_assessment,
+                established_evidence=list(working_state.get("evidence_ledger", [])),
             )
             ok = bool(verification["passed"])
+            if ok:
+                working_state.pop("verification_gap", None)
+            else:
+                missing_evidence = [
+                    {"kind": check["name"], "detail": check.get("detail")}
+                    for check in verification.get("checks", [])
+                    if not check.get("passed") and check.get("layer") == "evidence"
+                ]
+                working_state["verification_gap"] = {
+                    "required_evidence": missing_evidence,
+                    "instruction": "Repair only the unresolved evidence gap; preserve valid established work.",
+                    "operational_affordances": (
+                        ["read(absolute http/https URL)"]
+                        if self.capabilities.get("resource.http.read").state.value == "available"
+                        else []
+                    ),
+                }
+                working_state["pending"] = ["repair_verification_gap"]
             self.store.finalize_skill_usage(
                 cycle_id,
                 verifier_passed=ok,
@@ -606,6 +789,17 @@ class AIOSRuntime:
                 "task_cycles": task_budget.used_cycles,
                 "rounds_to_first_computation": task_metrics["rounds_to_first_computation"],
                 "dependency_provision_latency_ms": task_metrics["dependency_provision_latency_ms"],
+                "repeated_resource_reads": task_metrics["repeated_resource_reads"],
+                "repeated_resource_executions": task_metrics["repeated_resource_executions"],
+                "observation_reuse_hits": task_metrics["observation_reuse_hits"],
+                "redundant_resource_bypasses": task_metrics["redundant_resource_bypasses"],
+                "environment_probe_calls": task_metrics["environment_probe_calls"],
+                "sandbox_sessions": task_metrics["sandbox_sessions"],
+                "sandbox_health_probes": task_metrics["sandbox_health_probes"],
+                "adapter_retries": task_metrics["adapter_retries"],
+                "adapter_transient_recoveries": task_metrics["adapter_transient_recoveries"],
+                "protocol_repair_calls": task_metrics["protocol_repair_calls"],
+                "protocol_repair_tokens": task_metrics["protocol_repair_tokens"],
                 "prompt_token_attribution": attribution_totals,
                 "context_reuse_ratio": (
                     attribution_totals["repeated_tokens"] / attribution_totals["prompt_tokens"]
@@ -619,22 +813,46 @@ class AIOSRuntime:
                 "verification": verification,
                 "completion_metadata": completion_metadata,
                 "result_vector": verification.get("result_vector"),
+                "coverage_assessment": coverage_assessment,
+                "established_evidence": list(working_state.get("evidence_ledger", [])),
             }
             self.store.trace(cycle_id, "evaluation", evidence)
             task_result = {
                 "cycle_id": cycle_id,
                 "summary": final_summary,
+                "user_message": canonical_answer.user_message,
+                "artifacts": [asdict(item) for item in canonical_answer.artifacts],
+                "canonical_answer": canonical_answer.as_dict(),
                 "final_output": final_output,
                 "rounds": rounds,
                 "actions": [asdict(action) for action in all_actions],
                 "action_results": [asdict(result) for result in all_results],
                 "task_working_state": self._working_state_projection(working_state),
+                "situation_map": final_situation,
                 "evidence": evidence,
             }
             if ok:
                 committed = self.sandbox.commit(self.settings.workspace)
+                canonical_answer.mark_committed()
                 task_result["committed_files"] = committed
+                task_result["artifacts"] = [asdict(item) for item in canonical_answer.artifacts]
+                task_result["canonical_answer"] = canonical_answer.as_dict()
                 task_result["final_output"] = self._published_output(final_output, snapshot)
+                workspace_candidate_names = self._workspace_skill_candidate_names()
+                current_task_authored_candidate = bool(
+                    skill_authoring is not None
+                    and (
+                        self._skill_candidate_written(all_actions, all_results)
+                        or self._working_state_skill_candidate(working_state)
+                    )
+                )
+                if workspace_candidate_names and not current_task_authored_candidate:
+                    self.store.trace(cycle_id, "skill_candidate_ingest_suppressed", {
+                        "task_id": int(task.id),
+                        "candidates": workspace_candidate_names,
+                        "decision": "NO_ACTION",
+                        "reason": "no_explicit_skill_authoring_attribution",
+                    })
                 skill_candidates = (
                     self.skills.ingest_workspace_candidates(
                         self.settings.workspace,
@@ -645,7 +863,10 @@ class AIOSRuntime:
                             if item["cycle_id"] == cycle_id
                         ],
                     )
-                    if self.settings.skills.enabled else []
+                    if (
+                        self.settings.skills.enabled
+                        and current_task_authored_candidate
+                    ) else []
                 )
                 if skill_candidates:
                     task_result["skill_candidates"] = skill_candidates
@@ -664,7 +885,10 @@ class AIOSRuntime:
                 LOGGER.info("Task %s completed: %s", task.id, final_summary)
             elif verification.get("outcome") == "degraded":
                 committed = self.sandbox.commit(self.settings.workspace)
+                canonical_answer.mark_committed()
                 task_result["committed_files"] = committed
+                task_result["artifacts"] = [asdict(item) for item in canonical_answer.artifacts]
+                task_result["canonical_answer"] = canonical_answer.as_dict()
                 task_result["final_output"] = self._published_output(final_output, snapshot)
                 self.store.finish_events(event_ids)
                 self.store.update_task(int(task.id), TaskStatus.DEGRADED, result=task_result, error="Goal was only partially/substitutively satisfied")
@@ -728,6 +952,32 @@ class AIOSRuntime:
             if match:
                 packages.setdefault(match.group(1), set()).add(match.group(2))
         return any({"manifest.json", "skill.py"} <= files for files in packages.values())
+
+    @staticmethod
+    def _working_state_skill_candidate(state: dict[str, object]) -> bool:
+        packages: dict[str, set[str]] = {}
+        for item in state.get("available_artifacts", []):
+            if not isinstance(item, dict):
+                continue
+            path = normalize_resource_path(item.get("path", ""))
+            match = re.fullmatch(
+                r"skill_candidates/([a-z][a-z0-9_]{1,63})/(manifest\.json|skill\.py)",
+                path,
+            )
+            if match:
+                packages.setdefault(match.group(1), set()).add(match.group(2))
+        return any({"manifest.json", "skill.py"} <= files for files in packages.values())
+
+    def _workspace_skill_candidate_names(self) -> list[str]:
+        root = self.settings.workspace / "skill_candidates"
+        if not root.is_dir():
+            return []
+        return sorted(
+            item.name for item in root.iterdir()
+            if item.is_dir()
+            and (item / "manifest.json").is_file()
+            and (item / "skill.py").is_file()
+        )
 
     @staticmethod
     def _final_output(summary: str, actions: list, results: list) -> str:
@@ -893,6 +1143,17 @@ class AIOSRuntime:
         metrics: dict[str, object] = {
             "rounds_to_first_computation": None,
             "dependency_provision_latency_ms": 0.0,
+            "repeated_resource_reads": 0,
+            "repeated_resource_executions": 0,
+            "observation_reuse_hits": 0,
+            "redundant_resource_bypasses": 0,
+            "environment_probe_calls": 0,
+            "sandbox_sessions": 0,
+            "sandbox_health_probes": 0,
+            "adapter_retries": 0,
+            "adapter_transient_recoveries": 0,
+            "protocol_repair_calls": 0,
+            "protocol_repair_tokens": 0,
         }
         for checkpoint in reversed(self.store.task_checkpoints(task_id)):
             if checkpoint["phase"] == "retry_reset":
@@ -908,11 +1169,14 @@ class AIOSRuntime:
         for checkpoint in reversed(self.store.task_checkpoints(task_id)):
             if checkpoint["phase"] == "retry_reset":
                 break
-            if checkpoint["phase"] == "budget_deferred":
+            if checkpoint["phase"] in {"budget_deferred", "failed_attempt"}:
                 state = checkpoint["data"].get("working_state")
                 if isinstance(state, dict):
-                    return state
-        return {
+                    upgraded = self._upgrade_working_state(state)
+                    if checkpoint["phase"] == "failed_attempt":
+                        return self._sanitize_retry_state(upgraded)
+                    return upgraded
+        return self._upgrade_working_state({
             "objective": objective,
             "established_facts": [],
             "completed_steps": [],
@@ -921,8 +1185,90 @@ class AIOSRuntime:
             "execution_environment": {},
             "pending": ["fulfil_objective_and_verify"],
             "important_evidence_refs": [],
+            "evidence_ledger": [],
             "semantic_state": {},
-        }
+        })
+
+    def _sanitize_retry_state(self, state: dict[str, object]) -> dict[str, object]:
+        """Carry only evidence that remains valid after a failed sandbox is discarded."""
+        import hashlib
+
+        operational = state.get("operational", {})
+        resources = operational.get("resources", {}) if isinstance(operational, dict) else {}
+        valid_resources: dict[str, object] = {}
+        if isinstance(resources, dict):
+            for path, item in resources.items():
+                if not isinstance(item, dict):
+                    continue
+                if str(path).casefold().startswith(("http://", "https://")):
+                    valid_resources[str(path)] = item
+                    continue
+                digest = item.get("content_digest")
+                target = (self.settings.workspace / str(path)).resolve()
+                try:
+                    target.relative_to(self.settings.workspace.resolve())
+                except ValueError:
+                    continue
+                if not digest or not target.is_file():
+                    continue
+                current = hashlib.sha256(target.read_bytes()).hexdigest()
+                if current == digest:
+                    valid_resources[str(path)] = item
+        if isinstance(operational, dict):
+            operational["resources"] = valid_resources
+            operational["artifacts"] = []
+        state["accessed_resources"] = list(valid_resources)
+        state["available_artifacts"] = []
+        state["established_facts"] = [
+            item for item in state.get("established_facts", [])
+            if isinstance(item, dict) and str(item.get("resource")) in valid_resources
+        ]
+        # Network observations are immutable trace facts for this task attempt.
+        # Command-success evidence is not carried because the failed snapshot was discarded.
+        state["evidence_ledger"] = [
+            item for item in state.get("evidence_ledger", [])
+            if isinstance(item, dict) and item.get("kind") in {"network_request", "source_domain"}
+        ]
+        state["completed_steps"] = [
+            item for item in state.get("completed_steps", [])
+            if isinstance(item, dict) and str(item.get("step", "")).startswith("read:")
+        ]
+        return state
+
+    @staticmethod
+    def _upgrade_working_state(state: dict[str, object]) -> dict[str, object]:
+        """Upgrade v0.6.6 checkpoints into split semantic/operational state."""
+        semantic = state.setdefault("semantic", {})
+        if isinstance(semantic, dict):
+            semantic.setdefault("established_facts", list(state.get("established_facts", [])))
+            old_semantic = state.get("semantic_state")
+            if isinstance(old_semantic, dict):
+                semantic.setdefault("latest_model_summary", old_semantic.get("latest_model_summary", ""))
+        operational = state.setdefault("operational", {})
+        if not isinstance(operational, dict):
+            operational = {}
+            state["operational"] = operational
+        resources = operational.setdefault("resources", {})
+        if not isinstance(resources, dict):
+            resources = {}
+            operational["resources"] = resources
+        for fact in state.get("established_facts", []):
+            if not isinstance(fact, dict) or not fact.get("resource"):
+                continue
+            path = normalize_resource_path(fact["resource"])
+            resources.setdefault(path, {
+                "status": "read_complete", "complete": True, "representation": [],
+                "metadata": fact.get("metadata", {}), "evidence_ref": fact.get("evidence_ref"),
+                "last_request_ref": fact.get("evidence_ref"), "content_digest": None, "range": {},
+                "access_count": 1, "execution_count": 1, "reuse_count": 0,
+                "coverage_labels": coverage_labels(path),
+            })
+        operational.setdefault("environment", state.get("execution_environment", {}))
+        operational.setdefault("artifacts", state.get("available_artifacts", []))
+        ledger = state.setdefault("evidence_ledger", [])
+        if not isinstance(ledger, list):
+            state["evidence_ledger"] = []
+        return state
 
     def _working_state_projection(self, state: dict[str, object]) -> dict[str, object]:
         projected = {key: value for key, value in state.items() if not key.startswith("_")}
@@ -933,6 +1279,8 @@ class AIOSRuntime:
             return projected
         return {
             "objective": projected.get("objective"),
+            "semantic": projected.get("semantic", {}),
+            "operational": projected.get("operational", {}),
             "established_facts": list(projected.get("established_facts", []))[-12:],
             "completed_steps": list(projected.get("completed_steps", []))[-16:],
             "available_artifacts": list(projected.get("available_artifacts", []))[-12:],
@@ -940,12 +1288,14 @@ class AIOSRuntime:
             "execution_environment": projected.get("execution_environment", {}),
             "pending": projected.get("pending", []),
             "important_evidence_refs": list(projected.get("important_evidence_refs", []))[-16:],
+            "evidence_ledger": list(projected.get("evidence_ledger", []))[-32:],
             "semantic_state": projected.get("semantic_state", {}),
             "compacted": True,
         }
 
-    @staticmethod
-    def _update_working_state(state: dict[str, object], action: object, result: object, trace_id: int) -> None:
+    def _update_working_state(
+        self, state: dict[str, object], action: object, result: object, trace_id: int,
+    ) -> None:
         import hashlib
 
         tool = str(getattr(action, "tool", ""))
@@ -958,7 +1308,7 @@ class AIOSRuntime:
             del refs[:-16]
         if not ok:
             return
-        path = str(arguments.get("path", ""))
+        path = normalize_resource_path(arguments.get("path", ""))
         if tool == "read" and path:
             resources = state.setdefault("accessed_resources", [])
             if path not in resources:
@@ -966,16 +1316,67 @@ class AIOSRuntime:
             output = getattr(result, "output", None)
             resource = output.get("resource", {}) if isinstance(output, dict) else {}
             metadata = resource.get("metadata")
+            representations = resource.get("representations", []) if isinstance(resource, dict) else []
+            cache_metadata = output.get("observation_cache", {}) if isinstance(output, dict) else {}
+            representation_kinds = [
+                str(item.get("kind")) for item in representations
+                if isinstance(item, dict) and item.get("kind")
+            ]
+            complete = bool(representations) and not any(
+                bool(item.get("truncated")) for item in representations if isinstance(item, dict)
+            )
+            operational = state.setdefault("operational", {})
+            if not isinstance(operational, dict):
+                operational = {}
+                state["operational"] = operational
+            resource_states = operational.setdefault("resources", {})
+            if not isinstance(resource_states, dict):
+                resource_states = {}
+                operational["resources"] = resource_states
+            previous = resource_states.get(path, {})
+            reused = bool(cache_metadata.get("hit")) if isinstance(cache_metadata, dict) else False
+            source_reference = (
+                cache_metadata.get("source_observation_ref")
+                if reused and isinstance(cache_metadata, dict) else None
+            ) or reference
+            resource_states[path] = {
+                "status": "read_complete" if complete else "read_partial",
+                "complete": complete,
+                "representation": representation_kinds,
+                "metadata": metadata or {},
+                "content_digest": cache_metadata.get("content_digest") if isinstance(cache_metadata, dict) else None,
+                "range": {
+                    "offset": cache_metadata.get("offset", 0),
+                    "limit": cache_metadata.get("limit"),
+                } if isinstance(cache_metadata, dict) else {},
+                "evidence_ref": source_reference,
+                "last_request_ref": reference,
+                "access_count": int(previous.get("access_count", 0)) + 1 if isinstance(previous, dict) else 1,
+                "execution_count": int(previous.get("execution_count", 0)) + (0 if reused else 1) if isinstance(previous, dict) else (0 if reused else 1),
+                "reuse_count": int(previous.get("reuse_count", 0)) + (1 if reused else 0) if isinstance(previous, dict) else (1 if reused else 0),
+                "coverage_labels": coverage_labels(path, resource if isinstance(resource, dict) else None),
+                "semantic_residue": (
+                    self._semantic_residue(representations)
+                    or (previous.get("semantic_residue", "") if isinstance(previous, dict) else "")
+                ),
+            }
+            self._bound_semantic_residues(resource_states)
             if metadata:
-                fact = {"state": "ESTABLISHED", "resource": path, "metadata": metadata, "evidence_ref": reference}
+                fact = {"state": "ESTABLISHED", "resource": path, "metadata": metadata, "evidence_ref": source_reference}
                 facts = state.setdefault("established_facts", [])
                 facts[:] = [item for item in facts if not (isinstance(item, dict) and item.get("resource") == path)]
                 facts.append(fact)
+                semantic = state.setdefault("semantic", {})
+                if isinstance(semantic, dict):
+                    semantic["established_facts"] = list(facts)[-12:]
         if tool in {"write", "edit", "write_file", "append_file"} and path:
             artifacts = state.setdefault("available_artifacts", [])
             artifact = {"path": path, "state": "AVAILABLE", "evidence_ref": reference}
             artifacts[:] = [item for item in artifacts if not (isinstance(item, dict) and item.get("path") == path)]
             artifacts.append(artifact)
+            operational = state.setdefault("operational", {})
+            if isinstance(operational, dict):
+                operational["artifacts"] = list(artifacts)[-12:]
         if tool == "bash":
             command = str(arguments.get("command", ""))
             step = "bash:" + hashlib.sha256(command.encode("utf-8")).hexdigest()[:12]
@@ -984,6 +1385,76 @@ class AIOSRuntime:
         completed = state.setdefault("completed_steps", [])
         if not any(isinstance(item, dict) and item.get("step") == step for item in completed):
             completed.append({"step": step, "state": "DONE", "evidence_ref": reference})
+
+    def _record_contract_evidence(
+        self,
+        state: dict[str, object],
+        contract: EvidenceContract,
+        action: object,
+        result: object,
+        trace_id: int,
+    ) -> None:
+        if not isinstance(action, Action) or not isinstance(result, ActionResult):
+            return
+        collected = self.verifier.collect_evidence(
+            contract, action, result, f"trace:{trace_id}",
+        )
+        if not collected:
+            return
+        ledger = state.setdefault("evidence_ledger", [])
+        if not isinstance(ledger, list):
+            ledger = []
+            state["evidence_ledger"] = ledger
+        for item in collected:
+            ledger[:] = [
+                previous for previous in ledger
+                if not (
+                    isinstance(previous, dict)
+                    and previous.get("kind") == item["kind"]
+                    and previous.get("value") == item["value"]
+                )
+            ]
+            ledger.append(item)
+        del ledger[:-32]
+
+    @staticmethod
+    def _semantic_residue(representations: list[object], *, limit: int = 1200) -> str:
+        """Carry bounded resource meaning across cycles when rereading costs more."""
+        texts = [
+            str(item.get("text")) for item in representations
+            if isinstance(item, dict) and isinstance(item.get("text"), str) and item.get("text").strip()
+        ]
+        value = re.sub(r"\s+", " ", "\n".join(texts)).strip()
+        if len(value) <= limit:
+            return value
+        head = max(1, int(limit * 0.72))
+        tail = max(1, limit - head - 3)
+        return value[:head].rstrip() + " … " + value[-tail:].lstrip()
+
+    @staticmethod
+    def _bound_semantic_residues(
+        resources: dict[str, object], *, total_limit: int = 4000,
+    ) -> None:
+        """Keep semantic carry cheaper than repeated reads for large resource sets."""
+        remaining = total_limit
+        ordered = sorted(
+            resources.items(),
+            key=lambda item: (
+                -int(item[1].get("access_count", 0)) if isinstance(item[1], dict) else 0,
+                item[0],
+            ),
+        )
+        for _, state in ordered:
+            if not isinstance(state, dict):
+                continue
+            residue = str(state.get("semantic_residue", ""))
+            if not residue:
+                continue
+            if remaining <= 0:
+                state["semantic_residue"] = ""
+                continue
+            state["semantic_residue"] = residue[:remaining]
+            remaining -= len(str(state["semantic_residue"]))
 
     @staticmethod
     def _relevant_workspace_map(inventory: dict[str, object], state: dict[str, object]) -> dict[str, object]:
@@ -1076,7 +1547,17 @@ class AIOSRuntime:
             tokens_after=tokens_after,
         )
         self.store.finish_events(event_ids, error=error)
-        self.store.add_checkpoint(task_id, "failed_attempt", {"error": error, "cycle_id": cycle_id})
+        failure_class = "missing_executable" if "MissingExecutable:" in error else "execution_or_verification"
+        working_state = result.get("task_working_state") if isinstance(result, dict) else None
+        self.store.add_checkpoint(task_id, "failed_attempt", {
+            "error": error,
+            "cycle_id": cycle_id,
+            "failure_class": failure_class,
+            "verification_gap": (
+                working_state.get("verification_gap") if isinstance(working_state, dict) else None
+            ),
+            "working_state": working_state if isinstance(working_state, dict) else None,
+        })
         evolution_result = self.evolution.observe_failure(task, error, result)
         if evolution_result.get("triggered"):
             self.store.trace(cycle_id, "evolution_triggered", evolution_result)
@@ -1084,15 +1565,52 @@ class AIOSRuntime:
         if evolution_result.get("changed") or evolution_result.get("rolled_back_tools"):
             self._reload_generated_tools()
         terminal_protocol_failure = "Model protocol repair failed:" in error
-        if task.attempts < task.max_attempts and not terminal_protocol_failure:
+        missing_executable_attempts = sum(
+            checkpoint["phase"] == "failed_attempt"
+            and checkpoint["data"].get("failure_class") == "missing_executable"
+            for checkpoint in self.store.task_checkpoints(task_id)
+        )
+        capabilities = (
+            result.get("situation_map", {}).get("capabilities", [])
+            if isinstance(result, dict) else []
+        )
+        alternative_provider_available = any(
+            isinstance(item, dict)
+            and item.get("name") == "resource.http.read"
+            and item.get("state") == "available"
+            and item.get("interface") == "read(URL)"
+            for item in capabilities
+        )
+        guided_missing_executable_retry = (
+            failure_class != "missing_executable"
+            or (alternative_provider_available and missing_executable_attempts == 1)
+        )
+        if (
+            task.attempts < task.max_attempts
+            and not terminal_protocol_failure
+            and guided_missing_executable_retry
+        ):
             self.store.update_task(task_id, TaskStatus.RETRYING, result=result, error=error)
             payload = dict(event.payload)
             payload["task_id"] = task_id
-            retry_id = self.store.add_event(Event(event.type, payload, max(1, event.priority - 1)))
+            retry_type = event.type
+            if event.type == "TASK_CONTINUE" or payload.get("continuation"):
+                # A continuation identifies one fenced checkpoint. Replaying it
+                # as a retry would never increment task.attempts.
+                retry_type = "TASK_REQUEST"
+                for key in ("continuation", "checkpoint_id", "generation"):
+                    payload.pop(key, None)
+            retry_id = self.store.add_event(
+                Event(retry_type, payload, max(1, event.priority - 1))
+            )
             self.store.trace(
                 cycle_id,
                 "retry_scheduled",
-                {"task_id": task_id, "attempt": task.attempts, "max_attempts": task.max_attempts, "event_id": retry_id},
+                {
+                    "task_id": task_id, "attempt": task.attempts,
+                    "max_attempts": task.max_attempts, "event_id": retry_id,
+                    "event_type": retry_type,
+                },
             )
             LOGGER.warning(
                 "Task %s failed attempt %s/%s; retry event %s queued",

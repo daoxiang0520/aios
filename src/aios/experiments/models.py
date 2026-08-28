@@ -35,13 +35,40 @@ class ReplayMode(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class ComponentMutation:
+    component_id: str | None
+    component_kind: str
+    from_version: str | None = None
+    to_version: str | None = None
+    payload: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_legacy(cls, mutation_type: str, mutation: dict[str, Any]) -> "ComponentMutation":
+        identifier = mutation.get("component_id") or mutation.get("candidate_id")
+        return cls(
+            component_id=str(identifier) if identifier is not None else None,
+            component_kind=mutation_type,
+            from_version=str(mutation["from_version"]) if mutation.get("from_version") else None,
+            to_version=str(mutation["to_version"]) if mutation.get("to_version") else None,
+            payload=dict(mutation),
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
 class ExperimentVariant:
     name: str
     mutation_type: str = "skill"
     mutation: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        value = asdict(self)
+        value["component_mutation"] = ComponentMutation.from_legacy(
+            self.mutation_type, self.mutation
+        ).as_dict()
+        return value
 
 
 @dataclass(frozen=True, slots=True)

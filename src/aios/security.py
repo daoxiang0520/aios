@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .config import PermissionConfig
 from .types import Action
@@ -35,13 +36,22 @@ class SecurityKernel:
         arguments = dict(action.arguments)
         path_key = self.PATH_ARGUMENTS.get(action.tool)
         if path_key:
-            arguments[path_key] = str(self.resolve_workspace_path(arguments.get(path_key, ".")))
+            raw_path = str(arguments.get(path_key, "."))
+            if action.tool == "read" and self._is_http_url(raw_path):
+                arguments[path_key] = raw_path
+            else:
+                arguments[path_key] = str(self.resolve_workspace_path(raw_path))
 
         if action.tool in {"write", "edit", "write_file", "append_file"}:
             size = len(str(arguments.get("content", "")).encode("utf-8"))
             if size > self.config.max_write_bytes:
                 raise PermissionDenied(f"Write exceeds {self.config.max_write_bytes} bytes")
         return arguments
+
+    @staticmethod
+    def _is_http_url(value: str) -> bool:
+        parsed = urlsplit(str(value).strip())
+        return parsed.scheme.casefold() in {"http", "https"} and bool(parsed.hostname)
 
     def resolve_workspace_path(self, value: str) -> Path:
         candidate = self.normalize_workspace_path(value)

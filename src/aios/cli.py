@@ -5,11 +5,14 @@ import json
 import logging
 import shutil
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from .answers import CanonicalAnswer
 from .config import Settings
-from .capabilities import CapabilityRegistry
+from .capabilities import CapabilityRegistry, EvidenceContract
+from .controller import LLMController
 from .diagnostics import Diagnoser
 from .evolution import EvolutionManager
 from .evaluation import Verifier
@@ -21,6 +24,8 @@ from .plugins import PluginManager
 from .sandbox import DockerSandboxBroker
 from .skills import SkillManager
 from .runtime import AIOSRuntime
+from .self_evolution import ExperienceAnalyzer, ModelEvolutionReasoner, SelfEvolutionLoop
+from .situation import SituationResolver, normalize_resource_path
 from .storage import StateStore
 from .types import Action, ActionResult, Event, Goal, GoalStatus, GoalType, Memory, MemoryType, Task, TaskStatus
 from .utility import SkillUtilityEvaluator
@@ -117,6 +122,13 @@ def _parser() -> argparse.ArgumentParser:
     evolution_commands.add_parser("versions")
     evolution_runs = evolution_commands.add_parser("runs")
     evolution_runs.add_argument("--limit", type=int, default=50)
+    evolution_auto = evolution_commands.add_parser(
+        "auto-run", help="Run the slow self-evolution loop without production activation",
+    )
+    evolution_auto.add_argument("--capsule", action="append", default=[])
+    evolution_auto.add_argument("--runs", type=int)
+    evolution_auto.add_argument("--task-limit", type=int, default=100)
+    evolution_auto.add_argument("--trace-limit", type=int, default=1000)
     evolution_commands.add_parser("tools")
     rollback = evolution_commands.add_parser("rollback")
     rollback.add_argument("version", type=int)
@@ -215,6 +227,7 @@ def _skill_services(settings: Settings) -> tuple[SkillManager, DockerSandboxBrok
         sandbox_available=broker.available(),
         network_enabled=settings.capabilities.network_enabled,
         allowed_domains=settings.capabilities.allowed_domains,
+        http_read_available=broker.available(),
     )
     return manager, broker, capabilities
 
@@ -249,6 +262,43 @@ def _run_counterfactual(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return report
+
+
+def _historical_contract_evidence(
+    store: StateStore, task_id: int, contract: EvidenceContract,
+) -> list[dict[str, Any]]:
+    cycle_ids = list(dict.fromkeys(
+        str(checkpoint["data"]["cycle_id"])
+        for checkpoint in store.task_checkpoints(task_id)
+        if checkpoint["data"].get("cycle_id")
+    ))
+    traces = store.traces_for_cycles(cycle_ids)
+    plans: dict[tuple[str, int], list[Action]] = {}
+    results: dict[tuple[str, int], list[tuple[int, ActionResult]]] = {}
+    for trace in traces:
+        data = trace["data"]
+        round_number = int(data.get("round", 0))
+        key = (trace["cycle_id"], round_number)
+        if trace["kind"] == "plan_created":
+            plans[key] = [Action(**item) for item in data.get("actions", [])]
+        elif trace["kind"] == "action_result":
+            payload = {name: value for name, value in data.items() if name != "round"}
+            results.setdefault(key, []).append((int(trace["id"]), ActionResult(**payload)))
+    ledger: list[dict[str, Any]] = []
+    for key, actions in plans.items():
+        for action, (trace_id, result) in zip(actions, results.get(key, []), strict=False):
+            for item in Verifier.collect_evidence(
+                contract, action, result, f"trace:{trace_id}",
+            ):
+                ledger[:] = [
+                    previous for previous in ledger
+                    if not (
+                        previous.get("kind") == item["kind"]
+                        and previous.get("value") == item["value"]
+                    )
+                ]
+                ledger.append(item)
+    return ledger
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -361,20 +411,122 @@ def main(argv: list[str] | None = None) -> int:
             actions = [Action(**item) for item in task.result.get("actions", [])]
             results = [ActionResult(**item) for item in task.result.get("action_results", [])]
             evidence = task.result.get("evidence", {})
+            contract = EvidenceContract.from_request(
+                task.request, Verifier._expected_artifacts(task.request),
+            )
+            canonical = CanonicalAnswer.bind(
+                str(task.result.get("summary") or task.result.get("user_message") or ""),
+                actions, results, contract,
+            )
+            coverage = SituationResolver.assess_coverage(
+                task.result.get("situation_map", {}), canonical.body,
+            )
+            if coverage.get("required") and not coverage.get("passed"):
+                _print_json({
+                    "task_id": task.id, "reconciled": False,
+                    "reason": "canonical answer still fails semantic coverage",
+                    "coverage_assessment": coverage,
+                })
+                return 1
+            recovered_artifacts: list[str] = []
+            workspace_root = settings.workspace.resolve()
+            for action, result in zip(actions, results, strict=False):
+                if action.tool not in {"write", "write_file"} or not result.ok:
+                    continue
+                content = action.arguments.get("content")
+                relative = normalize_resource_path(action.arguments.get("path", ""))
+                if not relative or not isinstance(content, str):
+                    continue
+                target = (workspace_root / relative).resolve()
+                try:
+                    target.relative_to(workspace_root)
+                except ValueError:
+                    continue
+                if not target.is_file():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(content, encoding="utf-8")
+                    recovered_artifacts.append(relative)
+                if isinstance(result.output, dict):
+                    result.output["path"] = str(target)
+            prior_verification = evidence.get("verification")
+            established_evidence = _historical_contract_evidence(
+                store, int(task.id), contract,
+            )
+            prior_done = any(
+                check.get("name") == "task_declared_done" and check.get("passed")
+                for check in (prior_verification or {}).get("checks", [])
+                if isinstance(check, dict)
+            )
             verification = Verifier().verify(
                 actions,
                 results,
                 planned_count=int(evidence.get("planned_actions", len(actions))),
-                task_done=False,
+                task_done=prior_done,
                 request=task.request,
+                contract=contract,
+                final_output=canonical.body,
+                completion_metadata=evidence.get("completion_metadata"),
+                coverage_assessment=coverage,
+                established_evidence=established_evidence,
             )
             if not verification["passed"]:
                 _print_json({"task_id": task.id, "reconciled": False, "verification": verification})
                 return 1
-            task.result.setdefault("evidence", {})["verification"] = verification
+            canonical.mark_committed()
+            task.result["user_message"] = canonical.user_message
+            task.result["artifacts"] = [
+                {"path": item.path, "role": item.role, "content_ref": item.content_ref,
+                 "content_digest": item.content_digest, "state": item.state}
+                for item in canonical.artifacts
+            ]
+            task.result["canonical_answer"] = canonical.as_dict()
+            task.result["action_results"] = [asdict(item) for item in results]
+            if recovered_artifacts:
+                committed = list(task.result.get("committed_files", []))
+                task.result["committed_files"] = list(dict.fromkeys([
+                    *committed, *recovered_artifacts,
+                ]))
+                if len(recovered_artifacts) == 1:
+                    task.result["final_output"] = str(
+                        (workspace_root / recovered_artifacts[0]).resolve()
+                    )
+            task.result.setdefault("evidence", {})["previous_verification"] = prior_verification
+            task.result["evidence"]["verification"] = verification
+            task.result["evidence"]["coverage_assessment"] = coverage
+            task.result["evidence"]["established_evidence"] = established_evidence
             task.result["evidence"]["success"] = True
+            task.result["reverification"] = {
+                "reason": "runtime_fix",
+                "previous_outcome": task.status.value,
+                "new_outcome": "completed",
+                "model_calls": 0,
+                "recovered_artifacts": recovered_artifacts,
+            }
+            prior_failed_checks = {
+                item.get("name") for item in (prior_verification or {}).get("checks", [])
+                if isinstance(item, dict) and not item.get("passed")
+            }
+            evidence_persistence_failure = bool(
+                prior_failed_checks & {"network_request", "source_domain"}
+                and established_evidence
+            )
+            task.result["experience_validity"] = {
+                "agent_behavior": "invalid_for_learning",
+                "runtime_regression": True,
+                "root_surface": (
+                    "cross_cycle_evidence_persistence"
+                    if evidence_persistence_failure else "verifier_input_binding"
+                ),
+                "cost_metrics": (
+                    "contaminated" if evidence_persistence_failure else "valid"
+                ),
+            }
             store.update_task(int(task.id), TaskStatus.COMPLETED, result=task.result)
-            store.add_checkpoint(int(task.id), "reconciled", {"verification": verification})
+            store.add_checkpoint(int(task.id), "reconciled", {
+                "reason": "runtime_fix", "previous_verification": prior_verification,
+                "verification": verification, "model_calls": 0,
+                "recovered_artifacts": recovered_artifacts,
+            })
             _print_json({"task_id": task.id, "reconciled": True, "status": "completed"})
         return 0
     if args.command == "result":
@@ -473,6 +625,25 @@ def main(argv: list[str] | None = None) -> int:
             _print_json(store.list_harness_versions())
         elif args.evolution_command == "runs":
             _print_json(store.list_evolution_runs(args.limit))
+        elif args.evolution_command == "auto-run":
+            skill_manager, capsules, runner = _experiment_services(settings, store)
+            semantic = PairwiseSemanticJudge(
+                ModelSemanticJudge(settings.model)
+                if settings.experiments.semantic_judge_enabled else None
+            )
+            orchestrator = ExperimentOrchestrator(
+                store, capsules, runner, semantic_judge=semantic,
+            )
+            loop = SelfEvolutionLoop(
+                store, ExperienceAnalyzer(store),
+                ModelEvolutionReasoner(LLMController(settings.model)),
+                manager, orchestrator,
+            )
+            _print_json(loop.run(
+                capsule_ids=args.capsule or None,
+                runs_per_variant=args.runs or settings.experiments.default_runs_per_variant,
+                task_limit=args.task_limit, trace_limit=args.trace_limit,
+            ))
         elif args.evolution_command == "tools":
             plugins = PluginManager(settings.extensions, store, settings.workspace)
             _print_json([plugin.as_dict() for plugin in plugins.active_plugins()])

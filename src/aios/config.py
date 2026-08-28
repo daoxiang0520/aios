@@ -69,6 +69,7 @@ class SandboxConfig:
     memory_mb: int = 512
     cpus: float = 1.0
     pids_limit: int = 128
+    health_ttl_seconds: int = 30
     root: str = "./sandbox"
 
 

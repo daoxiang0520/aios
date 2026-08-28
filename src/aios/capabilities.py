@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from urllib.parse import urlsplit
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -54,10 +55,18 @@ class EvidenceContract:
         capabilities: list[CapabilityRequirement] = []
         evidence: list[EvidenceRequirement] = []
 
+        url_matches = list(re.finditer(r"https?://[^\s<>()\[\]{}]+", request, re.IGNORECASE))
+        path_scan_characters = list(request)
+        for match in url_matches:
+            path_scan_characters[match.start():match.end()] = " " * (match.end() - match.start())
+        path_scan_text = "".join(path_scan_characters)
+
         outside_workspace = (
-            re.search(r"\.\.[\\/]", request) is not None
-            or re.search(r"[A-Za-z]:[\\/]", request) is not None
-            or re.search(r"/(?:etc|root|home|proc|sys|var|run|dev)(?:/|\b)", request) is not None
+            re.search(r"\.\.[\\/]", path_scan_text) is not None
+            # A Windows drive path may appear after whitespace or punctuation,
+            # but the trailing `s:/` in `https://` is not a drive prefix.
+            or re.search(r"(?<![A-Za-z0-9+.-])[A-Za-z]:[\\/]", path_scan_text) is not None
+            or re.search(r"/(?:etc|root|home|proc|sys|var|run|dev)(?:/|\b)", path_scan_text) is not None
         )
         if outside_workspace:
             capabilities.append(
@@ -71,14 +80,38 @@ class EvidenceContract:
             "网络", "联网", "网页", "在线", "最新", "实时", "arxiv", "github", "internet",
             "online", "web", "latest", "current",
         )
-        if any(marker in text for marker in network_markers):
-            capabilities.append(CapabilityRequirement("network.external", "Task requires external/current information"))
+        url_domains = []
+        for match in url_matches:
+            hostname = urlsplit(match.group(0)).hostname
+            if hostname:
+                url_domains.append(hostname.removeprefix("www.").casefold())
+        bare_domains = re.findall(
+            r"(?<![a-z0-9_.-])(?:www\.)?"
+            r"((?:[a-z0-9-]+\.)+(?:com|org|net|io|cn))"
+            r"(?![a-z0-9_.-])",
+            text,
+        )
+        domains = list(dict.fromkeys([*url_domains, *bare_domains]))
+        fetch_markers = (
+            "访问", "读取", "打开", "获取", "查询", "下载", "抓取", "参考",
+            "根据", "来自", "中的", "题目", "read", "open", "fetch", "retrieve",
+            "visit", "download", "from", "according to", "solve",
+        )
+        reference_fetch_intent = bool(domains) and any(marker in text for marker in fetch_markers)
+        network_required = reference_fetch_intent or any(
+            marker in text for marker in network_markers
+        )
+        if network_required:
+            capabilities.append(CapabilityRequirement(
+                "resource.http.read",
+                "Task requires a governed HTTP resource observation",
+            ))
             evidence.append(EvidenceRequirement("network_request"))
-        domains = re.findall(r"(?:https?://)?(?:www\.)?([a-z0-9-]+\.(?:org|com|net|io|cn))", text)
         if "arxiv" in text and "arxiv.org" not in domains:
             domains.append("arxiv.org")
-        for domain in dict.fromkeys(domains):
-            evidence.append(EvidenceRequirement("source_domain", domain))
+        if network_required:
+            for domain in domains:
+                evidence.append(EvidenceRequirement("source_domain", domain))
 
         state_requirements = (
             (("trace", "追踪", "轨迹"), "state.trace_read", "trace_query"),
@@ -137,6 +170,7 @@ class CapabilityRegistry:
         network_enabled: bool,
         allowed_domains: list[str] | None = None,
         scientific_available: bool | None = None,
+        http_read_available: bool | None = None,
     ) -> "CapabilityRegistry":
         domains = allowed_domains or []
         network_state = CapabilityState.AVAILABLE if network_enabled else CapabilityState.NEEDS_AUTHORITY
@@ -146,6 +180,12 @@ class CapabilityRegistry:
             if sandbox_available and (network_enabled or scientific_available)
             else CapabilityState.NEEDS_AUTHORITY if sandbox_available else CapabilityState.MISSING
         )
+        http_operational = sandbox_available if http_read_available is None else bool(http_read_available)
+        http_state = (
+            CapabilityState.MISSING
+            if not http_operational
+            else CapabilityState.AVAILABLE if network_enabled else CapabilityState.NEEDS_AUTHORITY
+        )
         return cls(
             [
                 Capability("filesystem.read", CapabilityState.AVAILABLE, "read", "Workspace snapshot only"),
@@ -153,6 +193,23 @@ class CapabilityRegistry:
                     "resource.read", CapabilityState.AVAILABLE, "read",
                     "Structured directory/text/CSV/ZIP observations; PDF/XLSX adapters run in Docker",
                     {"adapters": ["directory", "text", "csv", "zip", "pdf", "xlsx"]},
+                ),
+                Capability("resource.csv.read", CapabilityState.AVAILABLE, "read", "Built-in CSV adapter"),
+                Capability("resource.pdf.read", sandbox_state, "read", "Docker PDF adapter"),
+                Capability("resource.xlsx.read", sandbox_state, "read", "Docker XLSX adapter"),
+                Capability(
+                    "resource.http.read", http_state, "read(URL)",
+                    (
+                        "Governed HTTP Reader provider is operational"
+                        if http_state == CapabilityState.AVAILABLE
+                        else "HTTP Reader requires Docker and external network authority"
+                    ),
+                    {
+                        "provider": "http_reader",
+                        "schemes": ["http", "https"],
+                        "authority": "network.external",
+                        "provider_operational": http_operational,
+                    },
                 ),
                 Capability("filesystem.write", CapabilityState.AVAILABLE, "write/edit", "Workspace snapshot only"),
                 Capability(
@@ -162,6 +219,8 @@ class CapabilityRegistry:
                     "Host and parent paths are outside the Agent authority boundary",
                 ),
                 Capability("process.sandbox_exec", sandbox_state, "bash", "Docker sandbox required"),
+                Capability("execution.shell", sandbox_state, "bash", "Shell execution inside Docker"),
+                Capability("execution.python", sandbox_state, "bash/python", "Python execution inside Docker"),
                 Capability(
                     "execution.python.scientific", scientific_state, "python",
                     "Pinned reusable numpy/pandas/scipy/statsmodels environment",

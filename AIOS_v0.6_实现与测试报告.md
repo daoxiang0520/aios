@@ -1,5 +1,341 @@
 # AIOS v0.6 实现与测试报告
 
+## v0.7.1.4 Operational Capability Binding（2026-08-28）
+
+Task 72 的 Contract 正确识别出洛谷 URL 需要网络，但 Runtime 只声明 `network.external=available`，没有为 Agent 提供可调用的 HTTP operation。模型只好猜测 `curl`，而 `python:3.12-slim` 中没有该命令；两次失败后又退化为只验证已有 `P1593.py`，最终被 Verifier 正确拒绝为缺少 `network_request/source_domain`。这是 deterministic Runtime regression，不进入 Evolution learning。
+
+- 保持模型工具面为 `read/write/edit/bash` 四原语；HTTP 不新增第五个 Tool Schema，而是通过 `read("https://...") → ResourceAdapter → http_reader` 执行；
+- 新增 Host-managed `resource_adapter:http_reader` Component，`provides=resource.http.read`，`requires=network.external + process.sandbox_exec`，固定代码在 Docker 内使用标准库 HTTP client；
+- URL Contract 从泛化的 `network.external` 改为任务真正需要的 `resource.http.read`，同时保留 `network_request/source_domain` EvidenceContract；
+- `resource.http.read` 的 Effective Capability 同时绑定 Provider 实现、Docker operational state 与网络 Authority；网络未授权返回 `needs_authority`，Provider/沙盒不可用返回 `missing`；
+- Situation Map 与 Tool Schema 明确投影 `read(URL)` affordance，模型不需要猜测 `curl/wget/requests`；
+- 成功 HTTP observation 自动记录状态码、requested/final URL、source domain、digest，并由 Host Verifier 建立网络与域名证据；模型文字声明不能替代 observation；
+- HTTP Provider 对 DNS、连接重置/拒绝、超时等瞬态错误最多受控重试一次，确定性 URL/HTTP 错误不重试；
+- Shell exit 127 结构化为 `MissingExecutable`；只有存在明确可用的替代 Provider 时允许一次定向恢复，重复 127 不再进入普通盲重试；
+- Verifier 将 unresolved evidence gap 与可用 affordance 写入下一 Attempt 的 Working State；失败沙盒丢弃后，仅保留 digest 仍匹配的本地资源状态和本任务网络 Trace，未提交 Artifact 与 `command_success` 不跨 Attempt 复用。
+
+Operational Capability Binding 聚焦测试 **7/7** 通过，完整标准库单元/集成测试 **145/145** 通过。真实 Provider 已进入固定 Docker HTTP Reader；当前 Codex 测试宿主的 Docker DNS 返回 `Temporary failure in name resolution`，被正确归类为瞬态 Adapter failure，而不再表现为 `curl: command not found`。应在用户常驻 Runtime 所在宿主重启后重跑 Task 72 完成最终外网验收。
+
+## v0.7.1.3 Cross-Cycle Evidence Persistence（2026-08-28）
+
+Task 71 在首个 Cycle 已真实访问洛谷并提取 P1593 题面，后续 Cycle 生成、修正并测试 `P1593.py`；终态 Verifier 却只检查最后一个 Cycle 的本地 read/bash，因而连续判定缺少 `network_request/source_domain`。这是 Evidence 生命周期与 Task 生命周期不一致，不是模型或网络失败。
+
+- Working State 新增 bounded `evidence_ledger`，记录 Host 根据当前 EvidenceContract 与成功 ActionResult 建立的 `{kind,value,state,evidence_ref}`；
+- ledger 经过 checkpoint continuation 与 Working State projection 持久化，终态 Verifier 同时检查当前 Cycle actions 和历史 established evidence；
+- 模型不能写入或声明 ledger，只有 Runtime 在 ActionResult 后调用确定性 Evidence Verifier 建立事实；
+- `task reconcile` 可从任务全部 `plan_created/action_result` Trace 重建相同 ledger，实现历史 Execution 与新 Evaluation 分离；
+- 网络 wrapper 即使 exit code 为 0，只要 stdout 明确以 `ERR` 报告捕获异常，就不能形成成功网络证据；
+- Task 71 的真实证据最终绑定到输出洛谷题面正文的 Trace，失败的 302/DNS 调用不会进入 ledger；
+- Task 71 使用既有 Trace、最终答案和已提交的 `P1593.py` 离线重验，由 `dead_letter` 恢复为 `completed`，新增模型调用为 0；原三次失败及旧 verification 均保留；
+- 经验标注为 `agent_behavior=invalid_for_learning`、`runtime_regression=true`、`root_surface=cross_cycle_evidence_persistence`、`cost_metrics=contaminated`。
+
+Evidence/Runtime 专项门禁 **14/14** 通过；完整标准库单元/集成测试 **138/138** 通过。
+
+## v0.7.1.2 Capability Reference Classification（2026-08-28）
+
+Task 70 的 `https://www.luogu.com.cn/problem/P1593` 同时被 URL 与 Windows 盘符规则命中：旧正则把 `https:/` 尾部的 `s:/` 当成盘符，导致 Authority 对错误推断出的 `filesystem.outside_workspace` 正确执行拒绝。本补丁修复 Contract extraction，不放宽任何文件系统权限。
+
+- 先提取 HTTP(S) URL spans，再将其从 generic filesystem path scan 中屏蔽；
+- Reference lexical type 保持最小集合：Web URL、Windows Host Path、受保护 POSIX Host Path、Parent Traversal 与其他文本；没有新增 Resource Resolver 或 Ontology；
+- `URL + fetch/read/open/reference/source intent → network.external`；仅解释 URL 字符串结构时既不要求网络，也不要求 workspace 外文件权限；
+- URL domain 使用结构化解析，`www.luogu.com.cn` 规范化为 `luogu.com.cn`，不截断成 `luogu.com`；
+- 混合请求可同时产生 `filesystem.outside_workspace` 与 `network.external`，两个引用不会互相覆盖；
+- 高影响的 `filesystem.outside_workspace` 只由显式 Windows 绝对路径、受保护 POSIX 路径或 parent traversal 触发；
+- Task 70 原 preflight 标记为 `agent_behavior=invalid_for_learning`、`runtime_regression=true`、`failure_surface=capability_contract`、`cost_metrics=valid_but_non_agent`；v0.7.1.2 离线 re-preflight 已通过。首次重新排队被仍驻留的 pre-hotfix Runtime 消费并再次阻断，因此必须先重启常驻 Runtime，再执行 `Re-preflight → Execute`，而不是重验不存在的 Agent execution。
+
+Reference classification 与 Runtime 专项门禁 **11/11** 通过；完整标准库单元/集成测试 **135/135** 通过。
+
+## v0.7.1.1 Runtime Correctness Hotfix（2026-08-28）
+
+本补丁只修复 Host/Runtime 不变量，不新增 Agent、Evolution Surface、Ontology 或任务能力。核心原则是：`Runtime invariant bug → deterministic runtime fix`，不能让自进化去适应 Harness 自身故障。
+
+### Continuation Correctness
+
+- `events` 新增显式 `task_id / checkpoint_id / continuation_generation`，`tasks` 新增 `current_checkpoint_id / continuation_generation`；
+- SQLite partial unique index保证每个 Task 至多一个 `pending/processing TASK_CONTINUE`；
+- 相同 checkpoint 重复入队幂等返回已有事件，并累计 `continuation_duplicates_suppressed`；
+- 新 checkpoint 自动使旧 active continuation stale；消费前再次检查 terminal status、checkpoint 和 generation；不匹配事件在模型调用前丢弃，并累计 `stale_continuations_discarded`；
+- 终态任务会清空 checkpoint、递增 fencing generation，并把遗留 continuation 标为 stale，禁止复活；
+- continuation 执行失败后改为普通 `TASK_REQUEST` 重试，下一轮正常递增 attempts，消除 Task 64 式无限 continuation retry；
+- 未引入新的 ContinuationManager，约束直接位于 StateStore、SQLite 与 Runtime 消费边界。
+
+### Canonical Answer Binding
+
+- 新增显式 `CanonicalAnswer={user_message, body, artifacts}`；artifact 记录 path、`final_deliverable` role、content reference、digest 与 staged/committed state；
+- Coverage 和 Completion Verifier 检查 canonical body，即最终文本与相关交付 artifact 正文；兼容字段 `final_output` 仍可保存产物路径，但不再充当语义答案；
+- artifact 选择优先匹配 EvidenceContract 请求的文件，其次匹配用户消息引用，最后只选择最后一个成功写入，避免把所有临时文件混入答案；
+- 离线 `task reconcile` 使用历史 actions/results 重建 Canonical Answer，可先重验语义，再从已记录 write 内容恢复未提交 artifact；不会调用模型。
+
+### Historical Reconciliation
+
+- Task 64：1 个 active continuation 已置 stale，任务转为 `needs_review`；`agent_behavior=invalid_for_learning`、`runtime_regression=true`、`cost_metrics=contaminated`；
+- Task 67：原始正文通过 A/B/C Coverage；从历史 write action 恢复 `MathModeling/题目总结.md`，随后由 `dead_letter` 转为 `completed`；`reverification.model_calls=0`；
+- Task 67 原 verification 保存在 `previous_verification`，新增 runtime-fix re-verification 记录，不覆盖原审计事实；
+- 当前数据库不存在拥有多个 active continuation 的 Task。
+
+### Invariant Gates
+
+- Artifact-backed answer：最终文字只引用路径、artifact 正文满足主题时 PASS；
+- Semantic negative：文件存在但正文不满足主题时 FAIL；
+- Continuation uniqueness：同 task/checkpoint 入队 10 次，active count 恒为 1；
+- Checkpoint fencing：旧 checkpoint 事件变为 stale，模型调用为 0；
+- Terminal no-resurrection：completed task 的遗留 continuation 变为 stale，任务保持 completed，模型调用为 0。
+- Terminal retry no-resurrection：指向终态任务的遗留普通 retry event 同样在模型调用前变为 stale。
+- URL Capability Binding：`https:/` 中的 `s:/` 不再被误判为 Windows 盘符；显式 URL 产生 `network.external + network_request + source_domain`，并保留 `luogu.com.cn` 等多级域名；真实 `C:\\...` 路径仍被判为 workspace 外部路径。
+
+语法检查通过；专项门禁 **8/8** 通过；完整标准库单元/集成测试 **132/132** 通过。
+
+## v0.7.1 Semantic Fitness & Persistence（2026-08-28）
+
+Task 66 不是一次有效的 Self-Evolution Loop 测试，而是 Fitness 与 Context Persistence 的反例：三个 PDF Evidence 均完整，但最终答案明确承认 B 题“未能在此轮完整呈现、待下一轮补充”，Coverage 仍错误给出 `covered_in_answer=true`；同时三个 Resource State 只有 read metadata，没有保留任何语义内容，最终累计 22 次重复 read request、25 次 Model Calls 和 208096 Tokens。
+
+### Answer Coverage Correctness
+
+- `未能在此轮完整呈现 / 具体文字内容未能 / 待下一轮 / 待补充 / 无法提供` 等明确否定或延期信号不能计为 full target coverage；
+- 修正题目标题边界，`B题PDF`、`C题NIPT` 可以正确成为 section 起点，不再把后续 target 的失败声明错误合并到前一个 target；
+- Task 66 原始答案现在得到 `Evidence(B)=true, AnswerCoverage(B)=false`，从而阻止 `completed/full`；
+- Controller 的 `claims_complete=true` 不能覆盖 Host 根据可观察答案得到的 Coverage failure。
+
+### Bounded Semantic Residue
+
+- 完整文本 Resource Observation 在 Operational Resource State 中新增 `semantic_residue`；
+- residue 从 Adapter 的真实 text representation 生成，不额外调用模型，也不以模型常识替代 Evidence；
+- 单资源最多保留 1200 字符，Task 内总计最多 4000 字符；超长文本使用 bounded head/tail projection；
+- residue、complete 状态与 evidence reference 一起经过 checkpoint/Working State projection 跨 Cycle 保留；
+- Controller 和 Situation guidance 明确要求优先使用 residue，再决定是否窄范围 reread；
+- 目标是满足 `CarryCost << ReReadCost`，同时不把完整 Tool Result 重新塞回 HOT Context。
+
+### Evolution Evidence Policy
+
+- Task 66 的历史 `completed/full` 结果不应作为自动选择的正向 Capsule；
+- 必须在 v0.7.1 下重跑，确认 A/B/C 均有实质总结且重复读取显著下降，才能进入 Harness Counterfactual；
+- 本补丁不新增 mutation surface，不增加 Resource ontology，也不声称解决所有开放语义判定；当前首先封堵 Task 66 的明确 false positive。
+
+新增三项门禁：Task 66 deferral 拒绝、semantic residue 跨 Context 保留、跨资源 residue 总预算。完整回归为 **124/124 通过**。
+
+## v0.7 Self-Evolution Loop（2026-08-28）
+
+本里程碑把开发重点从“人继续逐个修 Harness”转为“建立 AI 改进自身工作环境的慢循环”。正常 Task Agent 继续按秒/分钟执行任务；Evolution Agent 跨任务读取经验，以更慢频率提出并验证环境变化。
+
+### 自主闭环
+
+```text
+Goal / Task Experience
+→ Experience Analyzer
+→ Model Evolution Reasoner
+→ Hypothesis + Mutation
+→ Policy Benchmark
+→ Historical Task Capsules
+→ Baseline/Candidate Counterfactual
+→ Constraint/Pareto Selection
+```
+
+- `ExperienceAnalyzer` 聚合 Task 状态、失败类型、Verifier checks、Tool failure、Model Calls/Tokens、重复读取、环境探测、协议修复与 Adapter retry；
+- Analyzer 只压缩证据，不输出推荐 mutation，避免 Host heuristic 冒充自主进化；
+- `ModelEvolutionReasoner` 由模型自主选择一个重复 friction、形成 hypothesis、指定 target 并生成一个 mutation；
+- Experience、AI proposal、Candidate、Experiment 与 Selection 全部进入既有 Evolution/Experiment 审计记录。
+
+### Kernel 与 Mutable Environment
+
+不可变 Kernel：
+
+```text
+Authority / Credentials / Security Kernel / Sandbox Isolation
+Audit / Immutable Experiment Boundary / Rollback / Human Override
+```
+
+v0.7 MVP 首个开放面为声明式 Harness policy：
+
+```text
+prompt_append
+max_actions_per_cycle
+memory_context_characters
+```
+
+每个候选最多改变一个字段。任何 Kernel surface、未知字段或多 mutation 提案都在 Candidate 创建前拒绝。Skill 保留既有独立进化链；Workflow、Resource Adapter、Environment Provider、Plugin 与 Component taxonomy 本身尚未开放写入。
+
+### Counterfactual 与选择
+
+- `ExperimentOrchestrator` 的可执行 mutation kind 从仅 `skill` 扩展为 `skill | harness`；
+- Harness mutation 只应用在隔离恢复的实验 world，不修改生产数据库；
+- baseline 与 candidate 从相同 Capsule initial state 开始，并按相同重复次数运行；
+- correctness/security 为硬约束，之后才比较 Model Calls、Tokens 与 Latency；
+- 多 Capsule 全部 `PROMOTABLE` 才将 Candidate 标记为 `selected`；任一安全或正确性退化即 `rejected`；证据不足或 tradeoff 分别进入 `insufficient_evidence / needs_review`；
+- `selected` 不等于 production activated，v0.7 慢循环始终返回 `production_activated=false`。
+- 人工审阅通过后可执行 `evolution promote CANDIDATE_ID --approve`；晋升器接受通过静态 benchmark 的旧候选或通过 Counterfactual selection 的 `selected` 候选，其他状态仍拒绝。
+
+### 使用与测试
+
+```powershell
+python -m aios --config config.json evolution auto-run --capsule CAP_ID --runs 3
+```
+
+省略 `--capsule` 时自动选择最多三个近期 replayable Capsule；mock provider 只记录 `NO_ACTION`，不会伪造 AI hypothesis。
+
+新增四项 v0.7 门禁，完整回归为 **121/121 通过**：
+
+- 跨任务 Experience 能识别重复摩擦，但不替 AI 指定 mutation；
+- AI proposal 经两个 Capsule 均胜出后进入 `selected`，生产 Harness version 不变化；
+- Kernel mutation 在 Candidate 创建前被拒绝；
+- Harness mutation 可进入真实 Counterfactual 聚合并获得 `PROMOTABLE`。
+
+## v0.6.8.2 Goal-Oriented Coverage（2026-08-28）
+
+Task 65 证明 `Coverage Scope = MathModeling/` 仍不足以保证正确性：旧逻辑继续把 scope 内所有 `.md/.txt/.pdf/.docx/.html` 文件标成必读，导致四份派生分析 Markdown 成为无效 Coverage debt。本补丁纠正 Coverage 抽象，不新增 Resource Role 本体或额外治理子系统。
+
+### Goal Coverage
+
+- `SituationMap` 新增 `coverage_targets`，Coverage 从 required files 改为 required semantic targets；
+- Task 65 的目标解析为 `A题 / B题 / C题`；
+- 每个 target 仅选择一个确定性的最小证据来源；显式文件、规范同名文件、直接主题匹配优先，PDF/DOCX 优先于带“分析/建模/总结/报告”等派生特征的文件；
+- 文件仍保留 `required_for_coverage`，但只作为旧接口兼容投影，且仅在被选中的 evidence path 上为 true；
+- 无可识别主题时退化为一个 bounded scope target，而不是重新把每个文件变成独立义务。
+
+### Verification
+
+- 每个 Coverage Target 必须同时满足 `HasEvidence && AnswerCoverage`；
+- Evidence 必须来自完整 Resource Observation 且具有 evidence reference；
+- Answer Coverage 不再只看标签是否出现；短小的“未完整呈现/无法总结/重新读取”等免责声明不能冒充主题总结；
+- Coverage repair feedback 可区分缺失 evidence target 与缺失 answer topic，要求读取选中证据后再修订回答；
+- 未增加独立 Claim Consistency Verifier，Task 65 的 B 题矛盾直接由 Answer Coverage 捕获。
+
+### Task 65 Release Gate
+
+- Coverage Targets = `{A题, B题, C题}`；
+- 最小 Evidence Set = `{A题/A题.pdf, B题/B题.pdf, C题/C题.pdf}`；
+- `题目分析.md / 问题1_建模与求解.md / A题分析.md / 第一题建模.md` 均不产生 mandatory coverage debt；
+- 三个 PDF 均有 Evidence、但 B 题只输出“正文未完整呈现”时，Verification 必须失败；
+- B 题给出实质背景与原理后，Verification 通过；
+- v0.6.8–v0.6.8.2 定向回归 13/13 通过。
+
+## v0.6.8.1 Correctness Patch（2026-08-28）
+
+本补丁修复 Task 64 暴露的三项实现缺陷：Coverage 将“数模文件夹”扩大成整个 workspace、重复请求只记录不复用、PDF Adapter 每次操作都重新执行 Docker 健康探测。版本范围严格限定为 `Coverage Scoping + Observation Reuse + Sandbox Health Stabilization + Adapter Retry`。
+
+### Coverage Scoping
+
+- Resolver 先生成 `coverage_scope={root,recursive,include,exclude,resolution_reason}`，再选择 required resources；
+- `数模/数学建模` 与 `MathModeling` 的双语目录边界在 scope 层解析；
+- 一旦 root 为 `MathModeling`，Coverage 仅在该 subtree 内计算；workspace 顶层文件只计入 `outside_root_files_excluded`；
+- 保持 `RequestedScope ⊆ ResolvedResourceRoot`，不再使用 Workspace Files Read/Total 作为覆盖率。
+
+### Observation Reuse
+
+- Observation Cache key 包含 normalized path、content SHA-256、representation、offset、limit；
+- Cache 持久化到 task dependencies，跨 Cycle 和 ResourceAdapter 实例复用，真正终态后随任务依赖清理；
+- Cache hit 返回 `reused=true / source_observation_ref / content_digest`；
+- Operational Resource State 新增 range、digest、execution_count、reuse_count、last_request_ref；
+- 区分 `RepeatedRequest` 与 `RepeatedExecution`，相同完整读取请求不再重新解析 PDF/文本。
+
+### Sandbox Health 与 Adapter Retry
+
+- Docker 健康状态提升为 Session-level invariant，默认 TTL 30 秒；
+- 仅 Session 创建、TTL 到期、显式 invalidate 和恢复尝试重新 probe；
+- Adapter 只对 Docker daemon/connectivity/container-start 类瞬时错误重试一次；
+- corrupt/encrypted/unsupported/permission/path/parse 等确定性错误不重试；
+- 新增 `sandbox_sessions / sandbox_health_probes / adapter_retries / adapter_transient_recoveries` 指标。
+
+### Task 64 Release Gate
+
+- `coverage_scope.root = MathModeling`；
+- outside-root required = 0；
+- identical full-resource repeated execution = 0；
+- Observation reuse hits > 0；
+- Docker health probes = Sandbox sessions（未触发 recovery/TTL 时）；
+- transient Adapter failure 最多重试一次并可恢复；
+- deterministic parse failure 不重试；
+- TaskStatus = completed。
+
+真实 Task 64 的失败基线为 111263 Tokens / 12 Calls / 4 Cycles / 23 repeated requests。补丁的确定性 Release Gate 已通过；远程模型 Token 对比需部署后重跑，报告不以模拟调用代替真实成本。
+
+## v0.6.8 Runtime Situation Resolution（2026-08-28）
+
+Task 63 的基线虽为 `completed`，但使用 154253 Tokens、25 次模型调用、4 个 Cycle，并出现重复读取、`bash cat` 旁路、错误 Skill candidate 归因以及遗漏 C 题仍通过验证的问题。本版把重点从“继续压缩单轮 Context”转到“减少环境探索、重复工作并验证目标覆盖”。
+
+### Situation Map
+
+- 新增 Host-owned `SituationResolver`；每轮从 Task、Workspace Inventory、Evidence Contract、Component Registry、Skill Catalog 和 Working State 动态生成 `situation/v1`；
+- Resource Resolver 给出 relevant/unread/read_partial/read_complete、representation、evidence ref 与 coverage labels；
+- Capability Resolver 区分 declared provider 与 authority-available provider；
+- Procedure Resolver 只检索与当前任务相关的 Skill，不把完整 Component Graph 暴露给模型；
+- `environment_map` 的静态横幅角色由动态 `situation_map` 取代。
+
+### Operational Working State 与 Routing Telemetry
+
+- Working State 显式拆分 `semantic` 与 Host 确定性维护的 `operational`，同时保留旧字段兼容 checkpoint；
+- v0.6.6 checkpoint 可在恢复时自动升级为新结构；
+- 完整读取记录 normalized path、complete、representation、metadata、evidence_ref、access_count；
+- 重复完整读取记录 `repeated_resource_read`；
+- `cat/head/tail/file` 读取工作区资源记录 `redundant_resource_bypass`，但不禁止 `bash` escape hatch；
+- `ls/find/pwd/which/type` 等重复环境发现记录 `environment_probe`。
+
+### Coverage 与 Candidate Attribution
+
+- 面向用户的全目录总结启用 Resource + Answer Coverage Gate；未读 required resource 或最终答案遗漏已识别主题时不能完成；
+- 若 Cycle 尚有模型预算，Host 在同一 Cycle 发出 coverage repair feedback，要求复用已读证据修正答案，不重新读取；
+- 生成 Artifact 的任务继续由 Artifact/Evidence Contract 验证，不强迫最终回复逐文件复述输入；
+- Skill candidate 只有在“明确 Skill 开发请求 + 当前任务确实写出完整候选包”时才摄取；遗留或偶然 package 记录 `skill_candidate_ingest_suppressed / NO_ACTION`。
+
+### 新指标与 Release Gate
+
+- `RepeatedResourceReads`；
+- `RedundantResourceBypasses`；
+- `EnvironmentProbeCalls`；
+- `ProtocolRepairCalls / ProtocolRepairTokens`；
+- Task 63 确定性 fixture：3 次模型调用、0 次重复读取、A/B/C 全覆盖；A/B-only 初稿在同 Cycle 被拦截并修复；
+- 真实 Task 63 的远程模型成本基线保留为 154253 Tokens / 25 Calls / 4 Cycles，部署后需另行重跑对比，不用模拟结果冒充远程模型结果。
+
+## v0.6.7 Unified Component Model + Capability Graph（2026-08-28）
+
+本版只统一描述、注册、解析与实验接口，不增加 Agent Tool，不开放新的自动进化对象，也不统一不同安全平面的 Runner。
+
+### 统一数据模型
+
+- `ComponentManifest(api_version=aios/v1, manifest_schema=component/v1.1)` 统一 identity、version、requires/provides、runtime、spec、interface、evolution、lineage 与 evaluation；
+- 支持 `primitive / skill / workflow / resource_adapter / environment_provider / plugin / kernel_component`；
+- `ComponentID = hash(kind,name)`，`ComponentVersionID = hash(manifest,content)`；
+- SQLite 新增 `components / component_versions / component_capabilities / capability_implications`；
+- `ComponentRegistry` 提供 `register/get/list/resolve_provider/resolve_available_provider/list_providers/dependencies/dependents/graph/snapshot`；
+- Runtime 公共核固定为 `plane / isolation / runner_kind`，各类型私有配置进入 `spec`，Manifest 自报不能覆盖 Host Trust Policy。
+
+### Capability 与 Authority 分离
+
+- Component Registry 说明“谁提供能力”；Capability/Authority Kernel 决定“当前是否允许”；
+- `resolve_provider` 解析声明供给，`resolve_available_provider` 再叠加 Authority 与 requires 检查；例如 Host 禁网时仍能查询到 `docker_network_bridge` 的声明，但不能把它解析成当前可用 Provider；
+- Provider 允许多实现并采用确定性排序：exact、trust、version、cost、historical utility、stable ID；
+- 首版显式 implication 包括 `execution.python.scientific → execution.python` 和资源格式读取 → `resource.read`。
+- Capability 不按点号前缀自动继承；没有显式 implication 的 `resource.custom.deep` 不会被当作 `resource.custom`。
+
+### 兼容投影与 Host Components
+
+- `SkillManager` 是 Skill 生命周期的唯一真相源，`SkillManifest.as_component_manifest()` 只生成只读兼容投影；Registry 启动时主动对账，已废弃/移除 Skill 不会残留为 active Component；
+- Active Skill 只能由 `source=skill_registry` 投影，Host 或 Agent 均不能直接绕过原晋升流程写入；旧 list/promote/telemetry/replay 不变；
+- 注册四个 primitive，但模型 Tool Surface 仍严格只有 `read/write/edit/bash`；
+- 注册 `pdf_reader/xlsx_reader/csv_reader` Resource Adapter；
+- 注册 `scientific-py312-v1` Environment Provider；
+- Runtime Prompt 只接收 capability-centric `environment_map`，不暴露完整 Component 内部结构。
+
+### Trust 与实验边界
+
+- Host Trust Policy 覆盖 Manifest 自报；plugin/workflow/adapter/environment/kernel 均不能由 Agent 创建或晋升；
+- Agent 仅可登记 skill candidate，不能通过 Registry 绕过人工晋升成为 active；
+- 实验 Variant 新增通用 `component_mutation` schema，但 Runner 对非 skill 返回 `unsupported_mutation_kind`；
+- Capsule 保存 active Component Set 与 hash，Component Set 变化会改变 `initial_state_hash`。
+
+### Release gate
+
+- Existing Skill behavior unchanged；
+- Visible Tools = 4；
+- `resource.xlsx.read` 与 `execution.python.scientific` 可解析到正确 Provider；
+- Provider existence != Authority；
+- Declared provider resolution != available provider resolution；
+- Skill canonical state 与 Component projection 无漂移；
+- Runtime common core + kind-specific spec；
+- 多 Provider 版本排序稳定，且无隐式前缀推断；
+- Same Component abstraction != Same Trust；
+- Existing Counterfactual Replay 完整通过；
+- Component Set hash 纳入 Capsule 初始环境状态。
+
 ## v0.6.6.3 Structured Completion Semantics（2026-08-28）
 
 本补丁修复 Task 61 暴露的 Verifier Semantic Ambiguity：业务结论“云团无法形成有效遮蔽”不再被解释为 Agent 无法完成任务。

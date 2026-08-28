@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import Settings
+from ..evolution import EvolutionManager
 from ..runtime import AIOSRuntime
 from ..skills import SkillManager
 from ..storage import StateStore
@@ -41,8 +42,15 @@ class ExperimentOrchestrator:
         self, capsule_id: str, baseline: ExperimentVariant, candidate: ExperimentVariant,
         *, runs_per_variant: int = 3, keep_worlds: bool = False,
     ) -> dict[str, Any]:
-        if baseline.mutation_type != "skill" or candidate.mutation_type != "skill":
-            raise ValueError("v0.6.5 supports only mutation_type=skill")
+        supported = {"skill", "harness"}
+        unsupported = next(
+            (item.mutation_type for item in (baseline, candidate) if item.mutation_type not in supported),
+            None,
+        )
+        if unsupported is not None:
+            raise ValueError(f"unsupported_mutation_kind:{unsupported}")
+        if baseline.mutation_type != candidate.mutation_type:
+            raise ValueError("Experiment variants must mutate the same component kind")
         runs_per_variant = max(1, min(int(runs_per_variant), 10))
         capsule = self.capsules.show(capsule_id)
         integrity = self.capsules.verify_integrity(capsule_id)
@@ -58,8 +66,10 @@ class ExperimentOrchestrator:
                 "task": capsule["task"], "workspace_hash": capsule["workspace"]["manifest_hash"],
                 "capabilities": capsule["capabilities"], "harness": capsule["harness"],
                 "model": capsule["model"], "environment": capsule["environment"],
+                "components": capsule.get("components"),
             },
-            "allowed_difference": "skill mutation only",
+            "allowed_difference": f"{baseline.mutation_type} mutation only",
+            "mutation_schema": "component_mutation/v1",
         }
         self.store.create_experiment(spec)
         all_runs: dict[str, list[dict[str, Any]]] = {baseline.name: [], candidate.name: []}
@@ -154,15 +164,20 @@ class RuntimeVariantRunner:
         skill_root = Path(world["skills_root"])
         invoked: list[str] = []
         candidate_id = variant.mutation.get("candidate_id")
-        if candidate_id:
+        harness_mutation: dict[str, Any] = {}
+        if variant.mutation_type == "skill" and candidate_id:
             package, manifest, _ = self.source_skills._candidate(str(candidate_id))
             destination = skill_root / "active" / manifest.name
             if destination.exists():
                 shutil.rmtree(destination)
             shutil.copytree(package, destination)
             invoked.append(f"{manifest.name}@{manifest.version}")
-        elif variant.mutation:
+        elif variant.mutation_type == "skill" and variant.mutation:
             raise ValueError("Skill variant may only declare candidate_id")
+        elif variant.mutation_type == "harness":
+            harness_mutation = dict(variant.mutation)
+            if harness_mutation:
+                EvolutionManager._validate_mutation(harness_mutation)
 
         isolated = replace(
             self.settings,
@@ -174,6 +189,14 @@ class RuntimeVariantRunner:
             evolution=replace(self.settings.evolution, extensions_path=str(world_root / "extensions")),
         )
         runtime = AIOSRuntime(isolated)
+        if harness_mutation:
+            isolated_candidate = runtime.store.add_candidate(
+                harness_mutation, "Counterfactual experiment variant",
+            )
+            runtime.store.update_candidate(
+                isolated_candidate, "benchmarked", {"passed": True, "kind": "isolated_experiment"},
+            )
+            runtime.store.promote_candidate(isolated_candidate)
         task_data = capsule["task"]
         task = Task(
             title=task_data["title"], request=task_data["request"],
@@ -214,6 +237,10 @@ class RuntimeVariantRunner:
                 "wall_time_ms": wall_time_ms,
             },
             "skills": {"candidate_id": candidate_id, "variant_skills": invoked},
+            "component_mutation": {
+                "kind": variant.mutation_type,
+                "payload": harness_mutation if variant.mutation_type == "harness" else variant.mutation,
+            },
             "security": {"violations": violations},
             "artifacts": {"workspace_hash": workspace_hash, "committed_files": result.get("committed_files", [])},
             "trace_id": result.get("cycle_id"), "final_output": result.get("final_output", ""),

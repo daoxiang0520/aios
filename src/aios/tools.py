@@ -15,7 +15,7 @@ from .types import Action, ActionResult
 Tool = Callable[..., Any]
 
 CORE_TOOL_SCHEMAS: list[dict[str, Any]] = [
-    {"type": "function", "function": {"name": "read", "description": "Read a workspace resource through the Resource Adapter. Supports structured directory listings, UTF-8 text/code, CSV previews, ZIP listings, PDF text, and XLSX sheet previews. Use a relative path or /workspace/...; /workspace is the workspace root. offset/limit select text characters, CSV/XLSX rows, or PDF text characters depending on representation.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}}, "required": ["path"], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "read", "description": "Read a resource through the Resource Adapter. Supports workspace paths plus governed http/https URLs when resource.http.read is available, structured directory listings, UTF-8 text/code, CSV previews, ZIP listings, PDF text, and XLSX sheet previews. Use a relative path, /workspace/..., or a complete http/https URL. offset/limit select text characters, CSV/XLSX rows, or PDF text characters depending on representation.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}}, "required": ["path"], "additionalProperties": False}}},
     {"type": "function", "function": {"name": "write", "description": "Create or replace a UTF-8 file in the task workspace. Use a relative path or /workspace/....", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"], "additionalProperties": False}}},
     {"type": "function", "function": {"name": "edit", "description": "Replace exact text in an existing UTF-8 workspace file. Use a relative path or /workspace/....", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}, "replace_all": {"type": "boolean"}}, "required": ["path", "old_text", "new_text"], "additionalProperties": False}}},
     {"type": "function", "function": {"name": "bash", "description": "Run a command inside the configured strong sandbox with /workspace as its working directory. Never runs on the host and must not scan container root.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "timeout_seconds": {"type": "integer"}}, "required": ["command"], "additionalProperties": False}}},
@@ -115,6 +115,12 @@ class ToolExecutor:
             arguments = self.security.authorize(action)
             output = self.registry.get(action.tool)(**arguments)
             ok = not (action.tool == "bash" and isinstance(output, dict) and output.get("exit_code") != 0)
-            return ActionResult(tool=action.tool, ok=ok, output=output, error=None if ok else f"Command exited with {output.get('exit_code')}", duration_ms=(time.perf_counter() - started) * 1000)
+            if ok:
+                error = None
+            elif output.get("exit_code") == 127:
+                error = "MissingExecutable: shell command was not found (exit 127)"
+            else:
+                error = f"Command exited with {output.get('exit_code')}"
+            return ActionResult(tool=action.tool, ok=ok, output=output, error=error, duration_ms=(time.perf_counter() - started) * 1000)
         except Exception as exc:
             return ActionResult(tool=action.tool, ok=False, error=f"{type(exc).__name__}: {exc}", duration_ms=(time.perf_counter() - started) * 1000)

@@ -100,7 +100,7 @@ class Verifier:
     def __init__(self, completion_arbiter: CompletionArbiter | None = None):
         self.completion_arbiter = completion_arbiter or CompletionArbiter()
 
-    def verify(self, actions: list[Action], results: list[ActionResult], *, planned_count: int, task_done: bool = True, request: str = "", contract: EvidenceContract | None = None, final_output: str = "", capability_assessment: dict[str, Any] | None = None, completion_metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    def verify(self, actions: list[Action], results: list[ActionResult], *, planned_count: int, task_done: bool = True, request: str = "", contract: EvidenceContract | None = None, final_output: str = "", capability_assessment: dict[str, Any] | None = None, completion_metadata: dict[str, Any] | None = None, coverage_assessment: dict[str, Any] | None = None, established_evidence: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         contract = contract or EvidenceContract.from_request(request, self._expected_artifacts(request))
         checks: list[dict[str, Any]] = []
         self._check(checks, "execution", "all_actions_executed", len(results) == planned_count, f"executed={len(results)} planned={planned_count}")
@@ -135,9 +135,26 @@ class Verifier:
 
         evidence_ok = True
         for requirement in contract.evidence:
-            passed = self._has_evidence(requirement.kind, requirement.value, actions, results)
+            passed = self._has_evidence(
+                requirement.kind, requirement.value, actions, results,
+                established_evidence=established_evidence,
+            )
             evidence_ok = evidence_ok and passed
             self._check(checks, "evidence", requirement.kind, passed, requirement.value or "required")
+
+        coverage = coverage_assessment if isinstance(coverage_assessment, dict) else {"required": False, "passed": True}
+        if coverage.get("required"):
+            coverage_ok = bool(coverage.get("passed"))
+            evidence_ok = evidence_ok and coverage_ok
+            detail_parts = []
+            if coverage.get("unread_resources"):
+                detail_parts.append("unread=" + ",".join(str(item) for item in coverage["unread_resources"]))
+            if coverage.get("missing_answer_topics"):
+                detail_parts.append("missing_topics=" + ",".join(str(item) for item in coverage["missing_answer_topics"]))
+            self._check(
+                checks, "goal", "required_resource_and_answer_coverage", coverage_ok,
+                "; ".join(detail_parts) if detail_parts else "all required resources and topics covered",
+            )
 
         protocol_clean = not contains_serialized_tool_call(final_output)
         artifact_goal = bool(contract.artifacts) and not missing
@@ -171,6 +188,7 @@ class Verifier:
             "evidence_satisfied": evidence_ok and not missing,
             "result_vector": decision,
             "checks": checks,
+            "coverage_assessment": coverage,
         }
 
     @staticmethod
@@ -225,20 +243,51 @@ class Verifier:
         checks.append({"layer": layer, "name": name, "passed": passed, "detail": detail})
 
     @staticmethod
-    def _has_evidence(kind: str, value: str | None, actions: list[Action], results: list[ActionResult]) -> bool:
+    def _has_evidence(
+        kind: str,
+        value: str | None,
+        actions: list[Action],
+        results: list[ActionResult],
+        *,
+        established_evidence: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        if any(
+            isinstance(item, dict)
+            and item.get("state") == "ESTABLISHED"
+            and item.get("kind") == kind
+            and (value is None or str(item.get("value", "")).casefold() == value.casefold())
+            for item in (established_evidence or [])
+        ):
+            return True
         pairs = [(action, result) for action, result in zip(actions, results, strict=False) if result.ok]
         searchable = " ".join(f"{action.arguments} {result.output}" for action, result in pairs).lower()
         if kind == "network_request":
             clients = r"\b(?:curl|wget)\b|urllib\.request|http\.client|requests\.(?:get|post|request)"
             return any(
-                action.tool == "bash"
-                and isinstance(result.output, dict)
-                and result.output.get("exit_code") == 0
-                and re.search(clients, str(action.arguments.get("command", "")), re.IGNORECASE)
+                (
+                    action.tool == "read"
+                    and re.match(r"^https?://", str(action.arguments.get("path", "")), re.IGNORECASE)
+                    and isinstance(result.output, dict)
+                    and isinstance(result.output.get("resource"), dict)
+                    and int(result.output["resource"].get("metadata", {}).get("status", 0)) in range(200, 400)
+                )
+                or (
+                    action.tool == "bash"
+                    and isinstance(result.output, dict)
+                    and result.output.get("exit_code") == 0
+                    and re.search(clients, str(action.arguments.get("command", "")), re.IGNORECASE)
+                    and re.search(
+                        r"(?im)^\s*ERR(?:\s|:)",
+                        str(result.output.get("stdout", "")),
+                    ) is None
+                )
                 for action, result in pairs
             )
         if kind == "source_domain":
-            return bool(value) and value.lower() in searchable and Verifier._has_evidence("network_request", None, actions, results)
+            return bool(value) and value.lower() in searchable and Verifier._has_evidence(
+                "network_request", None, actions, results,
+                established_evidence=established_evidence,
+            )
         mapping = {"trace_query": "aiosctl.py traces", "dead_letter_query": "aiosctl.py dead-letters", "task_query": "aiosctl.py tasks", "memory_query": "aiosctl.py memory"}
         if kind in mapping:
             return mapping[kind] in searchable
@@ -247,6 +296,29 @@ class Verifier:
         if kind == "artifact":
             return bool(value) and value.lower() in searchable
         return False
+
+    @classmethod
+    def collect_evidence(
+        cls,
+        contract: EvidenceContract,
+        action: Action,
+        result: ActionResult,
+        evidence_ref: str,
+    ) -> list[dict[str, Any]]:
+        if not result.ok:
+            return []
+        collected = []
+        for requirement in contract.evidence:
+            if cls._has_evidence(
+                requirement.kind, requirement.value, [action], [result]
+            ):
+                collected.append({
+                    "kind": requirement.kind,
+                    "value": requirement.value,
+                    "state": "ESTABLISHED",
+                    "evidence_ref": evidence_ref,
+                })
+        return collected
 
     @staticmethod
     def _expected_artifacts(request: str) -> list[str]:

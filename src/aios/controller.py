@@ -28,7 +28,7 @@ not completion. If the user requested an artifact, do not set done=true until wr
 
 TOOL_SYSTEM_PROMPT = """You are the controller of a permission-gated AI runtime.
 Use the provided tools whenever workspace evidence or file changes are required.
-Reusable skills are listed in context.skills. Discover them with `python /skills/skill.py list`
+Relevant reusable skills are listed in context.situation_map.procedures. Discover them with `python /skills/skill.py list`
 and invoke them through bash as `python /skills/skill.py run NAME --input-json '{...}'`.
 Never list, read, write, or inspect `/skills` directly, and never combine a Skill dispatcher
 invocation with another shell command, pipe, or redirection.
@@ -38,6 +38,11 @@ Use context.workspace_inventory as the authoritative initial file listing. Do no
 rounds on `ls`, `find`, or `file` for paths and extensions already present there. The `read`
 primitive already adapts directories, text/code, CSV, ZIP, PDF, and XLSX into structured observations;
 call `read` directly instead of installing parsers or building format-specific shell pipelines.
+Use context.situation_map as the dynamic Host-resolved view of relevant resources, available
+capabilities, procedures, operational state, and constraints. Component identity and provider
+internals are Host concerns. A resource marked read_complete must not be read again unless you
+request a new explicit offset/range or explain conflicting evidence. For workspace inspection,
+prefer read; do not use bash cat/head/tail/file when read supports the resource.
 Listing or reading files is observation, not task completion. Continue until the user goal is fulfilled.
 For a requested artifact, call write and only finish after its successful tool result.
 Use edit for exact modifications. Use bash only for commands that are necessary and verifiable.
@@ -49,6 +54,8 @@ resume the task with fresh HOT context. Prefer task and trace query tools over u
 Treat context.task_working_state as the authoritative process state. Steps marked DONE and facts
 marked ESTABLISHED must not be repeated unless new evidence conflicts with them. Detailed old
 observations are COLD trace data; reread only the narrow resource range needed for the next step.
+When a read_complete resource has semantic_residue, treat it as the bounded carried knowledge from
+that observation. Use it to answer or plan before requesting the same full resource again.
 When context.budget.soft_pressure is true, enter efficiency mode: follow the critical path, avoid
 new discovery, reuse available artifacts, and converge on verified completion.
 When the task is complete, return a concise final answer with no tool call.
@@ -407,11 +414,12 @@ class LLMController:
             "history": history,
             "working_state": context.get("task_working_state"),
             "skills": context.get("skills"),
-            "environment_map": {"capabilities": context.get("capabilities"), "environment": context.get("environment")},
+            "situation_map": context.get("situation_map"),
+            "environment_map": context.get("environment_map") or {"capabilities": context.get("capabilities"), "environment": context.get("environment")},
             "continuation": context.get("continuation"),
             "runtime_other": {
                 key: value for key, value in context.items()
-                if key not in {"workspace_inventory", "retrieved_memories", "observations", "task_working_state", "skills", "capabilities", "environment", "continuation"}
+                if key not in {"workspace_inventory", "retrieved_memories", "observations", "task_working_state", "skills", "capabilities", "environment", "environment_map", "situation_map", "continuation"}
             },
             "tool_schema": tools,
         }

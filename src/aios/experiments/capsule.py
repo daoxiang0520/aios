@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ..capabilities import CapabilityRegistry, EvidenceContract
+from ..components import ComponentRegistry, build_component_registry
 from ..config import Settings
 from ..skills import SkillManager
 from ..storage import StateStore
@@ -28,11 +29,15 @@ class CapsuleManager:
     def __init__(
         self, settings: Settings, store: StateStore, skills: SkillManager,
         capabilities: CapabilityRegistry, root: Path | None = None,
+        components: ComponentRegistry | None = None,
     ):
         self.settings = settings
         self.store = store
         self.skills = skills
         self.capabilities = capabilities
+        self.components = components or build_component_registry(
+            capabilities, store=store, skill_manifests=skills.component_manifests()
+        )
         self.root = (root or settings.experiments_root).resolve()
         self.snapshots = ContentAddressedSnapshotStore(self.root / "capsule_objects")
         self.worlds = self.root / "worlds"
@@ -54,7 +59,7 @@ class CapsuleManager:
         )
         workspace["git"] = self._git_metadata(self.settings.workspace)
         manifest: dict[str, Any] = {
-            "kind": "execution_capsule", "capsule_version": "0.6.5",
+            "kind": "execution_capsule", "capsule_version": "0.6.7",
             "capsule_id": f"cap_{uuid.uuid4().hex}", "source_task_id": task_id,
             "capture_phase": capture_phase, "status": CapsuleStatus.CAPTURED.value,
             "fidelity": fidelity.value,
@@ -70,6 +75,7 @@ class CapsuleManager:
                 "versions": {item.name: item.version for item in self.skills.active_skills()},
             },
             "capabilities": self.capabilities.as_dict(),
+            "components": self.components.snapshot(),
             "harness": {
                 "version": self.store.active_harness().get("version"),
                 "config_hash": self._hash(self.store.active_harness().get("settings", {})),
@@ -97,6 +103,7 @@ class CapsuleManager:
             "task": manifest["task"],
             "workspace_hash": manifest["workspace"]["manifest_hash"],
             "active_skill_hash": manifest["skills"]["active_set_hash"],
+            "component_set_hash": manifest["components"]["active_set_hash"],
             "capabilities": manifest["capabilities"],
             "harness": manifest["harness"],
             "model": manifest["model"],
@@ -150,12 +157,15 @@ class CapsuleManager:
             raise CapsuleError("Restored workspace does not match capsule")
         if skill_hash != capsule["skills"]["active_set_hash"]:
             raise CapsuleError("Restored active Skill set does not match capsule")
-        restored_state_hash = self._hash({
+        restored_material = {
             "task": capsule["task"], "workspace_hash": workspace_hash,
             "active_skill_hash": skill_hash, "capabilities": capsule["capabilities"],
             "harness": capsule["harness"], "model": capsule["model"],
             "environment": capsule["environment"],
-        })
+        }
+        if "components" in capsule:
+            restored_material["component_set_hash"] = capsule["components"]["active_set_hash"]
+        restored_state_hash = self._hash(restored_material)
         if restored_state_hash != capsule["initial_state_hash"]:
             raise CapsuleError("Restored execution state does not match capsule")
         return {

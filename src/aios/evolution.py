@@ -84,8 +84,8 @@ class EvolutionManager:
             raise EvolutionPolicyError("Human approval is required for promotion")
         candidate = self._candidate(candidate_id)
         benchmark = candidate.get("benchmark") or {}
-        if candidate["status"] != "benchmarked" or not benchmark.get("passed"):
-            raise EvolutionPolicyError("Candidate must pass benchmark before promotion")
+        if candidate["status"] not in {"benchmarked", "selected"} or not benchmark.get("passed"):
+            raise EvolutionPolicyError("Candidate must pass benchmark or counterfactual selection before promotion")
         return self.store.promote_candidate(candidate_id)
 
     def rollback(self, version: int, *, approved: bool) -> dict[str, Any]:

@@ -10,6 +10,7 @@ class EventStatus(StrEnum):
     PROCESSING = "processing"
     DONE = "done"
     FAILED = "failed"
+    STALE = "stale"
 
 
 class GoalStatus(StrEnum):
@@ -38,6 +39,7 @@ class TaskStatus(StrEnum):
     NEEDS_AUTHORITY = "needs_authority"
     RETRYABLE_FAILURE = "retryable_failure"
     TERMINAL_FAILURE = "terminal_failure"
+    NEEDS_REVIEW = "needs_review"
 
 
 class MemoryType(StrEnum):

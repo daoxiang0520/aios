@@ -1,10 +1,12 @@
-# Self-Evolving AIOS v0.6
+# Self-Evolving AIOS
 
-Current release: **v0.6.6**. It adds a Resource Adapter layer beneath the unchanged `read` primitive,
-while retaining v0.6.5 immutable Task Capsules, content-addressed
-workspace and Skill snapshots, isolated baseline/candidate worlds, replicated
-counterfactual execution, multidimensional objective comparison, and an optional
-order-reversed semantic judge. Historical replay remains available as weaker evidence.
+Current release: **v0.7.1.4**. The Runtime correctness line now includes
+Operational Capability Binding and governed `read(URL)` HTTP observations,
+alongside cross-cycle Evidence Ledger persistence and typed
+URL/filesystem reference classification in addition to canonical
+answer binding, artifact-backed verification, continuation idempotency,
+checkpoint fencing, terminal-task no-resurrection, and historical state
+reconciliation. It adds no Agent, evolution surface, or ontology.
 
 > v0.6 将进化面从“增加专用 Tool Schema”迁移为“学习可执行、可测试、可版本化的 Skill”。模型的原生工具面仍固定为 `read / write / edit / bash`。
 
@@ -17,6 +19,8 @@ order-reversed semantic judge. Historical replay remains available as weaker evi
 - Goal Manager 与确定性 Intent Arbiter；
 - Mock 与 OpenAI-compatible 两种控制器；
 - 模型只可见四个通用工具：`read`、`write`、`edit`、`bash`；
+- HTTP(S) 资源通过同一个 `read(URL)` 原语与 Host-managed `http_reader` Adapter 读取，不新增模型 Tool Schema；
+- `resource.http.read` 的有效可用性同时要求 Provider 存在、Docker 可运行且 `network.external` Authority 已授予；
 - CapabilityRegistry 与执行前能力检查；
 - EvidenceContract 与执行/产物/证据/目标四层 Verifier；
 - `completed`、`degraded`、`blocked_capability`、`needs_authority` 等任务语义；
@@ -316,3 +320,112 @@ v0.6 已开始 Skill Evolution：Trace 或重复任务可以被沉淀为候选 S
 - Generic business statements containing “无法” no longer imply Agent degradation.
 - Explicit Agent/environment inability and substituted evidence remain degraded outcomes.
 - Memory remains gated to fully verified `completed` results; the richer result vector is retained for later policy evolution.
+
+## v0.7.1 Semantic Fitness & Persistence
+
+- Fixes the Task 66 false positive where a section saying “content was not fully presented; complete it next round” was accepted as full target coverage.
+- Answer Coverage recognizes explicit deferral/incompleteness signals including `未能在此轮完整呈现`, `待下一轮`, `待补充`, and equivalent English phrases.
+- Topic section boundaries now accept headings such as `B题PDF`; the previous lexical boundary could accidentally merge B's disclaimer into A's section.
+- Every complete textual Resource Observation carries a bounded `semantic_residue` in Task Working State. It preserves up to 1,200 characters per important resource and 4,000 characters across the task.
+- The controller must use semantic residue before requesting the same full resource again. Detailed observations remain COLD Trace data.
+- Task 66's historical `completed/full` label is not valid Self-Evolution evidence. It must be rerun under v0.7.1 before being captured as a positive Capsule.
+
+## v0.7.1.1 Runtime Correctness Hotfix
+
+- Verification receives an explicit `CanonicalAnswer`: user message plus the body of relevant final-deliverable artifacts. A tool-returned path is no longer treated as answer content.
+- Task results retain compatibility `final_output` while separately recording `user_message`, `artifacts`, and `canonical_answer`.
+- `TASK_CONTINUE` events carry explicit task/checkpoint/generation columns. A partial unique index enforces at most one pending/processing continuation per task.
+- Enqueue is idempotent; consumption fences terminal tasks, stale checkpoints, and stale generations before any model call.
+- A failed continuation retries as `TASK_REQUEST`, so retry attempts cannot remain constant forever.
+- Runtime telemetry records `continuation_duplicates_suppressed` and `stale_continuations_discarded`.
+- Task 64 was quarantined as `needs_review`; its cost evidence is marked contaminated and invalid for learning. Task 67 was reverified without a model call, its recorded artifact restored, and its prior verifier failure retained in the audit chain.
+- URL capability parsing distinguishes `https://` from Windows drive prefixes, treats explicit URLs as `network.external`, and preserves multi-level domains such as `luogu.com.cn`.
+- Eight focused Runtime/capability gates pass; the complete suite passes **132/132**.
+
+## v0.7.1.2 Capability Reference Classification
+
+- Structured HTTP(S) spans are recognized before generic filesystem scanning and masked from path inference.
+- URL fetch/read/reference intent requires `network.external`; merely explaining a URL string does not.
+- Windows absolute paths, protected POSIX host paths, parent traversal, and mixed URL/path requests retain independent capability requirements.
+- Multi-level domains such as `luogu.com.cn` are preserved in `source_domain` evidence.
+- Task 70 re-preflight succeeds under v0.7.1.2; its original Host misclassification is recorded as invalid for Agent learning. A resident pre-hotfix Runtime must be restarted before the task is requeued for real execution.
+- Focused gates pass **11/11**; the complete suite passes **135/135**.
+
+## v0.7.1.3 Cross-Cycle Evidence Persistence
+
+- Host-observed EvidenceContract facts are stored in a bounded `evidence_ledger` with kind, value, state, and Trace reference.
+- The ledger crosses checkpoint continuation through Task Working State; Verifier checks current actions plus established evidence, so a final local computation does not erase an earlier web fetch.
+- Models cannot self-declare ledger entries; only successful ActionResults matching an active EvidenceContract can establish them.
+- `task reconcile` can rebuild the same ledger from historical `plan_created/action_result` traces and re-evaluate without a model call.
+- A caught network exception printed as `ERR ...` is not evidence even when the wrapper exits with code 0.
+- Task 71 was reverified from the real Luogu observation and existing `P1593.py`, then recovered from dead letter to completed with zero additional model calls. Its retry-inflated cost is marked contaminated.
+- Focused gates pass **14/14**; the complete suite passes **138/138**.
+
+## v0.7 Self-Evolution Loop
+
+AIOS now has a slow evolution loop separate from the normal task loop:
+
+```text
+Experience → AI diagnosis → Hypothesis → Harness mutation
+           → Capsule counterfactuals → Constraint/Pareto selection
+```
+
+- `ExperienceAnalyzer` compresses cross-task Task/Trace/Verifier/cost telemetry but deliberately does not recommend an architecture change.
+- `ModelEvolutionReasoner` receives the evidence packet and autonomously selects one recurring friction, one hypothesis, and at most one mutable-environment mutation.
+- The immutable Kernel boundary covers authority, credentials, isolation, audit, experiment boundaries, rollback, and human override. A Kernel mutation is rejected before candidate creation.
+- The v0.7 MVP opens only the declarative `harness` surface: `prompt_append`, `max_actions_per_cycle`, or `memory_context_characters`. Skill evolution remains available through its existing lifecycle; other Component kinds are still closed.
+- Harness candidates run against baseline in immutable Task Capsules through the same counterfactual evaluator used for Skills.
+- Selection is constraint/Pareto based: security and correctness cannot regress; only then may cost, calls, and latency establish an improvement.
+- A winning candidate becomes `selected`, not active. The slow loop never modifies the production Harness automatically.
+- After reviewing the proposal and experiment reports, a human can activate a selected candidate with `python -m aios --config config.json evolution promote CANDIDATE_ID --approve`.
+
+Run against explicitly selected capsules:
+
+```powershell
+python -m aios --config config.json evolution auto-run `
+  --capsule CAP_ID_1 --capsule CAP_ID_2 --runs 3
+```
+
+When `--capsule` is omitted, the loop selects up to three recent replayable capsules. With the mock provider it records `NO_ACTION`; a configured remote model is required to author a real hypothesis.
+
+## v0.6.8.2 Goal-Oriented Coverage
+
+- Coverage obligations are semantic targets, not every narrative file under the resolved directory. A modeling-folder request resolves to `A题 / B题 / C题` rather than all PDF/Markdown files.
+- Each target selects one deterministic best evidence source. Explicitly named and canonical topic files are preferred; PDF/DOCX sources outrank derived analysis notes.
+- `required_for_coverage` remains only as a compatibility projection on the selected evidence paths; `coverage_targets` owns verification truth.
+- Verification requires every target to have a complete evidence reference and substantive answer coverage. A disclaimer such as “B题正文未完整呈现” does not count as B-topic coverage.
+- No Resource ontology, database table, Registry, Role Resolver, or separate Claim Consistency Verifier was added.
+- The Task 65 regression fixture selects only `A题.pdf / B题.pdf / C题.pdf`; four derived Markdown files create no mandatory coverage debt.
+
+## v0.6.8.1 Coverage Scoping + Observation Reuse + Sandbox Health Stabilization + Adapter Retry
+
+- Resolves a structured Coverage Scope before selecting obligations. A request for the modeling folder resolves to `MathModeling/`; files outside that subtree are excluded rather than counted as unread debt.
+- Adds a task-scoped persistent Observation Cache keyed by normalized path, SHA-256 content digest, representation, offset, and limit. Identical reads return `reused=true` plus the original observation reference without executing the Resource Adapter again.
+- Separates repeated requests from repeated executions through `repeated_resource_reads`, `repeated_resource_executions`, and `observation_reuse_hits`.
+- Docker health is cached as a Sandbox Session invariant with a configurable TTL (`sandbox.health_ttl_seconds`, default 30). It is reprobed only for session creation, TTL expiry, explicit invalidation, or recovery.
+- PDF/XLSX adapters retry exactly once only for classified transient Docker daemon/container-start failures. Corrupt files, unsupported formats, permission failures, and parse errors are not retried.
+- The Task 64 deterministic release gate completes with `coverage_scope.root=MathModeling`, zero outside-root obligations, zero identical repeated executions, positive reuse hits, and health probes equal to Sandbox sessions.
+
+## v0.6.8 Runtime Situation Resolution
+
+- Replaces the model-visible static Environment Map with a dynamic `SituationMap`: relevant resources, required/available capabilities, relevant procedures, operational state, constraints, and environment readiness.
+- Splits Working State into Host-maintained operational state and semantic state while retaining the v0.6.6 compatibility fields. Resource records include normalized path, completeness, representation, evidence reference, access count, and conservative coverage labels.
+- The Host resolves declared and authority-available providers before presenting capability routes; the model does not traverse the full Component graph.
+- Repeated complete-resource reads, `bash cat/head/tail/file` Resource Adapter bypasses, and generic environment probes remain permitted escape hatches but emit explicit telemetry and task metrics.
+- Broad folder-summary tasks receive deterministic resource/topic coverage checks. A premature final answer gets an in-cycle coverage repair opportunity using existing evidence, without rereading complete resources.
+- Skill candidate ingestion now requires explicit Skill-authoring intent plus a candidate package attributable to the current task. Incidental or stale workspace packages produce a `NO_ACTION` trace instead of a false candidate.
+- Adds `RepeatedResourceReads`, `RedundantResourceBypasses`, `EnvironmentProbeCalls`, `ProtocolRepairCalls`, and `ProtocolRepairTokens` to terminal evidence.
+- The Task 63 deterministic fixture completes in three model rounds, performs zero repeated reads, covers A/B/C, and rejects the original A/B-only answer.
+
+## v0.6.7 Unified Component Model + Capability Graph
+
+- Adds a Host-owned `ComponentRegistry` and deterministic `ComponentManifest` for primitives, skills, workflows, resource adapters, environment providers, plugins, and kernel components.
+- Components declare `requires` and `provides`; explicit capability implications form the first in-process Component/Capability graph without a graph database.
+- Declared supply and usable supply are separate APIs: `resolve_provider` reports who declares a capability, while `resolve_available_provider` additionally applies current Authority and dependency checks. A provider's existence never grants permission.
+- `SkillManager` is the single source of truth for Skills. Active Skills are reconciled into a read-only `ComponentRegistry(kind=skill)` compatibility projection, so deprecation/removal cannot leave an active Component behind; promotion, telemetry, runner, and replay behavior remain unchanged.
+- Every resolved manifest exposes the same runtime core (`plane`, `isolation`, `runner_kind`) and keeps kind-specific configuration under `spec`.
+- Multiple providers are supported with deterministic exactness/trust/version/cost/utility ordering. Capability inheritance occurs only through explicit implication edges, never by dotted-name prefix.
+- PDF/XLSX/CSV adapters and `scientific-py312-v1` are registered as Host-managed providers; the Agent sees only a compact capability-centric environment map.
+- Host Trust Policy overrides Manifest claims. Only Skill candidates remain Agent-authorable; no Component kind gains automatic promotion.
+- Task Capsules include the active Component Set hash. Experiment variants expose a generic Component mutation schema while execution remains restricted to `kind=skill`.
+- The model-visible Tool surface remains exactly `read`, `write`, `edit`, and `bash`.
