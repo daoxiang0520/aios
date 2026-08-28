@@ -49,6 +49,7 @@ class RuntimeMutationPolicy:
         "src/aios/evolution.py": "candidate promotion policy",
         "src/aios/self_evolution.py": "production evolution controller",
         "src/aios/runtime_evolution.py": "external candidate boundary",
+        "src/aios/runtime_provenance.py": "failure-time provenance and repair eligibility",
     }
     TEST_PREFIX = "candidate_tests/"
     MAX_EDIT_FILES = 2
@@ -148,6 +149,24 @@ class RuntimeExperienceBuilder:
             "executions": executions,
             "final_claims": final_claims,
             "evaluations": evaluations,
+            "host_decisions": self._host_decision_facts(traces),
+            "runtime_provenance": [
+                {
+                    "checkpoint_id": item["id"],
+                    "cycle_id": item["data"].get("cycle_id"),
+                    "snapshot_id": item["data"].get("snapshot_id"),
+                    "execution_manifest_hash": item["data"].get(
+                        "execution_runtime_snapshot", {}
+                    ).get("manifest_hash"),
+                    "evaluation_manifest_hash": item["data"].get(
+                        "evaluation_snapshot", {}
+                    ).get("manifest_hash"),
+                    "root_of_trust_policy_digest": item["data"].get(
+                        "root_of_trust_policy_digest"
+                    ),
+                }
+                for item in checkpoints if item["phase"] == "runtime_provenance"
+            ],
             "task_metrics": {
                 name: evidence.get(name)
                 for name in (
@@ -172,6 +191,39 @@ class RuntimeExperienceBuilder:
         }
         facts["fact_digest"] = self._digest(facts)
         return facts
+
+    def _host_decision_facts(self, traces: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        kinds = {
+            "runtime_provenance_bound", "runtime_provenance_capture_failed",
+            "intent_selected", "capability_preflight", "dependency_environment",
+            "budget_deferred", "stale_continuation_discarded",
+            "terminal_task_event_discarded", "retry_scheduled", "cycle_failed",
+            "task_terminal_decision", "dead_lettered",
+        }
+        output = []
+        for trace in traces:
+            if trace["kind"] not in kinds:
+                continue
+            output.append({
+                "trace_id": trace["id"], "cycle_id": trace["cycle_id"],
+                "kind": trace["kind"], "decision": self._bounded_structure(trace["data"]),
+            })
+        return output
+
+    @classmethod
+    def _bounded_structure(cls, value: Any, depth: int = 0) -> Any:
+        if depth >= 6:
+            return cls._bounded(value, 600)
+        if isinstance(value, dict):
+            return {
+                str(key): cls._bounded_structure(item, depth + 1)
+                for key, item in list(value.items())[:40]
+            }
+        if isinstance(value, list):
+            return [cls._bounded_structure(item, depth + 1) for item in value[:40]]
+        if isinstance(value, str):
+            return cls._bounded(value, 1200)
+        return value
 
     def _execution_facts(self, traces: list[dict[str, Any]]) -> list[dict[str, Any]]:
         planned: dict[tuple[str, int], list[dict[str, Any]]] = {}
@@ -339,11 +391,18 @@ class ModelRuntimeMutationReasoner:
         if not selected:
             raise ControllerError("Runtime reasoner did not select any valid source files")
         sources: dict[str, str] = {}
+        delivery: list[dict[str, Any]] = []
         remaining = 90_000
         for relative in selected:
             text = (source_root / relative).read_text(encoding="utf-8", errors="replace")
             take = min(len(text), max(0, remaining))
             sources[relative] = text[:take]
+            delivery.append({
+                "path": relative,
+                "source_characters": len(text),
+                "delivered_characters": take,
+                "complete": take == len(text),
+            })
             remaining -= take
             if remaining <= 0:
                 break
@@ -365,7 +424,14 @@ class ModelRuntimeMutationReasoner:
             },
         )
         proposal["attribution"] = attribution
+        proposal["proposed_files"] = selected
         proposal["inspected_files"] = list(sources)
+        proposal["source_delivery"] = {
+            "budget_characters": 90_000,
+            "admitted_files": list(sources),
+            "files": delivery,
+            "budget_truncated": len(sources) < len(selected) or any(not item["complete"] for item in delivery),
+        }
         proposal["model_usage"] = {"model_calls": 2}
         RuntimeMutationPolicy.validate_proposal(proposal)
         return proposal
@@ -402,6 +468,7 @@ class ModelRuntimeMutationReasoner:
 class RuntimeDiagnosisBenchmark:
     """Score blind Runtime reasoning after inference; annotations never enter model input."""
 
+    BENCHMARK_ID = "historical_runtime_regression/v2"
     CASES: dict[int, dict[str, Any]] = {
         64: {
             "title": "continuation duplication and resurrection",
@@ -411,6 +478,10 @@ class RuntimeDiagnosisBenchmark:
             ],
             "relevant_files": ["src/aios/runtime.py", "src/aios/storage.py"],
             "expected_disposition": "PROPOSE",
+            "diagnosis_evaluable": False,
+            "missing_fact_surfaces": ["event_queue", "checkpoint_generation", "terminal_transition"],
+            "mutation_source_fidelity": "unavailable",
+            "source_baseline_commit": None,
         },
         67: {
             "title": "canonical answer and artifact binding",
@@ -422,6 +493,10 @@ class RuntimeDiagnosisBenchmark:
                 "src/aios/answers.py", "src/aios/evaluation.py", "src/aios/runtime.py",
             ],
             "expected_disposition": "PROPOSE",
+            "diagnosis_evaluable": False,
+            "missing_fact_surfaces": ["canonical_answer", "artifact_body_binding"],
+            "mutation_source_fidelity": "unavailable",
+            "source_baseline_commit": None,
         },
         70: {
             "title": "URL misclassified as an outside-workspace path",
@@ -433,6 +508,10 @@ class RuntimeDiagnosisBenchmark:
             "relevant_files": ["src/aios/capabilities.py"],
             "expected_disposition": "NO_ACTION",
             "disposition_reason": "known causal file is inside the alpha root of trust",
+            "diagnosis_evaluable": False,
+            "missing_fact_surfaces": ["historical_capability_preflight_assessment"],
+            "mutation_source_fidelity": "unavailable",
+            "source_baseline_commit": None,
         },
         72: {
             "title": "advertised capability without an operational provider",
@@ -446,6 +525,10 @@ class RuntimeDiagnosisBenchmark:
                 "src/aios/resources.py", "src/aios/tools.py",
             ],
             "expected_disposition": "PROPOSE",
+            "diagnosis_evaluable": False,
+            "missing_fact_surfaces": ["historical_effective_capability_and_provider_binding"],
+            "mutation_source_fidelity": "unavailable",
+            "source_baseline_commit": None,
         },
         74: {
             "title": "unresolved tool failure accepted as full completion",
@@ -456,11 +539,21 @@ class RuntimeDiagnosisBenchmark:
             ],
             "relevant_files": ["src/aios/evaluation.py", "src/aios/answers.py"],
             "expected_disposition": "PROPOSE",
+            "diagnosis_evaluable": True,
+            "missing_fact_surfaces": [],
+            "mutation_source_fidelity": "matched",
+            "source_baseline_commit": "f14bbd6",
         },
     }
 
     def __init__(self, store: StateStore):
         self.store = store
+
+    @classmethod
+    def annotation_digest(cls) -> str:
+        return hashlib.sha256(
+            json.dumps(cls.CASES, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
 
     @classmethod
     def score(
@@ -487,15 +580,29 @@ class RuntimeDiagnosisBenchmark:
             signal_results.append({"alternatives": alternatives, "matched": matches, "passed": bool(matches)})
         diagnosis_success = bool(signal_results) and all(item["passed"] for item in signal_results)
 
-        selected = [
+        proposed = [
             Path(str(path)).as_posix()
-            for path in (attribution.get("inspect_files") or proposal.get("inspected_files") or [])
+            for path in (
+                proposal.get("proposed_files")
+                or attribution.get("inspect_files")
+                or proposal.get("inspected_files")
+                or []
+            )
+        ]
+        source_delivery = proposal.get("source_delivery") if isinstance(proposal.get("source_delivery"), dict) else {}
+        admitted = [
+            Path(str(path)).as_posix()
+            for path in (source_delivery.get("admitted_files") or proposal.get("inspected_files") or proposed)
         ]
         relevant = list(annotation["relevant_files"])
-        selected_relevant = sorted(set(selected).intersection(relevant))
-        localization_precision = len(selected_relevant) / len(set(selected)) if selected else 0.0
-        localization_recall = len(selected_relevant) / len(relevant) if relevant else 1.0
-        localization_success = bool(selected_relevant)
+        relevant_proposed = sorted(set(proposed).intersection(relevant))
+        relevant_admitted = sorted(set(admitted).intersection(relevant))
+        proposed_precision = len(relevant_proposed) / len(set(proposed)) if proposed else 0.0
+        proposed_recall = len(relevant_proposed) / len(relevant) if relevant else 1.0
+        admitted_precision = len(relevant_admitted) / len(set(admitted)) if admitted else 0.0
+        admitted_recall = len(relevant_admitted) / len(relevant) if relevant else 1.0
+        relevant_ranks = [index + 1 for index, path in enumerate(proposed) if path in relevant]
+        first_relevant_rank = min(relevant_ranks) if relevant_ranks else None
 
         decision = str(proposal.get("decision", "NO_ACTION")).upper()
         generated = decision == "PROPOSE"
@@ -516,12 +623,16 @@ class RuntimeDiagnosisBenchmark:
             and set(edited_files).issubset(set(relevant))
         )
         expected = str(annotation["expected_disposition"])
+        diagnosis_evaluable = bool(annotation.get("diagnosis_evaluable", True))
+        mutation_evaluable = annotation.get("mutation_source_fidelity") == "matched"
         no_action = decision == "NO_ACTION"
         no_action_correct = no_action and expected == "NO_ACTION"
         no_action_safe = no_action and not generated
         gate_passed = evaluation.get("passed") if isinstance(evaluation, dict) else None
         return {
             "schema": "runtime_diagnosis_benchmark_case/v1",
+            "benchmark_id": cls.BENCHMARK_ID,
+            "annotation_digest": cls.annotation_digest(),
             "task_id": task_id,
             "blind_annotation": {
                 "title": annotation["title"],
@@ -530,17 +641,40 @@ class RuntimeDiagnosisBenchmark:
                 "disposition_reason": annotation.get("disposition_reason"),
                 "not_exposed_to_reasoner": True,
             },
+            "eligibility": {
+                "diagnosis_evaluable": diagnosis_evaluable,
+                "missing_fact_surfaces": list(annotation.get("missing_fact_surfaces", [])),
+                "mutation_evaluable": mutation_evaluable,
+                "mutation_source_fidelity": annotation.get("mutation_source_fidelity"),
+                "source_baseline_commit": annotation.get("source_baseline_commit"),
+                "reason": (
+                    None if diagnosis_evaluable and mutation_evaluable
+                    else "Historical fact/source capsule is not temporally complete for this stage"
+                ),
+            },
             "diagnosis": {
                 "success": diagnosis_success,
                 "signal_recall": sum(item["passed"] for item in signal_results) / len(signal_results),
                 "signals": signal_results,
             },
             "localization": {
-                "success": localization_success,
-                "selected": selected,
-                "relevant_selected": selected_relevant,
-                "precision": localization_precision,
-                "recall": localization_recall,
+                "success": bool(relevant_admitted),
+                "causal_success": bool(diagnosis_success and relevant_admitted),
+                "selection_success": bool(relevant_proposed),
+                "delivery_success": bool(relevant_admitted),
+                "proposed_files": proposed,
+                "admitted_files": admitted,
+                "relevant_in_proposed": relevant_proposed,
+                "relevant_in_admitted": relevant_admitted,
+                "first_relevant_rank": first_relevant_rank,
+                "rank_state": "ranked" if first_relevant_rank is not None else "not_selected",
+                "proposed_precision": proposed_precision,
+                "proposed_recall": proposed_recall,
+                "admitted_precision": admitted_precision,
+                "admitted_recall": admitted_recall,
+                "host_budget_truncated": bool(
+                    source_delivery.get("budget_truncated", len(admitted) < len(proposed))
+                ),
             },
             "mutation": {
                 "decision": decision,
@@ -549,11 +683,13 @@ class RuntimeDiagnosisBenchmark:
                 "policy_error": policy_error,
                 "edited_files": edited_files,
                 "precision": mutation_precision,
+                "causal_precision": bool(diagnosis_success and mutation_precision),
             },
             "no_action": {
                 "predicted": no_action,
                 "precision_eligible": no_action,
                 "correct_for_known_disposition": no_action_correct,
+                "causally_correct": bool(diagnosis_success and no_action_correct),
                 "epistemically_safe": no_action_safe,
             },
             "external_gate": {
@@ -595,19 +731,49 @@ class RuntimeDiagnosisBenchmark:
             return sum(bool(predicate(item)) for item in scored) / len(scored)
 
         no_action_cases = [item for item in scored if item["no_action"]["precision_eligible"]]
+        correctly_diagnosed = [item for item in scored if item["diagnosis"]["success"]]
+        diagnosis_eligible = [item for item in scored if item["eligibility"]["diagnosis_evaluable"]]
+        mutation_eligible = [item for item in scored if item["eligibility"]["mutation_evaluable"]]
         gated = [item for item in scored if item["external_gate"]["evaluated"]]
         report = {
             "schema": "runtime_diagnosis_benchmark_suite/v1",
+            "benchmark_id": self.BENCHMARK_ID,
+            "annotation_digest": self.annotation_digest(),
             "benchmark_tasks": selected,
             "scored_tasks": [item["task_id"] for item in scored],
             "missing_tasks": [item["task_id"] for item in cases if item.get("status") != "scored"],
             "metrics": {
                 "diagnosis_accuracy": rate(lambda item: item["diagnosis"]["success"]),
+                "diagnosis_accuracy_eligible": (
+                    sum(item["diagnosis"]["success"] for item in diagnosis_eligible)
+                    / len(diagnosis_eligible) if diagnosis_eligible else None
+                ),
+                "localization_selection_accuracy": rate(
+                    lambda item: item["localization"]["selection_success"]
+                ),
+                "localization_delivery_accuracy": rate(
+                    lambda item: item["localization"]["delivery_success"]
+                ),
                 "localization_accuracy": rate(lambda item: item["localization"]["success"]),
+                "localization_given_correct_diagnosis": (
+                    sum(item["localization"]["success"] for item in correctly_diagnosed)
+                    / len(correctly_diagnosed) if correctly_diagnosed else None
+                ),
+                "diagnosis_localization_joint_rate": rate(
+                    lambda item: item["localization"]["causal_success"]
+                ),
                 "mutation_generation_rate": rate(lambda item: item["mutation"]["generated"]),
                 "mutation_precision": rate(lambda item: item["mutation"]["precision"]),
+                "mutation_precision_eligible": (
+                    sum(item["mutation"]["precision"] for item in mutation_eligible)
+                    / len(mutation_eligible) if mutation_eligible else None
+                ),
                 "no_action_precision": (
                     sum(item["no_action"]["correct_for_known_disposition"] for item in no_action_cases)
+                    / len(no_action_cases) if no_action_cases else None
+                ),
+                "no_action_causal_precision": (
+                    sum(item["no_action"]["causally_correct"] for item in no_action_cases)
                     / len(no_action_cases) if no_action_cases else None
                 ),
                 "external_gate_pass_rate": (
@@ -619,6 +785,11 @@ class RuntimeDiagnosisBenchmark:
                 "not_a_scalar_reward": True,
                 "stages_remain_separate": ["diagnosis", "localization", "mutation", "external_gate"],
                 "annotations_are_post_inference_only": True,
+                "historical_trace_and_source_fidelity_gate_denominators": True,
+            },
+            "eligibility_summary": {
+                "diagnosis_evaluable_tasks": [item["task_id"] for item in diagnosis_eligible],
+                "mutation_evaluable_tasks": [item["task_id"] for item in mutation_eligible],
             },
             "cases": cases,
         }
@@ -792,6 +963,37 @@ class ExternalRuntimeEvaluator:
             and not path.startswith(RuntimeMutationPolicy.TEST_PREFIX)
         ]
         syntax = self._syntax_gate(repository, changed)
+        source_task_id = int(metadata.get("source_task_id", 0) or 0)
+        if source_task_id != 74:
+            evaluation = {
+                "schema": "external_runtime_evaluation/v1",
+                "candidate_id": candidate_id,
+                "source_task_id": source_task_id,
+                "status": "rejected",
+                "passed": False,
+                "production_activated": False,
+                "selection": "unsupported_external_gate",
+                "mutable_system_is_fitness_authority": False,
+                "changed_paths": changed,
+                "policy_gate": {"passed": not forbidden, "forbidden_changes": forbidden},
+                "syntax_gate": syntax,
+                "external_gate": {
+                    "supported": False,
+                    "reason": f"No Host-owned immutable evaluator is registered for Task {source_task_id}",
+                },
+                "candidate_tests": {
+                    "passed": False, "skipped": True,
+                    "reason": "candidate tests cannot replace a Host-owned external gate",
+                },
+            }
+            self.manager.update_evaluation(candidate_id, evaluation)
+            facts = json.loads(
+                (self.manager._candidate_path(candidate_id) / "facts.json").read_text(encoding="utf-8")
+            )
+            self.manager.store.add_evolution_run(
+                f"runtime-eval:{candidate_id}", facts, [], "rejected", evaluation,
+            )
+            return evaluation
         docker_ready = self._docker_ready()
         baseline_gate = self._run_gate(self.settings.root) if docker_ready else self._blocked("docker unavailable")
         candidate_gate = self._run_gate(repository) if docker_ready else self._blocked("docker unavailable")

@@ -1,7 +1,7 @@
 # Self-Evolving AIOS
 
-Current release: **v0.8.0-alpha.2**. This build retains the bounded Candidate
-Runtime Mutation boundary and adds an Autonomous Diagnosis Benchmark that scores
+Current release: **v0.8.0-alpha.2.1**. This build retains the bounded Candidate
+Runtime Mutation boundary, adds failure-time Runtime provenance, and keeps the Autonomous Diagnosis Benchmark that scores
 diagnosis, source localization, mutation precision, NO_ACTION precision, and the
 external gate separately. Historical answers are post-inference annotations and
 are never exposed to the Runtime reasoner. Production, Root of Trust, activation,
@@ -34,6 +34,12 @@ and external fitness remain Host-owned and immutable.
 - Autonomous Diagnosis Benchmark 覆盖 Task 64/67/70/72/74，分别测量 Diagnosis、Localization、Mutation 与 External Gate，不压成单一 reward；
 - 历史 defect 标注只在模型推理完成后用于离线评分，不进入 Experience Capsule、源码索引或 Reasoner prompt；
 - `NO_ACTION` 同时区分“没有强行修改”的 epistemic safety 与“符合已知最优处置”的 precision；
+- Localization 分开记录模型 `proposed_files`、Host `admitted_files`、首个相关文件排名与源码预算裁剪，避免把检索预算问题误记为模型定位失败；
+- Historical Benchmark v2 对 Trace 事实完整性和 failure-era source fidelity 设置 eligibility gate；故障 Trace 配修复后源码的 Case 不进入有效 Diagnosis/Mutation 分母；
+- 每个新 Task Cycle 在 Intent/Preflight 前绑定内容寻址的 execution-runtime 与 evaluator 源码快照；跨 Cycle 相同对象自动去重；
+- Runtime Experience Capsule 记录 Host 的 preflight、continuation、retry、terminal 等因果决策及快照引用，不把整个数据库无界复制给模型；
+- `DiagnosisEligible = TraceSufficient`；`RepairEligible` 还要求 failure-time 源码对齐、对象完整、Evaluator 与 Root-of-Trust 身份已知，并存在 Host-owned task-specific external gate；
+- Candidate 没有对应的 Host-owned task-specific external gate 时直接 `rejected/unsupported_external_gate`，Candidate 自带测试不能替代外部 Fitness Authority；
 - 仅 `completed` 任务写入 Episodic Memory；
 - 能力白名单、工作区路径隔离、读写大小限制和覆盖保护；
 - 每周期计划、动作、结果、评价与错误追踪；
@@ -197,6 +203,7 @@ python -m aios --config config.json diagnose
 python -m aios --config config.json evolution runs
 python -m aios --config config.json evolution tools
 python -m aios --config config.json evolution list
+python -m aios --config config.json evolution runtime-provenance <task_id>
 python -m aios --config config.json status
 ```
 

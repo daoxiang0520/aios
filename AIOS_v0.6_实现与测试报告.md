@@ -9,11 +9,23 @@
 - 每个 Case 独立记录 `diagnosis.success/signal_recall`、`localization.precision/recall`、`mutation.generated/policy_valid/precision`、`external_gate.passed`；
 - Suite 指标保持向量，不合成为 reward scalar；缺少真实实验的任务明确为 `missing_experiment`，不伪造零分或成功；
 - `NO_ACTION` 拆成两种语义：`epistemically_safe` 表示没有在证据不足时强行修改，`correct_for_known_disposition` 表示它是否也是离线已知的最优处置；
+- Localization 进一步拆分模型提出的 `proposed_files` 与 Host 实际交付的 `admitted_files`，分别记录 selection/delivery accuracy、precision/recall、首个相关文件的 1-based rank，以及 `host_budget_truncated`；正确文件从未进入候选集时 rank 为 `null/not_selected`，与“选对但被预算裁掉”明确区分；
+- 历史回归集冻结为 `historical_runtime_regression/v1`，每份报告携带相同 `annotation_digest`；后续新增真实缺陷应形成新版本或 Future Holdout，不通过修改既有答案迎合 Reasoner；
 - 新增 CLI：`evolution runtime-benchmark <task_id>` 与 `evolution runtime-benchmark-suite [--task-id ...]`，二者只消费已经存在的 Runtime experiment，不触发模型调用。
 
-Task 74 的真实 alpha.1 DeepSeek 结果已经完成首轮盲评：`diagnosis_accuracy=1.0`，成功识别“未编译却宣称 complete/correct”的 Claim/Evidence 矛盾；`localization_accuracy=0.0`，所选 `sandbox/tools/runtime/controller` 未命中离线标注的 `evaluation/answers` 语义面；`mutation_generation_rate=0.0`，最终 `NO_ACTION`；该 NO_ACTION 的 `epistemically_safe=true`，但 `correct_for_known_disposition=false`，因此既保留其安全价值，也不把漏修包装成成功。Task 64/67/70/72 尚无 alpha.2 真实实验，均保持 `missing_experiment`，且本轮没有未经授权向 DeepSeek 发送它们的 Trace。
+Task 74 的真实 alpha.1 DeepSeek 结果已经完成首轮盲评：`diagnosis_accuracy=1.0`，成功识别“未编译却宣称 complete/correct”的 Claim/Evidence 矛盾；`localization_selection_accuracy=0.0`、`localization_delivery_accuracy=0.0`。模型提出 `sandbox/tools/runtime/controller`，Host 因 90k 字符预算实际交付前三份，但离线相关面 `evaluation/answers` 根本没有进入 proposed set，因此 `first_relevant_rank=null/not_selected`：主要失败属于模型/索引定位，而不是 Host 恰好裁掉正确文件。`mutation_generation_rate=0.0`，最终 `NO_ACTION`；该 NO_ACTION 的 `epistemically_safe=true`，但 `correct_for_known_disposition=false`，因此既保留其安全价值，也不把漏修包装成成功。
 
-alpha.2 专项测试 **8/8** 通过；Host Docker 权限下完整单元/集成回归 **153/153** 通过，无跳过。生产 Runtime、Root of Trust 与外部 Fitness Authority 均未改变。
+### 五项真实盲测与 Benchmark Fidelity 修正
+
+用户明确授权后，Task 64/67/70/72 已使用冻结 prompt 完成真实 DeepSeek 盲测；每项两阶段调用，Task 67 首次第二阶段产生非法 JSON escape，未形成实验，随后以相同协议唯一重试一次。原始结果为：Task 64 将 continuation defect 误诊为 Coverage 内容问题并 `NO_ACTION`；Task 67 将 Canonical Answer binding 误诊为 `A 题/A题` 空格匹配并生成 `situation.py` Candidate；Task 70 把历史 URL/path false positive 解释为正确的 authority block 并 `NO_ACTION`；Task 72 把 capability/provider mismatch 解释为缺少 `curl` 的环境限制并 `NO_ACTION`。Task 67 Candidate 通过 mutation policy 与 syntax，但因没有 Host-owned Task 67 外部门禁被明确 `rejected/unsupported_external_gate`；其自带测试不能成为唯一 fitness。
+
+首轮 raw matrix 为：`Diagnosis=0.2`、文件重叠式 `Localization=0.8`、`MutationGeneration=0.2`、`MutationPrecision=0`、`NO_ACTIONPrecision=0.25`、External Gate 无有效进入。但该 0.8 不能解释为定位成功：Task 64/67/70/72 都是在错误诊断下因宽泛选中文件而偶然命中相关面。新增因果条件指标后：`localization_given_correct_diagnosis=0`、`diagnosis_localization_joint_rate=0`、`no_action_causal_precision=0`。
+
+更关键的是，本次运行发现 Historical Benchmark v1 的时点一致性不足：Task 64 Capsule 没有 event queue/checkpoint generation/terminal transition；Task 67 没有 Canonical Answer 与 artifact body binding；Task 70 没有历史 capability preflight assessment；Task 72 没有历史 effective-capability/provider binding。并且这四项读取的是已包含人工修复的当前源码，而 Git 历史中没有各自 failure-era 的独立源码提交。故障时代 Trace 与修复后 Source 不能构成有效 Mutation counterfactual。
+
+因此保留已持久化的 v1 raw report，同时新增 `historical_runtime_regression/v2` fidelity gate：只有事实投影完整的 Case 进入 Diagnosis 分母，只有拥有匹配 failure-era source baseline 的 Case 进入 Mutation 分母。当前 `diagnosis_evaluable_tasks=[74]`、`mutation_evaluable_tasks=[74]`，因此 eligible Diagnosis 为 1.0，但样本仍只有一个；其 Localization 为 0。Task 64/67/70/72 的真实模型输出保留为观察性证据，不能用于声称自主修复成功率。下一步应先建立 failure-time Trace + Source Capsule，而不是直接进入 causal source index alpha.3。
+
+alpha.2 基础版本专项测试 **8/8**、完整回归 **153/153** 通过；LocalizationRank/Source Delivery 后专项测试为 **9/9**、完整回归 **154/154**；Fidelity denominator 与 task-specific external-gate scope 门禁后专项测试为 **11/11**，Host Docker 权限下完整回归 **156/156** 通过、无跳过。生产 Runtime、Root of Trust 与外部 Fitness Authority 均未改变。
 
 ## v0.8.0-alpha.1 Candidate Runtime Mutation（2026-08-28）
 
@@ -410,6 +422,22 @@ Task 63 的基线虽为 `completed`，但使用 154253 Tokens、25 次模型调�
 - “当前环境无法执行所需的外部网络请求。” → `degraded`；
 - “由于无法读取原始文件，我改用用户提供的摘要进行分析。” → `degraded`；
 - 缺失 Evidence 时，Controller 自报完成不得覆盖 Host 验证。
+
+## v0.8.0-alpha.2.1 Runtime Evolution Provenance（2026-08-28）
+
+alpha.2 的盲测证明：历史 Trace 若缺少 Host 决策事实，或故障 Trace 与修复后源码混配，Diagnosis/Localization/Mutation 数字不具备因果解释力。本补丁不调整 Reasoner、不扩大 Runtime 可变文件，也不重建旧任务的“伪历史”；目标是让此后的失败天然可复现、可判定是否有资格进入自主修复实验。
+
+实现内容：
+
+1. 每个新 Task Cycle 在 Intent 与 Capability Preflight 前捕获两份逻辑快照：`execution_runtime_snapshot` 与 `evaluation_snapshot`。快照使用 SHA-256 内容寻址对象和确定性 Manifest；相同源码跨 Cycle/Task 共享对象。
+2. 快照记录 Git commit/dirty-state digest、源码角色、Evaluator 身份、Root-of-Trust policy digest，并产生 `runtime_provenance_bound` Trace 与持久 Checkpoint。生产激活仍明确禁止。
+3. 新增 failure-time Runtime 恢复接口，可按 Task/Cycle 将不可变 execution snapshot 恢复到空目录，供未来隔离 Candidate 实验使用。
+4. Runtime Experience Capsule 新增有界 `host_decisions`，投影 Intent、Preflight、依赖环境、Budget continuation、stale event、retry、cycle failure、terminal decision 与 dead-letter 事实；同时只携带 provenance hash/ref，不无界复制全库。
+5. 新增确定性 Eligibility：`DiagnosisEligible = TraceSufficient`；`RepairEligible = TraceComplete AND SourceTimeAligned AND SourceIntegrity AND EvaluatorSnapshotKnown AND ExternalGateAvailable AND RootOfTrustKnown`。
+6. 缺 Host-owned task-specific external gate 的任务可用于合格 Diagnosis，但不可进入 Repair/Mutation 的有效分母。对象被篡改、任一历史 Cycle 未绑定 failure-time snapshot、或关键因果决策缺失，均明确撤销资格。
+7. 新增 CLI：`python -m aios --config config.json evolution runtime-provenance <task_id>`，同时输出全部 binding 与 eligibility assessment。
+
+专项回归覆盖内容寻址去重、按 Cycle 恢复、Host 决策 Capsule、Diagnosis/Repair 分层资格、external gate 要求以及对象篡改撤销。专项 v0.8 测试 15/15 通过；完整测试 160/160 通过，包含真实 Docker 用例且无跳过。旧 Task 64/67/70/72 不做追溯重建，继续保持 `source fidelity unavailable`；Task 74 仍只按已有真实材料评价。
 
 ## v0.6.6.2 Context Working Set & Continuation Efficiency（2026-08-28）
 

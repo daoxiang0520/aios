@@ -54,6 +54,40 @@ class ContentAddressedSnapshotStore:
             )
         return {key: value for key, value in manifest.items() if key != "files"}
 
+    def capture_paths(self, source: Path, relative_paths: list[str]) -> dict[str, Any]:
+        """Capture an explicit, bounded file set while reusing the same object store."""
+        source = source.resolve()
+        if not source.is_dir():
+            raise FileNotFoundError(f"Snapshot source is not a directory: {source}")
+        files: dict[str, dict[str, Any]] = {}
+        total_bytes = 0
+        for relative in sorted(set(relative_paths)):
+            relative_path = self._validate_relative(relative)
+            path = (source / relative_path).resolve()
+            if source not in path.parents or path.is_symlink() or not path.is_file():
+                raise SnapshotIntegrityError(f"Snapshot source file is invalid: {relative}")
+            payload = path.read_bytes()
+            digest = hashlib.sha256(payload).hexdigest()
+            object_path = self.object_path(digest)
+            if not object_path.exists():
+                object_path.parent.mkdir(parents=True, exist_ok=True)
+                object_path.write_bytes(payload)
+            files[relative_path.as_posix()] = {
+                "sha256": digest, "size": len(payload), "mode": path.stat().st_mode & 0o777,
+            }
+            total_bytes += len(payload)
+        manifest_hash = self._manifest_hash(files)
+        manifest = {
+            "kind": "content_addressed_tree_v1", "manifest_hash": manifest_hash,
+            "files": files, "file_count": len(files), "total_bytes": total_bytes,
+        }
+        manifest_path = self.manifests / f"{manifest_hash}.json"
+        if not manifest_path.exists():
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8"
+            )
+        return {key: value for key, value in manifest.items() if key != "files"}
+
     def load(self, manifest_hash: str) -> dict[str, Any]:
         path = self.manifests / f"{self._validate_digest(manifest_hash)}.json"
         if not path.is_file():

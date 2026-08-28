@@ -29,6 +29,7 @@ from .runtime_evolution import (
     ExternalRuntimeEvaluator, ModelRuntimeMutationReasoner, RuntimeCandidateManager,
     RuntimeDiagnosisBenchmark,
 )
+from .runtime_provenance import RuntimeProvenanceManager
 from .situation import SituationResolver, normalize_resource_path
 from .storage import StateStore
 from .types import Action, ActionResult, Event, Goal, GoalStatus, GoalType, Memory, MemoryType, Task, TaskStatus
@@ -149,6 +150,10 @@ def _parser() -> argparse.ArgumentParser:
         "runtime-benchmark-suite", help="Measure diagnosis/localization/mutation/gate stages separately",
     )
     runtime_benchmark_suite.add_argument("--task-id", action="append", type=int, default=[])
+    runtime_provenance = evolution_commands.add_parser(
+        "runtime-provenance", help="Inspect failure-time source bindings and repair eligibility",
+    )
+    runtime_provenance.add_argument("task_id", type=int)
     evolution_commands.add_parser("runtime-list")
     runtime_show = evolution_commands.add_parser("runtime-show")
     runtime_show.add_argument("candidate_id")
@@ -675,7 +680,15 @@ def main(argv: list[str] | None = None) -> int:
             "runtime-observe", "runtime-propose", "runtime-list",
             "runtime-show", "runtime-evaluate", "runtime-benchmark",
             "runtime-benchmark-suite",
+            "runtime-provenance",
         }:
+            if args.evolution_command == "runtime-provenance":
+                provenance = RuntimeProvenanceManager(settings, store)
+                _print_json({
+                    "bindings": provenance.bindings(args.task_id),
+                    "eligibility": provenance.assess(args.task_id),
+                })
+                return 0
             runtime_candidates = RuntimeCandidateManager(
                 settings, store, ModelRuntimeMutationReasoner(LLMController(settings.model)),
             )

@@ -18,6 +18,7 @@ from .evaluation import Verifier
 from .goals import GoalManager, IntentArbiter
 from .memory import ContextComposer, MemoryManager
 from .plugins import PluginManager
+from .runtime_provenance import RuntimeProvenanceManager
 from .security import SecurityKernel
 from .situation import SituationResolver, coverage_labels, normalize_resource_path
 from .sandbox import DockerSandboxBroker, SandboxPolicyError
@@ -95,6 +96,7 @@ class AIOSRuntime:
         self.evolution = AutonomousEvolutionEngine(
             self.store, self.plugins, settings.evolution
         )
+        self.runtime_provenance = RuntimeProvenanceManager(settings, self.store)
         self.shutdown_requested = False
 
     def request_shutdown(self, *_: object) -> None:
@@ -157,6 +159,16 @@ class AIOSRuntime:
                     )
                     return True
             task = self.store.start_task_attempt(int(task.id), increment_attempt=not continuation)
+            try:
+                self.runtime_provenance.capture_cycle(int(task.id), cycle_id)
+            except Exception as provenance_error:
+                failure = {
+                    "task_id": int(task.id),
+                    "error": f"{type(provenance_error).__name__}: {provenance_error}",
+                    "execution_continued": True,
+                }
+                self.store.trace(cycle_id, "runtime_provenance_capture_failed", failure)
+                self.store.add_checkpoint(int(task.id), "runtime_provenance_failed", failure)
             task_budget = self._task_budget(int(task.id))
             task_metrics = self._task_metrics(int(task.id))
             working_state = self._task_working_state(int(task.id), task.request)
@@ -186,6 +198,10 @@ class AIOSRuntime:
                 status = TaskStatus.NEEDS_AUTHORITY if preflight_assessment["needs_authority"] else TaskStatus.BLOCKED_CAPABILITY
                 reason = "Required authority is missing" if preflight_assessment["needs_authority"] else "Required capability is unavailable"
                 result = {"cycle_id": cycle_id, "summary": reason, "capability_preflight": preflight, "evidence": {"success": False}}
+                self.store.trace(cycle_id, "task_terminal_decision", {
+                    "task_id": int(task.id), "status": status.value,
+                    "reason": reason, "decision_input_ref": "capability_preflight",
+                })
                 self.store.finish_events(event_ids)
                 self.store.update_task(int(task.id), status, result=result, error=reason)
                 self.store.add_checkpoint(int(task.id), status.value, result)
@@ -871,6 +887,10 @@ class AIOSRuntime:
                 if skill_candidates:
                     task_result["skill_candidates"] = skill_candidates
                     self.store.trace(cycle_id, "skill_candidates_ingested", {"candidates": skill_candidates})
+                self.store.trace(cycle_id, "task_terminal_decision", {
+                    "task_id": int(task.id), "status": TaskStatus.COMPLETED.value,
+                    "reason": "verification_passed", "decision_input_ref": "evaluation",
+                })
                 self.store.finish_events(event_ids)
                 self.store.update_task(int(task.id), TaskStatus.COMPLETED, result=task_result)
                 self.store.add_checkpoint(int(task.id), "completed", task_result)
@@ -890,6 +910,10 @@ class AIOSRuntime:
                 task_result["artifacts"] = [asdict(item) for item in canonical_answer.artifacts]
                 task_result["canonical_answer"] = canonical_answer.as_dict()
                 task_result["final_output"] = self._published_output(final_output, snapshot)
+                self.store.trace(cycle_id, "task_terminal_decision", {
+                    "task_id": int(task.id), "status": TaskStatus.DEGRADED.value,
+                    "reason": "verification_degraded", "decision_input_ref": "evaluation",
+                })
                 self.store.finish_events(event_ids)
                 self.store.update_task(int(task.id), TaskStatus.DEGRADED, result=task_result, error="Goal was only partially/substitutively satisfied")
                 self.store.add_checkpoint(int(task.id), "degraded", task_result)
@@ -1637,6 +1661,10 @@ class AIOSRuntime:
                     retry_id,
                 )
                 return
+            self.store.trace(cycle_id, "task_terminal_decision", {
+                "task_id": task_id, "status": TaskStatus.DEAD_LETTER.value,
+                "reason": error, "decision_input_ref": "failed_attempt",
+            })
             self.store.update_task(task_id, TaskStatus.DEAD_LETTER, result=result, error=error)
             self.sandbox.purge_task_dependencies(task_id)
             dead_id = self.store.add_dead_letter(task_id, event, error)
