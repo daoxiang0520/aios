@@ -297,3 +297,22 @@ v0.6 已开始 Skill Evolution：Trace 或重复任务可以被沉淀为候选 S
 - PDF/XLSX/CSV/text 采用 metadata-first 小预览，Tool Result 有字符预算；旧的大结果从 HOT context 压缩成摘要与 `trace:<id>` 引用。
 - 首次需要科学计算时，Host Provider 构建固定版本的 numpy/pandas/scipy/statsmodels/openpyxl/pypdf 环境；后续任务只读复用。任务私有 `/deps` 跨 continuation 保留，真正终态才清理。
 - Evidence 新增任务累计 Model Calls、Tokens、Task Cycles、首次计算轮次与依赖准备延迟。
+
+## v0.6.6.2 Context Working Set & Continuation Efficiency
+
+- 每次模型调用把 Prompt 拆为 system、task、workspace map、memory、history、working state、skills、environment、continuation、runtime 和 tool schema；记录字符数、估算 Token、API 实际 Prompt Tokens、SHA256 与重复 Token 比例。
+- 新增 Host 管理的 `TaskWorkingState`：保存目标、已确认资源事实、DONE 步骤、可用产物、执行环境、待办与 Evidence References；原始结果继续留在 Trace，不充当长期上下文。
+- `budget_deferred` 冻结 Working State；下一 Cycle 使用 fresh context 恢复状态，不恢复上一 Cycle 对话或 Tool History。
+- 同 Cycle 默认只保留最近两个 Tool Round 为 HOT；Working State 为 WARM；完整 Trace 为 COLD。详细观测丢弃后，按需窄范围 reread。
+- Workspace Inventory 只在任务首次调用完整注入；之后仅投影已访问资源与产物。Capability、Skill 和 Environment Map 同样使用差量形式。
+- 新增 120k Soft Token / 12 Soft Model Calls 压力线；超过后提示 Agent 停止 discovery、沿关键路径收敛。300k/24 仍是 hard limit。
+- `task retry` 写入 `retry_reset`，确保新一次验收不继承旧 continuation 的预算与 Working State。
+
+## v0.6.6.3 Structured Completion Semantics
+
+- Controller finalization now carries internal `completion_metadata`; user-visible answers remain natural text.
+- `CompletionArbiter` resolves outcomes in the order Host execution/capability, evidence contract, controller declaration, then scoped language heuristics.
+- Result evidence includes a five-dimensional `result_vector`: completion, evidence, capability, quality, and protocol.
+- Generic business statements containing “无法” no longer imply Agent degradation.
+- Explicit Agent/environment inability and substituted evidence remain degraded outcomes.
+- Memory remains gated to fully verified `completed` results; the richer result vector is retained for later policy evolution.

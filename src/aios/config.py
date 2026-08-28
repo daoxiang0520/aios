@@ -36,10 +36,13 @@ class BudgetConfig:
     max_model_calls_per_task: int = 24
     max_tool_calls_per_task: int = 32
     max_tokens_per_task: int = 300_000
+    soft_model_calls_per_task: int = 12
+    soft_tokens_per_task: int = 120_000
     max_cycles_per_task: int = 6
     reserved_completion_tool_calls: int = 1
     tool_observation_characters: int = 12_000
-    hot_tool_results: int = 4
+    hot_tool_results: int = 2
+    working_state_characters: int = 8_000
 
 
 @dataclass(slots=True)

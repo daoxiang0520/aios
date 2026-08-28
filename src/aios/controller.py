@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
+import math
 import os
 import re
 import urllib.error
@@ -44,6 +46,11 @@ transactional task workspace. Bash starts in /workspace. Never scan the containe
 Respect context.budget, preserve reserved completion calls, and stop broad inspection before the
 tool budget is exhausted. A cycle boundary is not a task deadline: checkpoint continuation may
 resume the task with fresh HOT context. Prefer task and trace query tools over unrelated scans.
+Treat context.task_working_state as the authoritative process state. Steps marked DONE and facts
+marked ESTABLISHED must not be repeated unless new evidence conflicts with them. Detailed old
+observations are COLD trace data; reread only the narrow resource range needed for the next step.
+When context.budget.soft_pressure is true, enter efficiency mode: follow the critical path, avoid
+new discovery, reuse available artifacts, and converge on verified completion.
 When the task is complete, return a concise final answer with no tool call.
 Only when context.budget.force_final is true are tools disabled. Never print XML, DSML, tool-call tags, or a serialized
 tool request as text; synthesize the best natural-language answer from existing observations.
@@ -169,12 +176,14 @@ class LLMController:
                 summary="Execute actions supplied by a trusted local event producer",
                 actions=[LLMController._parse_action(item) for item in requested],
                 done=True,
+                completion_metadata=LLMController._completion_metadata(claims_complete=True),
             )
         message = event.get("message") or f"Handled event: {intent.name}"
         return Plan(
             summary="Mock controller acknowledgement",
             actions=[],
             done=True,
+            completion_metadata=LLMController._completion_metadata(claims_complete=True),
         )
 
     def _remote_plan(
@@ -237,8 +246,14 @@ class LLMController:
         if self.config.provider == "deepseek":
             thinking = self.config.thinking if self.config.thinking in {"enabled", "disabled"} else "disabled"
             request_data["thinking"] = {"type": thinking}
+        attribution = self._prompt_attribution(
+            messages[0]["content"], user_payload, request_context,
+            protocol_messages if isinstance(protocol_messages, list) else [],
+            self.tool_schemas if use_tool_calling else [],
+        )
         response_data = self._send_request(request_data, key)
         model_usage = _normalized_usage(response_data.get("usage"))
+        self._attribute_actual_tokens(attribution, model_usage.get("prompt_tokens"))
         try:
             choice = response_data["choices"][0]
             message = choice["message"]
@@ -260,6 +275,7 @@ class LLMController:
                     done=False,
                     protocol_message=protocol_message,
                     model_usage=model_usage,
+                    model_attributions=[attribution],
                 )
             if use_tool_calling and isinstance(content, str) and content.strip():
                 if contains_serialized_tool_call(content):
@@ -267,7 +283,8 @@ class LLMController:
                     repairs = int(budget.get("protocol_repairs_remaining", 0))
                     if force_final and repairs > 0:
                         return self._repair_final_answer(
-                            request_data, content, key, initial_usage=model_usage
+                            request_data, content, key, initial_usage=model_usage,
+                            initial_attribution=attribution,
                         )
                     raise ControllerError(
                         "Model emitted serialized tool-call markup instead of a native tool call or final answer"
@@ -277,10 +294,13 @@ class LLMController:
                     actions=[],
                     done=True,
                     model_usage=model_usage,
+                    model_attributions=[attribution],
+                    completion_metadata=self._completion_metadata(claims_complete=True),
                 )
             try:
                 plan = self._parse_plan_content(content)
                 plan.model_usage = model_usage
+                plan.model_attributions = [attribution]
                 return plan
             except ControllerError as exc:
                 content_chars = len(content) if isinstance(content, str) else 0
@@ -315,6 +335,7 @@ class LLMController:
         invalid_content: str,
         key: str,
         initial_usage: dict[str, int],
+        initial_attribution: dict[str, Any],
     ) -> Plan:
         """Perform one no-tools synthesis retry without re-running completed actions."""
         messages = list(original_request.get("messages", []))
@@ -338,7 +359,10 @@ class LLMController:
         if "thinking" in original_request:
             repair_request["thinking"] = original_request["thinking"]
         response_data = self._send_request(repair_request, key)
-        combined_usage = _merge_usage(initial_usage, _normalized_usage(response_data.get("usage")))
+        repair_usage = _normalized_usage(response_data.get("usage"))
+        combined_usage = _merge_usage(initial_usage, repair_usage)
+        repair_attribution = self._whole_request_attribution(repair_request, "protocol_repair")
+        self._attribute_actual_tokens(repair_attribution, repair_usage.get("prompt_tokens"))
         try:
             choice = response_data["choices"][0]
             message = choice["message"]
@@ -352,13 +376,79 @@ class LLMController:
                     actions=[],
                     done=True,
                     model_usage=combined_usage,
+                    model_attributions=[initial_attribution, repair_attribution],
+                    completion_metadata=self._completion_metadata(
+                        claims_complete=False,
+                        quality="degraded",
+                        execution_blocked=True,
+                        reason="model_protocol_repair_failed",
+                    ),
                 )
             return Plan(
                 summary=content.strip(), actions=[], done=True,
                 model_usage=combined_usage,
+                model_attributions=[initial_attribution, repair_attribution],
+                completion_metadata=self._completion_metadata(claims_complete=True),
             )
         except (KeyError, IndexError, TypeError) as exc:
             raise ControllerError("Model protocol repair failed: invalid response") from exc
+
+    @staticmethod
+    def _prompt_attribution(
+        system: str, user_payload: dict[str, Any], context: dict[str, Any],
+        history: list[dict[str, Any]], tools: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        grouped = {
+            "system": system,
+            "task": {"intent": user_payload.get("intent"), "active_goals": user_payload.get("active_goals")},
+            "workspace_map": context.get("workspace_inventory"),
+            "memory": context.get("retrieved_memories"),
+            "observations": context.get("observations"),
+            "history": history,
+            "working_state": context.get("task_working_state"),
+            "skills": context.get("skills"),
+            "environment_map": {"capabilities": context.get("capabilities"), "environment": context.get("environment")},
+            "continuation": context.get("continuation"),
+            "runtime_other": {
+                key: value for key, value in context.items()
+                if key not in {"workspace_inventory", "retrieved_memories", "observations", "task_working_state", "skills", "capabilities", "environment", "continuation"}
+            },
+            "tool_schema": tools,
+        }
+        return LLMController._block_attribution(grouped)
+
+    @staticmethod
+    def _whole_request_attribution(request: dict[str, Any], name: str) -> dict[str, Any]:
+        return LLMController._block_attribution({name: request})
+
+    @staticmethod
+    def _block_attribution(grouped: dict[str, Any]) -> dict[str, Any]:
+        blocks: dict[str, Any] = {}
+        for name, value in grouped.items():
+            raw = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+            blocks[name] = {
+                "characters": len(raw),
+                "estimated_tokens": max(1, math.ceil(len(raw) / 4)),
+                "sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+            }
+        return {"blocks": blocks}
+
+    @staticmethod
+    def _attribute_actual_tokens(attribution: dict[str, Any], prompt_tokens: int | None) -> None:
+        blocks = attribution.get("blocks", {})
+        estimated = sum(int(item.get("estimated_tokens", 0)) for item in blocks.values())
+        attribution["estimated_prompt_tokens"] = estimated
+        attribution["actual_prompt_tokens"] = prompt_tokens
+        if not isinstance(prompt_tokens, int) or prompt_tokens < 0 or estimated <= 0:
+            return
+        assigned = 0
+        names = list(blocks)
+        for name in names:
+            value = round(prompt_tokens * int(blocks[name]["estimated_tokens"]) / estimated)
+            blocks[name]["attributed_tokens"] = value
+            assigned += value
+        if names:
+            blocks[names[-1]]["attributed_tokens"] += prompt_tokens - assigned
 
     @staticmethod
     def _protocol_failure_fallback(messages: list[dict[str, Any]]) -> str:
@@ -387,6 +477,28 @@ class LLMController:
             "response remained an invalid serialized tool request after one no-tools protocol "
             f"repair. Last observed tool result: {detail}"
         )
+
+    @staticmethod
+    def _completion_metadata(
+        *,
+        claims_complete: bool,
+        quality: str = "full",
+        capability_degraded: bool = False,
+        missing_capabilities: list[str] | None = None,
+        execution_blocked: bool = False,
+        substitution_used: bool = False,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Internal controller declaration; the host remains the final authority."""
+        return {
+            "claims_complete": claims_complete,
+            "quality": quality,
+            "capability_degraded": capability_degraded,
+            "missing_capabilities": list(missing_capabilities or []),
+            "execution_blocked": execution_blocked,
+            "substitution_used": substitution_used,
+            "reason": reason,
+        }
 
     @classmethod
     def _parse_tool_calls(cls, tool_calls: Any) -> list[Action]:
@@ -508,6 +620,21 @@ class LLMController:
             summary=str(data.get("summary", "Model-generated plan")),
             actions=parsed_actions,
             done=done,
+            completion_metadata=(
+                cls._completion_metadata(
+                    claims_complete=bool(data["completion"].get("claims_complete", done)),
+                    quality=str(data["completion"].get("quality", "full")),
+                    capability_degraded=bool(data["completion"].get("capability_degraded", False)),
+                    missing_capabilities=[
+                        str(item) for item in data["completion"].get("missing_capabilities", [])
+                    ] if isinstance(data["completion"].get("missing_capabilities", []), list) else [],
+                    execution_blocked=bool(data["completion"].get("execution_blocked", False)),
+                    substitution_used=bool(data["completion"].get("substitution_used", False)),
+                    reason=(str(data["completion"]["reason"]) if data["completion"].get("reason") else None),
+                )
+                if isinstance(data.get("completion"), dict)
+                else (cls._completion_metadata(claims_complete=True) if done else None)
+            ),
         )
 
     @staticmethod

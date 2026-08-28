@@ -10,15 +10,97 @@ from .protocol import contains_serialized_tool_call, is_skill_authoring_request
 from .types import Action, ActionResult
 
 
+class CompletionArbiter:
+    """Resolve task outcome from measured, verified, declared, then heuristic signals."""
+
+    AGENT_DEGRADATION_PATTERNS = (
+        r"(?:我|本系统|本环境|当前系统|当前环境|该系统|该环境|运行环境)"
+        r"[^\n。！？.!?]{0,32}(?:无法|不能|不具备|缺少)"
+        r"[^\n。！？.!?]{0,32}(?:访问|读取|执行|连接|联网|完成|使用|获取|提供|能力|权限)",
+        r"(?:由于|因为)[^\n。！？.!?]{0,48}(?:无法|不能)[^\n。！？.!?]{0,48}"
+        r"(?:只能|改用|仅能|仅基于|近似|替代)",
+        r"\b(?:i|we)\s+(?:cannot|can't|could not|am unable to|are unable to)\s+"
+        r"(?:access|read|execute|connect|complete|use|retrieve|provide)\b",
+        r"\b(?:current\s+)?(?:system|environment|runtime)\s+(?:cannot|can't|is unable to|lacks?)\b",
+        r"\bunable to complete the task\b",
+    )
+
+    def decide(
+        self,
+        *,
+        execution_satisfied: bool,
+        evidence_satisfied: bool,
+        task_declared_done: bool,
+        protocol_valid: bool,
+        capability_assessment: dict[str, Any] | None,
+        completion_metadata: dict[str, Any] | None,
+        final_output: str,
+    ) -> dict[str, Any]:
+        metadata = completion_metadata if isinstance(completion_metadata, dict) else {}
+        assessment = capability_assessment if isinstance(capability_assessment, dict) else {}
+        blocking = assessment.get("blocking") if isinstance(assessment.get("blocking"), list) else []
+        authority = assessment.get("needs_authority") if isinstance(assessment.get("needs_authority"), list) else []
+        declared_missing = metadata.get("missing_capabilities")
+        if not isinstance(declared_missing, list):
+            declared_missing = []
+        missing = [
+            str(item.get("name", item)) if isinstance(item, dict) else str(item)
+            for item in [*blocking, *authority, *declared_missing]
+        ]
+        structured_degraded = bool(
+            metadata.get("capability_degraded")
+            or metadata.get("execution_blocked")
+            or metadata.get("substitution_used")
+            or metadata.get("quality") == "degraded"
+            or missing
+        )
+        heuristic_matches = [
+            match.group(0)
+            for pattern in self.AGENT_DEGRADATION_PATTERNS
+            for match in re.finditer(pattern, final_output, re.IGNORECASE)
+        ]
+        heuristic_degraded = bool(heuristic_matches)
+        degraded = structured_degraded or heuristic_degraded
+        claims_complete = bool(metadata.get("claims_complete", task_declared_done))
+        completed = bool(
+            task_declared_done
+            and claims_complete
+            and execution_satisfied
+            and evidence_satisfied
+            and protocol_valid
+        )
+        if completed and not degraded:
+            outcome = "completed"
+        elif degraded:
+            outcome = "degraded"
+        else:
+            outcome = "retryable_failure"
+        return {
+            "completion": "complete" if completed else "incomplete",
+            "evidence": "satisfied" if evidence_satisfied else "unsatisfied",
+            "capability": "full" if not missing and not metadata.get("capability_degraded") else "degraded",
+            "quality": "degraded" if degraded else "full",
+            "protocol": "valid" if protocol_valid else "invalid",
+            "outcome": outcome,
+            "controller_claims_complete": claims_complete,
+            "missing_capabilities": missing,
+            "execution_blocked": bool(metadata.get("execution_blocked")),
+            "substitution_used": bool(metadata.get("substitution_used")),
+            "degradation_signal": (
+                "structured" if structured_degraded else "language_heuristic" if heuristic_degraded else "none"
+            ),
+            "heuristic_matches": heuristic_matches,
+            "reason": metadata.get("reason"),
+        }
+
+
 class Verifier:
     """Layered deterministic verifier: execution, artifact, evidence, goal."""
 
-    DEGRADATION_PATTERNS = (
-        r"无法(?:真实|实时|执行|访问|完成)?", r"不具备.+能力", r"仅基于.+知识",
-        r"非实时", r"未实际", r"建议.+环境", r"\bcannot\b", r"\bunable\b", r"not real[- ]time",
-    )
+    def __init__(self, completion_arbiter: CompletionArbiter | None = None):
+        self.completion_arbiter = completion_arbiter or CompletionArbiter()
 
-    def verify(self, actions: list[Action], results: list[ActionResult], *, planned_count: int, task_done: bool = True, request: str = "", contract: EvidenceContract | None = None, final_output: str = "") -> dict[str, Any]:
+    def verify(self, actions: list[Action], results: list[ActionResult], *, planned_count: int, task_done: bool = True, request: str = "", contract: EvidenceContract | None = None, final_output: str = "", capability_assessment: dict[str, Any] | None = None, completion_metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         contract = contract or EvidenceContract.from_request(request, self._expected_artifacts(request))
         checks: list[dict[str, Any]] = []
         self._check(checks, "execution", "all_actions_executed", len(results) == planned_count, f"executed={len(results)} planned={planned_count}")
@@ -57,17 +139,39 @@ class Verifier:
             evidence_ok = evidence_ok and passed
             self._check(checks, "evidence", requirement.kind, passed, requirement.value or "required")
 
-        degraded = any(re.search(pattern, final_output, re.IGNORECASE | re.DOTALL) for pattern in self.DEGRADATION_PATTERNS)
         protocol_clean = not contains_serialized_tool_call(final_output)
         artifact_goal = bool(contract.artifacts) and not missing
         effective_done = task_done or artifact_goal
+        execution_ok = len(results) == planned_count and (failures == 0 or recovered)
+        decision = self.completion_arbiter.decide(
+            execution_satisfied=execution_ok,
+            evidence_satisfied=evidence_ok and not missing,
+            task_declared_done=effective_done,
+            protocol_valid=protocol_clean,
+            capability_assessment=capability_assessment,
+            completion_metadata=completion_metadata,
+            final_output=final_output,
+        )
         self._check(checks, "goal", "task_declared_done", effective_done, "planner/artifact completion")
-        self._check(checks, "goal", "not_degraded_substitute", not degraded, "answer admits a substituted or unavailable capability" if degraded else "no degradation marker")
+        self._check(
+            checks, "goal", "not_degraded_substitute", decision["quality"] == "full",
+            "structured completion state reports degraded execution/substitution"
+            if decision["degradation_signal"] == "structured"
+            else "agent/environment degradation language detected"
+            if decision["degradation_signal"] == "language_heuristic"
+            else "no degradation signal",
+        )
         self._check(checks, "goal", "no_serialized_tool_protocol", protocol_clean, "final answer contains tool-call markup" if not protocol_clean else "natural-language final answer")
 
-        passed = all(check["passed"] for check in checks)
-        outcome = "completed" if passed else "degraded" if degraded else "retryable_failure"
-        return {"passed": passed, "outcome": outcome, "degraded": degraded, "evidence_satisfied": evidence_ok, "checks": checks}
+        passed = decision["outcome"] == "completed" and all(check["passed"] for check in checks)
+        return {
+            "passed": passed,
+            "outcome": decision["outcome"],
+            "degraded": decision["quality"] == "degraded",
+            "evidence_satisfied": evidence_ok and not missing,
+            "result_vector": decision,
+            "checks": checks,
+        }
 
     @staticmethod
     def _is_skill_authoring_request(request: str) -> bool:

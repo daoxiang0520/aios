@@ -830,6 +830,7 @@ class StateStore:
                    updated_at=CURRENT_TIMESTAMP WHERE id=?""",
                 (TaskStatus.QUEUED.value, task_id),
             )
+        self.add_checkpoint(task_id, "retry_reset", {"previous_status": task.status.value})
         return self.add_event(
             Event("TASK_REQUEST", {"task_id": task_id, "message": task.request}, task.priority)
         )

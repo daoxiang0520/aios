@@ -1,5 +1,35 @@
 # AIOS v0.6 实现与测试报告
 
+## v0.6.6.3 Structured Completion Semantics（2026-08-28）
+
+本补丁修复 Task 61 暴露的 Verifier Semantic Ambiguity：业务结论“云团无法形成有效遮蔽”不再被解释为 Agent 无法完成任务。
+
+- 新增内部 `completion_metadata`，与用户可见答案分离；
+- 新增 `CompletionArbiter`，采用 `Measured > Verified > Declared > Heuristic`；
+- 验证结果新增 `(Completion, Evidence, Capability, Quality, Protocol)` 状态向量；
+- `not_degraded_substitute` 改用结构化仲裁结果；
+- 自然语言规则缩小为 Agent/System/Environment 主体与访问、读取、执行等能力谓词；
+- 保持严格 Memory Gate，不把真正 degraded 的结果写入 Episodic Memory；
+- 加入 Task 61、数学/统计业务否定以及真实能力缺失与替代分析的对抗回归测试。
+
+### Release gate
+
+- “云团始终偏离视线至少约 46 m，无法形成有效遮蔽。” → `completed/full`；
+- “我无法访问附件.xlsx。” → `degraded`；
+- “当前环境无法执行所需的外部网络请求。” → `degraded`；
+- “由于无法读取原始文件，我改用用户提供的摘要进行分析。” → `degraded`；
+- 缺失 Evidence 时，Controller 自报完成不得覆盖 Host 验证。
+
+## v0.6.6.2 Context Working Set & Continuation Efficiency（2026-08-28）
+
+Task 55 在 v0.6.6.1 达到 `completed`，但使用 246609 Tokens、18 次模型调用、3 个 Cycle；因此该版本证明 Persistent Correctness，未证明 Persistent Efficiency。本版不修改 Component/Skill 架构，只优化模型工作集。
+
+实现范围：Per-call Token Attribution、Host TaskWorkingState、Cycle-boundary Fresh Context、HOT/WARM/COLD 生命周期、Workspace/Capability/Skill/Environment 差量投影、Carry-vs-Reread 策略、Soft Token/Model-call Pressure。每次模型调用的组成与 block hash 进入 `model_call_attribution` Trace；Task 结果汇总 Prompt Token Attribution 与 Context Reuse Ratio。
+
+默认工作集策略：完整 Workspace Map 和 Memory 仅在 Task 第一次模型调用出现；后续只投影已访问资源/产物；同 Cycle 仅保留最近 2 个 Tool Round；跨 Cycle 不携带任何 Protocol Messages，仅恢复上限 8000 字符的 Working State 和 Evidence References。达到 120000 Tokens 或 12 Calls 后进入效率模式，Hard Budget 仍为 300000 Tokens/24 Calls。
+
+新增回归覆盖 Token block 总额归一到 API Prompt Tokens、fresh-context continuation、Working State 恢复、旧 HOT round 淘汰，以及 retry 后预算/状态归零。Task 55 release gate：保持 `completed`，第一阶段目标 `<150000 Tokens`。
+
 ## v0.6.6.1 Runtime Hardening（2026-08-28）
 
 Task 55 的失败链已定位为 Runtime 复合故障：`python ... | head` 由末端命令覆盖退出码；模型请求 180 秒却被旧的 60 秒配置上限静默截断；科学依赖在任务私有环境中重复安装；第六轮仅因 CycleBudget 耗尽就强制 `tool_choice=none`；XLSX 默认大预览与历史 Tool Result 持续堆入 HOT context。它不是“建模能力缺失”。

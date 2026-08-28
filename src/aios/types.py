@@ -92,6 +92,8 @@ class Plan:
     done: bool = False
     protocol_message: dict[str, Any] | None = None
     model_usage: dict[str, int] | None = None
+    model_attributions: list[dict[str, Any]] = field(default_factory=list)
+    completion_metadata: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)

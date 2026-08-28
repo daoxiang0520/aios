@@ -118,6 +118,11 @@ class AIOSRuntime:
             task = self.store.start_task_attempt(int(task.id), increment_attempt=not continuation)
             task_budget = self._task_budget(int(task.id))
             task_metrics = self._task_metrics(int(task.id))
+            working_state = self._task_working_state(int(task.id), task.request)
+            seen_context_hashes = set(working_state.pop("_seen_context_hashes", []))
+            attribution_totals = working_state.pop("_attribution_totals", {
+                "prompt_tokens": 0, "repeated_tokens": 0, "calls": 0,
+            })
             task_budget.used_cycles += 1
             self.store.add_checkpoint(int(task.id), "continued" if continuation else "started", {
                 "cycle_id": cycle_id, "attempt": task.attempts, "task_cycle": task_budget.used_cycles,
@@ -132,13 +137,13 @@ class AIOSRuntime:
 
             expected_artifacts = self.verifier._expected_artifacts(task.request)
             contract = EvidenceContract.from_request(task.request, expected_artifacts)
-            assessment = self.capabilities.assess(contract)
-            preflight = {"contract": contract.as_dict(), "assessment": assessment}
+            preflight_assessment = self.capabilities.assess(contract)
+            preflight = {"contract": contract.as_dict(), "assessment": preflight_assessment}
             self.store.trace(cycle_id, "capability_preflight", preflight)
             self.store.add_checkpoint(int(task.id), "capability_preflight", preflight)
-            if not assessment["satisfied"]:
-                status = TaskStatus.NEEDS_AUTHORITY if assessment["needs_authority"] else TaskStatus.BLOCKED_CAPABILITY
-                reason = "Required authority is missing" if assessment["needs_authority"] else "Required capability is unavailable"
+            if not preflight_assessment["satisfied"]:
+                status = TaskStatus.NEEDS_AUTHORITY if preflight_assessment["needs_authority"] else TaskStatus.BLOCKED_CAPABILITY
+                reason = "Required authority is missing" if preflight_assessment["needs_authority"] else "Required capability is unavailable"
                 result = {"cycle_id": cycle_id, "summary": reason, "capability_preflight": preflight, "evidence": {"success": False}}
                 self.store.finish_events(event_ids)
                 self.store.update_task(int(task.id), status, result=result, error=reason)
@@ -155,6 +160,7 @@ class AIOSRuntime:
                 if not environment_observation.get("ready"):
                     raise RuntimeError(str(environment_observation.get("error") or "Scientific environment provisioning failed"))
                 task_metrics["dependency_provision_latency_ms"] += float(environment_observation.get("latency_ms", 0.0))
+                working_state["execution_environment"] = {"scientific_python": "ready"}
             self.sandbox.expose_read_only_state({
                 "tasks": [asdict(item) for item in self.store.list_tasks(limit=100)],
                 "traces": self.store.recent_traces(limit=100),
@@ -172,12 +178,13 @@ class AIOSRuntime:
             if isinstance(memory_limit, int):
                 self.context.max_characters = memory_limit
             context = self.context.compose(task.request)
-            context["workspace_inventory"] = self._workspace_inventory(snapshot)
+            full_workspace_inventory = self._workspace_inventory(snapshot)
+            full_capabilities = self.capabilities.as_dict()
+            full_skills = self.skills.catalog(self.capabilities) if self.settings.skills.enabled else []
+            context["workspace_inventory"] = full_workspace_inventory
             context["evidence_contract"] = contract.as_dict()
-            context["capabilities"] = self.capabilities.as_dict()
-            context["skills"] = (
-                self.skills.catalog(self.capabilities) if self.settings.skills.enabled else []
-            )
+            context["capabilities"] = full_capabilities
+            context["skills"] = full_skills
             skill_authoring = (
                 self.skills.authoring_context(task.request) if self.settings.skills.enabled else None
             )
@@ -186,6 +193,7 @@ class AIOSRuntime:
             context["harness"] = harness_settings
             context["harness_version"] = harness.get("version")
             context["continuation"] = self._continuation_context(int(task.id)) if continuation else None
+            context["task_working_state"] = self._working_state_projection(working_state)
             if environment_observation is not None:
                 context["environment"] = {"scientific_python": environment_observation}
             self.store.trace(cycle_id, "context_composed", context)
@@ -214,9 +222,20 @@ class AIOSRuntime:
             planned_count = 0
             task_done = False
             final_summary = ""
+            completion_metadata = None
             budget_truncated = False
             budget_deferred = 0
             for round_number in range(1, model_round_cap + 1):
+                first_task_call = task_budget.used_model_calls == 0 and round_number == 1
+                if not first_task_call:
+                    context["workspace_inventory"] = self._relevant_workspace_map(full_workspace_inventory, working_state)
+                    context["capabilities"] = self._differential_capabilities(full_capabilities)
+                    context["skills"] = self._differential_skills(full_skills)
+                    context["retrieved_memories"] = []
+                    context["characters"] = 0
+                    if environment_observation is not None:
+                        context["environment"] = {"scientific_python": "ready"}
+                context["task_working_state"] = self._working_state_projection(working_state)
                 remaining_before_round = max(0, action_cap - len(all_actions))
                 artifact_written = any(
                     action.tool in {"write", "write_file"} and result.ok
@@ -256,6 +275,10 @@ class AIOSRuntime:
                         or task_budget.used_tokens + model_tokens_total >= task_budget.max_tokens
                         or task_budget.used_cycles >= task_budget.max_cycles
                     ),
+                    "soft_pressure": (
+                        task_budget.used_model_calls + model_calls_used >= self.settings.budget.soft_model_calls_per_task
+                        or task_budget.used_tokens + model_tokens_total >= self.settings.budget.soft_tokens_per_task
+                    ),
                     "reserved_completion_tool_calls": reserved,
                     "protocol_repairs_remaining": 1,
                     "required_artifacts": expected_artifacts,
@@ -269,9 +292,29 @@ class AIOSRuntime:
                 model_usage = plan.model_usage or {}
                 model_calls_used += int(model_usage.get("model_calls", 1))
                 model_tokens_total += int(model_usage.get("total_tokens", 0))
+                for attribution in plan.model_attributions:
+                    repeated_tokens = 0
+                    for block in attribution.get("blocks", {}).values():
+                        repeated = block.get("sha256") in seen_context_hashes
+                        block["repeated"] = repeated
+                        if repeated:
+                            repeated_tokens += int(block.get("attributed_tokens", block.get("estimated_tokens", 0)))
+                        seen_context_hashes.add(str(block.get("sha256")))
+                    prompt_tokens = int(attribution.get("actual_prompt_tokens") or attribution.get("estimated_prompt_tokens", 0))
+                    attribution["repeated_tokens"] = repeated_tokens
+                    attribution["context_reuse_ratio"] = repeated_tokens / prompt_tokens if prompt_tokens else 0.0
+                    attribution_totals["prompt_tokens"] += prompt_tokens
+                    attribution_totals["repeated_tokens"] += repeated_tokens
+                    attribution_totals["calls"] += 1
+                    self.store.trace(cycle_id, "model_call_attribution", {
+                        "task_id": int(task.id), "task_cycle": task_budget.used_cycles,
+                        "round": round_number, **attribution,
+                    })
                 if plan.protocol_message:
                     protocol_messages.append(plan.protocol_message)
                 final_summary = plan.summary
+                completion_metadata = plan.completion_metadata
+                working_state["semantic_state"] = {"latest_model_summary": plan.summary[:2000]}
                 actions, deferred_actions = self._select_actions(
                     plan.actions,
                     remaining_before_round,
@@ -294,6 +337,7 @@ class AIOSRuntime:
                     "summary": plan.summary,
                     "done": plan.done,
                     "actions": [asdict(action) for action in actions],
+                    "completion_metadata": completion_metadata,
                 }
                 rounds.append(plan_data)
                 self.store.trace(cycle_id, "plan_created", plan_data)
@@ -355,6 +399,7 @@ class AIOSRuntime:
                     round_results.append(result)
                     result_data = {"round": round_number, **asdict(result)}
                     result_trace_id = self.store.trace(cycle_id, "action_result", result_data)
+                    self._update_working_state(working_state, action, result, result_trace_id)
                     if skill_invocation is not None:
                         output = result.output if isinstance(result.output, dict) else {}
                         exit_code = output.get("exit_code")
@@ -434,8 +479,13 @@ class AIOSRuntime:
                     }
                     for action, result in zip(actions, round_results, strict=False)
                 )
+                self._retain_hot_protocol_rounds(
+                    protocol_messages, self.settings.budget.hot_tool_results
+                )
                 has_final_action = any(action.tool in {"write", "edit", "echo", "write_file", "append_file"} for action in actions)
                 task_done = bool(plan.done and (has_final_action or not actions))
+                if task_done:
+                    working_state["pending"] = []
                 if task_done:
                     break
                 if not actions and not deferred_actions:
@@ -482,7 +532,11 @@ class AIOSRuntime:
                     "summary": final_summary,
                     "budget": asdict(task_budget),
                     "remaining": remaining_task_budget,
-                    "recent_observations": self._compact_observations(observations),
+                    "working_state": {
+                        **working_state,
+                        "_seen_context_hashes": sorted(seen_context_hashes),
+                        "_attribution_totals": attribution_totals,
+                    },
                     "metrics": task_metrics,
                     "action_trace_ids": [
                         item["id"] for item in self.store.recent_traces(limit=max(50, len(all_results) * 3))
@@ -531,6 +585,8 @@ class AIOSRuntime:
                 request=task.request,
                 contract=contract,
                 final_output=final_output,
+                capability_assessment=preflight_assessment,
+                completion_metadata=completion_metadata,
             )
             ok = bool(verification["passed"])
             self.store.finalize_skill_usage(
@@ -550,12 +606,19 @@ class AIOSRuntime:
                 "task_cycles": task_budget.used_cycles,
                 "rounds_to_first_computation": task_metrics["rounds_to_first_computation"],
                 "dependency_provision_latency_ms": task_metrics["dependency_provision_latency_ms"],
+                "prompt_token_attribution": attribution_totals,
+                "context_reuse_ratio": (
+                    attribution_totals["repeated_tokens"] / attribution_totals["prompt_tokens"]
+                    if attribution_totals["prompt_tokens"] else 0.0
+                ),
                 "planned_actions": planned_count,
                 "executed_actions": len(all_results),
                 "failed_actions": sum(not result.ok for result in all_results),
                 "budget_truncated": budget_truncated,
                 "budget_deferred_actions": budget_deferred,
                 "verification": verification,
+                "completion_metadata": completion_metadata,
+                "result_vector": verification.get("result_vector"),
             }
             self.store.trace(cycle_id, "evaluation", evidence)
             task_result = {
@@ -565,6 +628,7 @@ class AIOSRuntime:
                 "rounds": rounds,
                 "actions": [asdict(action) for action in all_actions],
                 "action_results": [asdict(result) for result in all_results],
+                "task_working_state": self._working_state_projection(working_state),
                 "evidence": evidence,
             }
             if ok:
@@ -799,6 +863,8 @@ class AIOSRuntime:
         )
         checkpoints = self.store.task_checkpoints(task_id)
         for checkpoint in reversed(checkpoints):
+            if checkpoint["phase"] == "retry_reset":
+                break
             if checkpoint["phase"] != "budget_deferred":
                 continue
             saved = checkpoint["data"].get("budget", {})
@@ -811,15 +877,15 @@ class AIOSRuntime:
 
     def _continuation_context(self, task_id: int) -> dict | None:
         for checkpoint in reversed(self.store.task_checkpoints(task_id)):
+            if checkpoint["phase"] == "retry_reset":
+                break
             if checkpoint["phase"] == "budget_deferred":
                 data = checkpoint["data"]
                 return {
                     "checkpoint_id": checkpoint["id"],
                     "previous_cycle_id": data.get("cycle_id"),
-                    "summary": data.get("summary"),
-                    "recent_observations": data.get("recent_observations", []),
-                    "action_trace_ids": data.get("action_trace_ids", []),
-                    "instruction": "Resume from this checkpoint; do not repeat completed discovery or dependency setup.",
+                    "fresh_context": True,
+                    "instruction": "Restore TaskWorkingState in a fresh context. DONE/ESTABLISHED work must not be repeated without conflicting evidence.",
                 }
         return None
 
@@ -829,12 +895,131 @@ class AIOSRuntime:
             "dependency_provision_latency_ms": 0.0,
         }
         for checkpoint in reversed(self.store.task_checkpoints(task_id)):
+            if checkpoint["phase"] == "retry_reset":
+                break
             if checkpoint["phase"] == "budget_deferred":
                 saved = checkpoint["data"].get("metrics", {})
                 if isinstance(saved, dict):
                     metrics.update({key: saved[key] for key in metrics if key in saved})
                 break
         return metrics
+
+    def _task_working_state(self, task_id: int, objective: str) -> dict[str, object]:
+        for checkpoint in reversed(self.store.task_checkpoints(task_id)):
+            if checkpoint["phase"] == "retry_reset":
+                break
+            if checkpoint["phase"] == "budget_deferred":
+                state = checkpoint["data"].get("working_state")
+                if isinstance(state, dict):
+                    return state
+        return {
+            "objective": objective,
+            "established_facts": [],
+            "completed_steps": [],
+            "available_artifacts": [],
+            "accessed_resources": [],
+            "execution_environment": {},
+            "pending": ["fulfil_objective_and_verify"],
+            "important_evidence_refs": [],
+            "semantic_state": {},
+        }
+
+    def _working_state_projection(self, state: dict[str, object]) -> dict[str, object]:
+        projected = {key: value for key, value in state.items() if not key.startswith("_")}
+        import json
+        raw = json.dumps(projected, ensure_ascii=False, default=str)
+        limit = self.settings.budget.working_state_characters
+        if len(raw) <= limit:
+            return projected
+        return {
+            "objective": projected.get("objective"),
+            "established_facts": list(projected.get("established_facts", []))[-12:],
+            "completed_steps": list(projected.get("completed_steps", []))[-16:],
+            "available_artifacts": list(projected.get("available_artifacts", []))[-12:],
+            "accessed_resources": list(projected.get("accessed_resources", []))[-12:],
+            "execution_environment": projected.get("execution_environment", {}),
+            "pending": projected.get("pending", []),
+            "important_evidence_refs": list(projected.get("important_evidence_refs", []))[-16:],
+            "semantic_state": projected.get("semantic_state", {}),
+            "compacted": True,
+        }
+
+    @staticmethod
+    def _update_working_state(state: dict[str, object], action: object, result: object, trace_id: int) -> None:
+        import hashlib
+
+        tool = str(getattr(action, "tool", ""))
+        arguments = getattr(action, "arguments", {})
+        ok = bool(getattr(result, "ok", False))
+        reference = f"trace:{trace_id}"
+        refs = state.setdefault("important_evidence_refs", [])
+        if reference not in refs:
+            refs.append(reference)
+            del refs[:-16]
+        if not ok:
+            return
+        path = str(arguments.get("path", ""))
+        if tool == "read" and path:
+            resources = state.setdefault("accessed_resources", [])
+            if path not in resources:
+                resources.append(path)
+            output = getattr(result, "output", None)
+            resource = output.get("resource", {}) if isinstance(output, dict) else {}
+            metadata = resource.get("metadata")
+            if metadata:
+                fact = {"state": "ESTABLISHED", "resource": path, "metadata": metadata, "evidence_ref": reference}
+                facts = state.setdefault("established_facts", [])
+                facts[:] = [item for item in facts if not (isinstance(item, dict) and item.get("resource") == path)]
+                facts.append(fact)
+        if tool in {"write", "edit", "write_file", "append_file"} and path:
+            artifacts = state.setdefault("available_artifacts", [])
+            artifact = {"path": path, "state": "AVAILABLE", "evidence_ref": reference}
+            artifacts[:] = [item for item in artifacts if not (isinstance(item, dict) and item.get("path") == path)]
+            artifacts.append(artifact)
+        if tool == "bash":
+            command = str(arguments.get("command", ""))
+            step = "bash:" + hashlib.sha256(command.encode("utf-8")).hexdigest()[:12]
+        else:
+            step = f"{tool}:{path or 'operation'}"
+        completed = state.setdefault("completed_steps", [])
+        if not any(isinstance(item, dict) and item.get("step") == step for item in completed):
+            completed.append({"step": step, "state": "DONE", "evidence_ref": reference})
+
+    @staticmethod
+    def _relevant_workspace_map(inventory: dict[str, object], state: dict[str, object]) -> dict[str, object]:
+        paths = set(str(item) for item in state.get("accessed_resources", []))
+        paths.update(
+            str(item.get("path")) for item in state.get("available_artifacts", [])
+            if isinstance(item, dict) and item.get("path")
+        )
+        entries = [item for item in inventory.get("files", []) if isinstance(item, dict) and item.get("path") in paths]
+        return {
+            "relevant_resources": entries,
+            "other_files_available": max(0, int(inventory.get("total_files", 0)) - len(entries)),
+            "instruction": "Use relevant resources directly. Request a directory read only if another path is actually needed.",
+        }
+
+    @staticmethod
+    def _differential_capabilities(capabilities: dict[str, object]) -> dict[str, object]:
+        return {
+            name: {"state": value.get("state"), "interface": value.get("interface")}
+            for name, value in capabilities.items() if isinstance(value, dict)
+        }
+
+    @staticmethod
+    def _differential_skills(skills: list[dict]) -> list[dict[str, object]]:
+        return [
+            {key: item.get(key) for key in ("name", "version", "status") if key in item}
+            for item in skills
+        ]
+
+    @staticmethod
+    def _retain_hot_protocol_rounds(messages: list[dict], rounds: int) -> None:
+        assistant_indexes = [index for index, item in enumerate(messages) if item.get("role") == "assistant"]
+        if len(assistant_indexes) <= max(1, rounds):
+            return
+        cut = assistant_indexes[-max(1, rounds)]
+        del messages[:cut]
 
     def _load_or_create_task(self, event: Event) -> Task:
         task_id = event.payload.get("task_id")

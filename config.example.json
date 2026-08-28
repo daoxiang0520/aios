@@ -9,9 +9,12 @@
     "max_model_calls_per_task": 24,
     "max_tool_calls_per_task": 32,
     "max_tokens_per_task": 300000,
+    "soft_model_calls_per_task": 12,
+    "soft_tokens_per_task": 120000,
     "max_cycles_per_task": 6,
     "tool_observation_characters": 12000,
-    "hot_tool_results": 4,
+    "hot_tool_results": 2,
+    "working_state_characters": 8000,
     "reserved_completion_tool_calls": 1
   },
   "evolution": {
