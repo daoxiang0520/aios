@@ -1,5 +1,60 @@
 # AIOS v0.6 实现与测试报告
 
+## v0.8.0-alpha.2 Autonomous Diagnosis Benchmark（2026-08-28）
+
+本版本不扩大生产 mutation surface，也不为 Task 74 人工指定 `evaluation.py`。目标是把 Autonomous Runtime Repair 拆成可测量的四段：`Diagnosis → Localization → Mutation → External Gate`，先判断系统究竟卡在哪一段，再决定是否需要 alpha.3 的 causal source index 或 bounded source expansion。
+
+- 新增 Task 64/67/70/72/74 历史缺陷盲测标注，分别覆盖 continuation fencing、Canonical Answer binding、URL/path classification、operational capability binding 与 claim/evidence recovery；
+- 标注包含诊断信号、相关源码面与期望处置，但只在 Reasoner 推理结束后评分，绝不进入 Experience Capsule、source index 或模型 prompt；
+- 每个 Case 独立记录 `diagnosis.success/signal_recall`、`localization.precision/recall`、`mutation.generated/policy_valid/precision`、`external_gate.passed`；
+- Suite 指标保持向量，不合成为 reward scalar；缺少真实实验的任务明确为 `missing_experiment`，不伪造零分或成功；
+- `NO_ACTION` 拆成两种语义：`epistemically_safe` 表示没有在证据不足时强行修改，`correct_for_known_disposition` 表示它是否也是离线已知的最优处置；
+- 新增 CLI：`evolution runtime-benchmark <task_id>` 与 `evolution runtime-benchmark-suite [--task-id ...]`，二者只消费已经存在的 Runtime experiment，不触发模型调用。
+
+Task 74 的真实 alpha.1 DeepSeek 结果已经完成首轮盲评：`diagnosis_accuracy=1.0`，成功识别“未编译却宣称 complete/correct”的 Claim/Evidence 矛盾；`localization_accuracy=0.0`，所选 `sandbox/tools/runtime/controller` 未命中离线标注的 `evaluation/answers` 语义面；`mutation_generation_rate=0.0`，最终 `NO_ACTION`；该 NO_ACTION 的 `epistemically_safe=true`，但 `correct_for_known_disposition=false`，因此既保留其安全价值，也不把漏修包装成成功。Task 64/67/70/72 尚无 alpha.2 真实实验，均保持 `missing_experiment`，且本轮没有未经授权向 DeepSeek 发送它们的 Trace。
+
+alpha.2 专项测试 **8/8** 通过；Host Docker 权限下完整单元/集成回归 **153/153** 通过，无跳过。生产 Runtime、Root of Trust 与外部 Fitness Authority 均未改变。
+
+## v0.8.0-alpha.1 Candidate Runtime Mutation（2026-08-28）
+
+Task 74 暴露出跨层事实矛盾：三次 `g++` 调用均为 `MissingExecutable(exit 127)`；最终回答声明 C++ “complete and correct”；Verifier 却仅因 `task_done=True` 将 `tool_failures_recovered` 判为通过，并以 16 次模型调用、188,327 Tokens、3 个 Cycle 进入 `completed`。本版本不再人工直接修生产 Verifier，而是建立受限的 Autonomous Harness Evolution 实验边界。
+
+### Perception 与 Attribution
+
+- `RuntimeExperienceBuilder` 从任务 checkpoints 对应的全部 Trace 生成 `runtime_experience/v1`；
+- Capsule 并列保存 Action/Tool Result、final claims、Verifier checks/result vector 与 Task cost，不生成 `recommended_fix` 或 mutation target；
+- 写入动作正文不进入 Capsule，只保留字符数和 SHA-256；网页/输出摘录对 CSRF、Bearer、常见 API token 与 URL credentials 做脱敏；
+- `ModelRuntimeMutationReasoner` 使用两阶段归因：第一轮只看事实与源码符号索引，自主提出竞争假设并选择最多四个文件；第二轮才读取所选源码并生成最多四个 exact edits、最多两个 Runtime 文件及 Candidate tests。
+
+### Candidate Mutation Boundary
+
+- Candidate 位于 ignored 的 `experiments/runtime_candidates/rtc_*/repo`，生产仓库从不作为 patch 写入目标；
+- 可变面限定为 Answer/Component/Controller/Verifier/Memory/Resource/Runtime/Situation/Tool strategy 实现；
+- Authority/Capability Contract、SecurityKernel、Sandbox isolation、Storage/Audit、CLI/Deployment、Evolution Controller、Candidate boundary 与外部 Evaluator 属于 Root of Trust；
+- Candidate 若通过 Bash 或其他路径修改禁止文件，Host 在 evaluation 前按 baseline manifest 文件粒度拒绝；
+- Alpha 阶段没有 promote/activate 方法，评估通过最多进入 `needs_review`，`production_activated=false`。
+
+### External Fitness Authority
+
+- `external_evaluators/task74_recovery_gate.py` 位于 Candidate 权限边界之外；
+- Host 以 `--network none --read-only --cap-drop ALL --no-new-privileges` 启动 Docker，将 Candidate 与外部门禁只读挂载；
+- 门禁要求：未恢复的 MissingExecutable 不得仅因 final plan done 而通过，同时零失败的正常 completion 必须保持通过；
+- 当前生产 v0.7.1.4 基线在 Host-owned Docker 中按预期 **FAIL**：`unresolved_failure_rejected=false`、`recovery_check_passed=true`；这证明 Gate 能捕获 Task 74 defect，且 Fitness Authority 未使用 Candidate 自己的 Verifier 结论作为唯一真值。
+
+### CLI
+
+```powershell
+python -m aios --config config.json evolution runtime-observe 74
+python -m aios --config config.json evolution runtime-propose 74
+python -m aios --config config.json evolution runtime-list
+python -m aios --config config.json evolution runtime-show <candidate_id>
+python -m aios --config config.json evolution runtime-evaluate <candidate_id>
+```
+
+`runtime-propose` 会把脱敏后的 Task Trace、源码符号索引及 Reasoner 自主选择的源码发送给配置的模型 Provider。用户明确授权后，已对 Task 74 完成一次真实 DeepSeek 两阶段运行，共发生 **2 次模型调用**：第一阶段选择假设 H3——“C++ 从未编译执行，最终 complete/correct 声明缺少充分证据”，并请求检查 `sandbox.py`、`tools.py`、`runtime.py`、`controller.py`；第二阶段实际接收受预算约束的前三份源码。Reasoner 最终返回 **`NO_ACTION`**，理由是缺少 `g++` 属于环境能力限制，现有可变 Runtime 面中没有证据充分且安全的源码修复。因而没有创建 Candidate、没有运行 Candidate gate、没有修改或激活生产 Runtime。这个结果验证了系统允许模型拒绝无依据 mutation，而不是为了制造“自进化”强行改代码。
+
+离线 Candidate 边界测试 **5/5** 通过，完整标准库单元/集成测试 **150/150** 通过；真实 Task 74 Capsule、DeepSeek attribution/selection/NO_ACTION 路径与 Host-owned baseline gate 均已验证。当前仍保留一个有价值但未自动修复的缺口：最终答案的“完整正确”主张与实际编译证据不一致；后续若扩大 mutation surface，应先把它建模为可验证的 Evidence/Claim consistency 问题，而不是简单把编译器塞进 Runtime。
+
 ## v0.7.1.4 Operational Capability Binding（2026-08-28）
 
 Task 72 的 Contract 正确识别出洛谷 URL 需要网络，但 Runtime 只声明 `network.external=available`，没有为 Agent 提供可调用的 HTTP operation。模型只好猜测 `curl`，而 `python:3.12-slim` 中没有该命令；两次失败后又退化为只验证已有 `P1593.py`，最终被 Verifier 正确拒绝为缺少 `network_request/source_domain`。这是 deterministic Runtime regression，不进入 Evolution learning。

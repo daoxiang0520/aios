@@ -1,3 +1,3 @@
 """Self-Evolving AIOS MVP."""
 
-__version__ = "0.7.1.4"
+__version__ = "0.8.0a2"

@@ -1,12 +1,11 @@
 # Self-Evolving AIOS
 
-Current release: **v0.7.1.4**. The Runtime correctness line now includes
-Operational Capability Binding and governed `read(URL)` HTTP observations,
-alongside cross-cycle Evidence Ledger persistence and typed
-URL/filesystem reference classification in addition to canonical
-answer binding, artifact-backed verification, continuation idempotency,
-checkpoint fencing, terminal-task no-resurrection, and historical state
-reconciliation. It adds no Agent, evolution surface, or ontology.
+Current release: **v0.8.0-alpha.2**. This build retains the bounded Candidate
+Runtime Mutation boundary and adds an Autonomous Diagnosis Benchmark that scores
+diagnosis, source localization, mutation precision, NO_ACTION precision, and the
+external gate separately. Historical answers are post-inference annotations and
+are never exposed to the Runtime reasoner. Production, Root of Trust, activation,
+and external fitness remain Host-owned and immutable.
 
 > v0.6 将进化面从“增加专用 Tool Schema”迁移为“学习可执行、可测试、可版本化的 Skill”。模型的原生工具面仍固定为 `read / write / edit / bash`。
 
@@ -26,6 +25,15 @@ reconciliation. It adds no Agent, evolution surface, or ontology.
 - `completed`、`degraded`、`blocked_capability`、`needs_authority` 等任务语义；
 - Docker-only SandboxBroker：事务工作区、资源限制、禁用宿主 Shell 回退；
 - `aiosctl` 只读状态接口与沙盒内状态快照；
+- `runtime_experience/v1` 事实 Capsule：联合投影 Tool Result、最终声明、Verifier checks 与成本，但不输出 Host 推荐修复；
+- 两阶段 Runtime Evolution Reasoner：先从源码符号索引自主选择检查文件，再读取所选源码并提出最小 Candidate patch；
+- Candidate Runtime 源码快照与精确替换策略；生产源码永远不是写入目标；
+- Root of Trust 禁止变更：Authority、SecurityKernel、Sandbox、审计/存储、CLI/部署、Evolution Controller 和外部 Evaluator；
+- Host-owned Docker 外部门禁：Candidate 只读挂载、无网络、降权执行，要求 Task 74 基线 FAIL → Candidate PASS；
+- Runtime Candidate 只能进入 `needs_review/rejected`，v0.8-alpha.1 不提供自动生产激活接口；
+- Autonomous Diagnosis Benchmark 覆盖 Task 64/67/70/72/74，分别测量 Diagnosis、Localization、Mutation 与 External Gate，不压成单一 reward；
+- 历史 defect 标注只在模型推理完成后用于离线评分，不进入 Experience Capsule、源码索引或 Reasoner prompt；
+- `NO_ACTION` 同时区分“没有强行修改”的 epistemic safety 与“符合已知最优处置”的 precision；
 - 仅 `completed` 任务写入 Episodic Memory；
 - 能力白名单、工作区路径隔离、读写大小限制和覆盖保护；
 - 每周期计划、动作、结果、评价与错误追踪；

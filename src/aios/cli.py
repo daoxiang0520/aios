@@ -25,6 +25,10 @@ from .sandbox import DockerSandboxBroker
 from .skills import SkillManager
 from .runtime import AIOSRuntime
 from .self_evolution import ExperienceAnalyzer, ModelEvolutionReasoner, SelfEvolutionLoop
+from .runtime_evolution import (
+    ExternalRuntimeEvaluator, ModelRuntimeMutationReasoner, RuntimeCandidateManager,
+    RuntimeDiagnosisBenchmark,
+)
 from .situation import SituationResolver, normalize_resource_path
 from .storage import StateStore
 from .types import Action, ActionResult, Event, Goal, GoalStatus, GoalType, Memory, MemoryType, Task, TaskStatus
@@ -129,6 +133,29 @@ def _parser() -> argparse.ArgumentParser:
     evolution_auto.add_argument("--runs", type=int)
     evolution_auto.add_argument("--task-limit", type=int, default=100)
     evolution_auto.add_argument("--trace-limit", type=int, default=1000)
+    runtime_observe = evolution_commands.add_parser(
+        "runtime-observe", help="Build a fact-only cross-layer Runtime experience capsule",
+    )
+    runtime_observe.add_argument("task_id", type=int)
+    runtime_propose = evolution_commands.add_parser(
+        "runtime-propose", help="Let the model diagnose and patch an isolated Runtime candidate",
+    )
+    runtime_propose.add_argument("task_id", type=int)
+    runtime_benchmark = evolution_commands.add_parser(
+        "runtime-benchmark", help="Score a completed Runtime experiment against blind historical annotations",
+    )
+    runtime_benchmark.add_argument("task_id", type=int)
+    runtime_benchmark_suite = evolution_commands.add_parser(
+        "runtime-benchmark-suite", help="Measure diagnosis/localization/mutation/gate stages separately",
+    )
+    runtime_benchmark_suite.add_argument("--task-id", action="append", type=int, default=[])
+    evolution_commands.add_parser("runtime-list")
+    runtime_show = evolution_commands.add_parser("runtime-show")
+    runtime_show.add_argument("candidate_id")
+    runtime_evaluate = evolution_commands.add_parser(
+        "runtime-evaluate", help="Run Host-owned immutable gates against a Runtime candidate",
+    )
+    runtime_evaluate.add_argument("candidate_id")
     evolution_commands.add_parser("tools")
     rollback = evolution_commands.add_parser("rollback")
     rollback.add_argument("version", type=int)
@@ -644,6 +671,30 @@ def main(argv: list[str] | None = None) -> int:
                 runs_per_variant=args.runs or settings.experiments.default_runs_per_variant,
                 task_limit=args.task_limit, trace_limit=args.trace_limit,
             ))
+        elif args.evolution_command in {
+            "runtime-observe", "runtime-propose", "runtime-list",
+            "runtime-show", "runtime-evaluate", "runtime-benchmark",
+            "runtime-benchmark-suite",
+        }:
+            runtime_candidates = RuntimeCandidateManager(
+                settings, store, ModelRuntimeMutationReasoner(LLMController(settings.model)),
+            )
+            if args.evolution_command == "runtime-observe":
+                _print_json(runtime_candidates.observe(args.task_id))
+            elif args.evolution_command == "runtime-propose":
+                _print_json(runtime_candidates.propose(args.task_id))
+            elif args.evolution_command == "runtime-benchmark":
+                _print_json(RuntimeDiagnosisBenchmark(store).latest(args.task_id))
+            elif args.evolution_command == "runtime-benchmark-suite":
+                _print_json(RuntimeDiagnosisBenchmark(store).suite(args.task_id or None))
+            elif args.evolution_command == "runtime-list":
+                _print_json(runtime_candidates.list())
+            elif args.evolution_command == "runtime-show":
+                _print_json(runtime_candidates.show(args.candidate_id))
+            else:
+                _print_json(ExternalRuntimeEvaluator(settings, runtime_candidates).evaluate(
+                    args.candidate_id
+                ))
         elif args.evolution_command == "tools":
             plugins = PluginManager(settings.extensions, store, settings.workspace)
             _print_json([plugin.as_dict() for plugin in plugins.active_plugins()])
