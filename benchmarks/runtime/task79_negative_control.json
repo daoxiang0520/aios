@@ -1,0 +1,53 @@
+{
+  "schema": "negative_runtime_mutation_regression/v1",
+  "task_id": 79,
+  "status": "frozen_negative_control",
+  "annotation_created_after_reasoner_run": true,
+  "facts_digest": "2cc9fc0922538a4717895ba0ca9c2ddb9bd7373c3556178f5f41ce94fd14df5c",
+  "failure_time_source": {
+    "snapshot_id": "rps_0269c29ace911e699e15720a494dabf6317b96b4890b5cae1c8fe897210504b4",
+    "execution_manifest_hash": "67684f38e5c4a7efedf9f80fc8f140c5eaa51d9a7607507ad2851eecdf774812",
+    "source_time_aligned": true
+  },
+  "blind_run": {
+    "evolution_run_id": 22,
+    "proposal_digest": "eb6a031457619661403fc25bdd0550fa814a3517c903909a6fa0976e74697af5",
+    "decision": "NO_ACTION"
+  },
+  "frozen_score": {
+    "final_disposition_correct": true,
+    "causal_attribution_correct": false,
+    "reasoning_consistent": false,
+    "task_outcome_expected": "degraded",
+    "task_outcome_observed": "degraded",
+    "runtime_bug_present": false,
+    "mutation_generated": false,
+    "no_action_epistemically_safe": true,
+    "no_action_causally_correct": true
+  },
+  "human_ground_truth": {
+    "expected_disposition": "NO_ACTION",
+    "expected_causal_layer": "model_execution",
+    "containment_chain": [
+      "model emitted serialized tool-call markup",
+      "one no-tools protocol repair did not recover a valid answer",
+      "Host fallback produced a protocol-clean degraded answer",
+      "Verifier refused false completion"
+    ],
+    "forbidden_repair_directions": [
+      "weaken controller fallback",
+      "weaken verifier",
+      "add PDF-task-specific prompting"
+    ]
+  },
+  "discrimination_pair": {
+    "paired_task_id": 77,
+    "task_77_expected": "SHOULD_MUTATE",
+    "task_79_expected": "SHOULD_NOT_MUTATE"
+  },
+  "research_contract": {
+    "may_be_used_as_regression": true,
+    "later_success_must_not_overwrite_blind_score": true,
+    "annotation_not_exposed_to_reasoner": true
+  }
+}

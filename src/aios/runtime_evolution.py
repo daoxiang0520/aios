@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any, Protocol
@@ -18,6 +19,85 @@ from .storage import StateStore
 
 class RuntimeMutationPolicyError(RuntimeError):
     pass
+
+
+class RuntimeAttributionContract:
+    """Host-owned structural consistency for model-authored causal judgments."""
+
+    HYPOTHESIS_STATES = {"supported", "rejected", "unresolved"}
+    NON_MUTATION_REASONS = {
+        "authority_boundary", "root_of_trust", "safety_risk", "insufficient_evidence",
+    }
+
+    @classmethod
+    def assess(cls, proposal: dict[str, Any]) -> dict[str, Any]:
+        attribution = proposal.get("attribution") if isinstance(proposal.get("attribution"), dict) else {}
+        hypotheses = attribution.get("hypotheses") if isinstance(attribution.get("hypotheses"), list) else []
+        indexed = {
+            str(item.get("id")): item for item in hypotheses
+            if isinstance(item, dict) and item.get("id")
+        }
+        errors: list[str] = []
+        for hypothesis_id, hypothesis in indexed.items():
+            status = str(hypothesis.get("status", "")).lower()
+            if status not in cls.HYPOTHESIS_STATES:
+                errors.append(f"hypothesis {hypothesis_id} has invalid final status")
+
+        selected_id = attribution.get("selected_hypothesis")
+        selected = indexed.get(str(selected_id)) if selected_id is not None else None
+        if selected_id is not None and selected is None:
+            errors.append("selected_hypothesis does not identify a declared hypothesis")
+
+        decision = str(proposal.get("decision", "NO_ACTION")).upper()
+        final_disposition = (
+            proposal.get("final_disposition")
+            if isinstance(proposal.get("final_disposition"), dict) else {}
+        )
+        final_action = str(final_disposition.get("action", decision)).upper()
+        if final_action != decision:
+            errors.append("final_disposition.action disagrees with decision")
+
+        supported_by = final_disposition.get("supported_by", [])
+        if not isinstance(supported_by, list):
+            errors.append("final_disposition.supported_by must be a list")
+            supported_by = []
+        for hypothesis_id in supported_by:
+            hypothesis = indexed.get(str(hypothesis_id))
+            if hypothesis is None:
+                errors.append(f"final disposition references unknown hypothesis {hypothesis_id}")
+            elif str(hypothesis.get("status", "")).lower() != "supported":
+                errors.append(f"final disposition relies on non-supported hypothesis {hypothesis_id}")
+
+        runtime_defect_supported = proposal.get("runtime_defect_supported")
+        non_mutation_reason = str(proposal.get("non_mutation_reason", "")).lower() or None
+        selected_supported_runtime_defect = bool(
+            selected
+            and str(selected.get("status", "")).lower() == "supported"
+            and bool(selected.get("runtime_defect"))
+        )
+        allowed_abstention = non_mutation_reason in cls.NON_MUTATION_REASONS
+        if decision == "PROPOSE":
+            if runtime_defect_supported is not True:
+                errors.append("PROPOSE requires runtime_defect_supported=true")
+            if selected is None or str(selected.get("status", "")).lower() != "supported":
+                errors.append("PROPOSE requires a supported selected hypothesis")
+        if decision == "NO_ACTION" and (
+            runtime_defect_supported is True or selected_supported_runtime_defect
+        ) and not allowed_abstention:
+            errors.append(
+                "NO_ACTION retains a supported Runtime defect without an explicit safety/authority/evidence reason"
+            )
+
+        return {
+            "schema": "runtime_attribution_consistency/v1",
+            "valid": not errors,
+            "errors": errors,
+            "decision": decision,
+            "selected_hypothesis": selected_id,
+            "selected_hypothesis_status": selected.get("status") if selected else None,
+            "runtime_defect_supported": runtime_defect_supported,
+            "non_mutation_reason": non_mutation_reason,
+        }
 
 
 class RuntimeMutationReasoner(Protocol):
@@ -115,7 +195,8 @@ class RuntimeExperienceBuilder:
             if item["data"].get("cycle_id")
         ))
         traces = self.store.traces_for_cycles(cycle_ids)
-        executions = self._execution_facts(traces)
+        cycle_context = self._cycle_context(checkpoints, cycle_ids)
+        executions = self._execution_facts(traces, cycle_context)
         evaluations = []
         final_claims = []
         for trace in traces:
@@ -123,6 +204,7 @@ class RuntimeExperienceBuilder:
             if trace["kind"] == "plan_created" and data.get("done"):
                 final_claims.append({
                     "trace_id": trace["id"], "cycle_id": trace["cycle_id"],
+                    "at": self._trace_at(trace, cycle_context, "model_final"),
                     "text": self._bounded(data.get("summary"), 4000),
                     "completion_metadata": data.get("completion_metadata"),
                 })
@@ -130,6 +212,7 @@ class RuntimeExperienceBuilder:
                 verification = data.get("verification") if isinstance(data.get("verification"), dict) else {}
                 evaluations.append({
                     "trace_id": trace["id"], "cycle_id": trace["cycle_id"],
+                    "at": self._trace_at(trace, cycle_context, "evaluation"),
                     "success": bool(data.get("success")),
                     "failed_actions": int(data.get("failed_actions", 0) or 0),
                     "model_calls": int(data.get("model_api_calls", 0) or 0),
@@ -140,7 +223,7 @@ class RuntimeExperienceBuilder:
         result = task.result if isinstance(task.result, dict) else {}
         evidence = result.get("evidence") if isinstance(result.get("evidence"), dict) else {}
         facts: dict[str, Any] = {
-            "schema": "runtime_experience/v1",
+            "schema": "runtime_experience/v2",
             "task": {
                 "id": task_id, "request": task.request, "status": task.status.value,
                 "attempts": task.attempts, "error": task.error,
@@ -149,7 +232,7 @@ class RuntimeExperienceBuilder:
             "executions": executions,
             "final_claims": final_claims,
             "evaluations": evaluations,
-            "host_decisions": self._host_decision_facts(traces),
+            "host_decisions": self._host_decision_facts(traces, cycle_context),
             "runtime_provenance": [
                 {
                     "checkpoint_id": item["id"],
@@ -175,6 +258,9 @@ class RuntimeExperienceBuilder:
                     "protocol_repair_calls", "context_reuse_ratio",
                 )
             },
+            "temporal_evidence": self._temporal_evidence(
+                checkpoints, cycle_context, evidence, task.status.value,
+            ),
             "observation_contract": {
                 "host_role": "compress facts only",
                 "reasoner_role": "interpret contradictions and attribute faults",
@@ -192,11 +278,74 @@ class RuntimeExperienceBuilder:
         facts["fact_digest"] = self._digest(facts)
         return facts
 
-    def _host_decision_facts(self, traces: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    @staticmethod
+    def _cycle_context(
+        checkpoints: list[dict[str, Any]], cycle_ids: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        output = {
+            cycle_id: {"cycle_id": cycle_id, "task_cycle": index + 1}
+            for index, cycle_id in enumerate(cycle_ids)
+        }
+        for checkpoint in checkpoints:
+            if checkpoint["phase"] not in {"started", "continued"}:
+                continue
+            data = checkpoint.get("data") if isinstance(checkpoint.get("data"), dict) else {}
+            cycle_id = str(data.get("cycle_id") or "")
+            if not cycle_id:
+                continue
+            output.setdefault(cycle_id, {"cycle_id": cycle_id})
+            output[cycle_id].update({
+                "attempt": data.get("attempt"),
+                "task_cycle": data.get("task_cycle", output[cycle_id].get("task_cycle")),
+                "cycle_started_at": checkpoint.get("created_at"),
+            })
+        return output
+
+    @staticmethod
+    def _trace_at(
+        trace: dict[str, Any], cycle_context: dict[str, dict[str, Any]], phase: str,
+    ) -> dict[str, Any]:
+        return {
+            **cycle_context.get(str(trace.get("cycle_id")), {"cycle_id": trace.get("cycle_id")}),
+            "phase": phase,
+            "trace_id": trace.get("id"),
+            "observed_at": trace.get("created_at"),
+        }
+
+    def _temporal_evidence(
+        self, checkpoints: list[dict[str, Any]], cycle_context: dict[str, dict[str, Any]],
+        final_evidence: dict[str, Any], final_status: str,
+    ) -> list[dict[str, Any]]:
+        output: list[dict[str, Any]] = []
+        for checkpoint in checkpoints:
+            if checkpoint["phase"] != "budget_deferred":
+                continue
+            data = checkpoint.get("data") if isinstance(checkpoint.get("data"), dict) else {}
+            cycle_id = str(data.get("cycle_id") or "")
+            at = {
+                **cycle_context.get(cycle_id, {"cycle_id": cycle_id}),
+                "phase": "checkpoint",
+                "checkpoint_phase": "budget_deferred",
+                "checkpoint_id": checkpoint.get("id"),
+                "observed_at": checkpoint.get("created_at"),
+            }
+            for namespace in ("budget", "remaining"):
+                values = data.get(namespace) if isinstance(data.get(namespace), dict) else {}
+                for name, value in values.items():
+                    output.append({"fact": f"{namespace}.{name}", "value": value, "at": at})
+        final_at = {"phase": "task_final", "task_status": final_status}
+        for name in ("model_api_calls", "model_tokens", "task_cycles", "failed_actions"):
+            if name in final_evidence:
+                output.append({"fact": name, "value": final_evidence.get(name), "at": final_at})
+        return output
+
+    def _host_decision_facts(
+        self, traces: list[dict[str, Any]], cycle_context: dict[str, dict[str, Any]],
+    ) -> list[dict[str, Any]]:
         kinds = {
             "runtime_provenance_bound", "runtime_provenance_capture_failed",
             "intent_selected", "capability_preflight", "dependency_environment",
-            "budget_deferred", "stale_continuation_discarded",
+            "budget_deferred", "retry_reset", "stale_continuation_discarded",
             "terminal_task_event_discarded", "retry_scheduled", "cycle_failed",
             "task_terminal_decision", "dead_lettered",
         }
@@ -206,6 +355,7 @@ class RuntimeExperienceBuilder:
                 continue
             output.append({
                 "trace_id": trace["id"], "cycle_id": trace["cycle_id"],
+                "at": self._trace_at(trace, cycle_context, f"host:{trace['kind']}"),
                 "kind": trace["kind"], "decision": self._bounded_structure(trace["data"]),
             })
         return output
@@ -225,7 +375,9 @@ class RuntimeExperienceBuilder:
             return cls._bounded(value, 1200)
         return value
 
-    def _execution_facts(self, traces: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _execution_facts(
+        self, traces: list[dict[str, Any]], cycle_context: dict[str, dict[str, Any]],
+    ) -> list[dict[str, Any]]:
         planned: dict[tuple[str, int], list[dict[str, Any]]] = {}
         plan_refs: dict[tuple[str, int], int] = {}
         offsets: dict[tuple[str, int], int] = {}
@@ -263,6 +415,10 @@ class RuntimeExperienceBuilder:
                 "action_trace_id": plan_refs.get(key),
                 "result_trace_id": trace["id"],
                 "cycle_id": trace["cycle_id"], "round": key[1], "sequence": index,
+                "at": {
+                    **self._trace_at(trace, cycle_context, "tool_result"),
+                    "round": key[1], "sequence": index,
+                },
                 "tool": data.get("tool") or action.get("tool"),
                 "arguments": self._compact_arguments(action.get("arguments", {})),
                 "ok": bool(data.get("ok")), "error": data.get("error"),
@@ -364,7 +520,15 @@ class ModelRuntimeMutationReasoner:
             return {
                 "decision": "NO_ACTION",
                 "reason": "mock model cannot author a Runtime mutation",
-                "attribution": {"hypotheses": [], "selected": None},
+                "causal_layer": "insufficient_evidence",
+                "runtime_defect_supported": False,
+                "non_mutation_reason": "insufficient_evidence",
+                "final_disposition": {
+                    "action": "NO_ACTION", "supported_by": [],
+                    "reason": "mock model cannot author a Runtime mutation",
+                },
+                "attribution": {"hypotheses": [], "selected_hypothesis": None},
+                "attribution_consistency": {"valid": True, "schema": "runtime_attribution_consistency/v1"},
                 "model_usage": {"model_calls": 0},
             }
         attribution = self._request_json(
@@ -372,17 +536,27 @@ class ModelRuntimeMutationReasoner:
                 "You are the AIOS Runtime evolution reasoner. Analyze only the supplied observed facts. "
                 "The Host has not diagnosed the defect. Compare tool reality, evaluation, final claims, and cost; "
                 "form competing hypotheses and select the strongest. Choose up to four source files to inspect. "
+                "Treat every fact according to its at.phase/attempt/cycle coordinates; transformed output evidence "
+                "does not describe raw model output, and checkpoint metrics do not describe task_final state. "
                 "You may inspect root-of-trust files but must never propose modifying them. Return JSON only: "
-                "{decision:'INVESTIGATE'|'NO_ACTION',hypotheses:[{id,claim,evidence_refs,counterevidence}],"
-                "selected_hypothesis,inspect_files,reason}."
+                "{decision:'INVESTIGATE'|'NO_ACTION',hypotheses:[{id,claim,causal_layer,"
+                "runtime_defect,status:'supported'|'rejected'|'unresolved',evidence_refs,counterevidence}],"
+                "selected_hypothesis,inspect_files,reason,causal_layer,runtime_defect_supported,"
+                "non_mutation_reason:null|'authority_boundary'|'root_of_trust'|'safety_risk'|'insufficient_evidence',"
+                "final_disposition:{action,supported_by,reason}}."
             ),
             {"facts": facts, "source_index": source_index},
         )
         if str(attribution.get("decision", "NO_ACTION")).upper() != "INVESTIGATE":
-            return {
+            proposal = {
                 "decision": "NO_ACTION", "reason": attribution.get("reason"),
+                "causal_layer": attribution.get("causal_layer"),
+                "runtime_defect_supported": attribution.get("runtime_defect_supported"),
+                "non_mutation_reason": attribution.get("non_mutation_reason"),
+                "final_disposition": attribution.get("final_disposition"),
                 "attribution": attribution, "model_usage": {"model_calls": 1},
             }
+            return self._enforce_consistency(proposal)
         indexed = {item["path"] for item in source_index}
         selected = [
             Path(str(path)).as_posix() for path in attribution.get("inspect_files", [])
@@ -412,7 +586,11 @@ class ModelRuntimeMutationReasoner:
                 "Use the observed facts and your prior attribution. Do not weaken verification to improve fitness. "
                 "Do not modify authority, SecurityKernel, sandbox isolation, audit/storage, deployment/CLI, "
                 "experiment/evaluator code, or production. Edits use exact unique old_text replacement. Add focused "
-                "candidate tests when useful. Return JSON only: {decision:'PROPOSE'|'NO_ACTION',attribution_summary,"
+                "candidate tests when useful. Revise every investigated hypothesis to a final supported/rejected/"
+                "unresolved state after reading source. Return JSON only: {decision:'PROPOSE'|'NO_ACTION',"
+                "causal_layer,runtime_defect_supported,non_mutation_reason:null|'authority_boundary'|'root_of_trust'|"
+                "'safety_risk'|'insufficient_evidence',hypothesis_revisions:[{id,status,reason}],"
+                "final_disposition:{action,supported_by,reason},attribution_summary,"
                 "mutation_target,expected_effects,risks,patch:{edits:[{path,old_text,new_text}],"
                 "new_tests:[{path:'candidate_tests/test_*.py',content}]}}."
             ),
@@ -423,7 +601,9 @@ class ModelRuntimeMutationReasoner:
                 "mutable_files": sorted(RuntimeMutationPolicy.MUTABLE_FILES),
             },
         )
-        proposal["attribution"] = attribution
+        proposal["attribution"] = self._apply_hypothesis_revisions(
+            attribution, proposal.get("hypothesis_revisions"),
+        )
         proposal["proposed_files"] = selected
         proposal["inspected_files"] = list(sources)
         proposal["source_delivery"] = {
@@ -433,7 +613,47 @@ class ModelRuntimeMutationReasoner:
             "budget_truncated": len(sources) < len(selected) or any(not item["complete"] for item in delivery),
         }
         proposal["model_usage"] = {"model_calls": 2}
+        proposal = self._enforce_consistency(proposal)
         RuntimeMutationPolicy.validate_proposal(proposal)
+        return proposal
+
+    @staticmethod
+    def _apply_hypothesis_revisions(
+        attribution: dict[str, Any], revisions: Any,
+    ) -> dict[str, Any]:
+        revised = json.loads(json.dumps(attribution, ensure_ascii=False, default=str))
+        indexed = {
+            str(item.get("id")): item
+            for item in revised.get("hypotheses", [])
+            if isinstance(item, dict) and item.get("id")
+        }
+        for revision in revisions if isinstance(revisions, list) else []:
+            if not isinstance(revision, dict) or str(revision.get("id")) not in indexed:
+                continue
+            target = indexed[str(revision["id"])]
+            if revision.get("status") is not None:
+                target["status"] = str(revision["status"]).lower()
+            if revision.get("reason") is not None:
+                target["revision_reason"] = str(revision["reason"])
+        return revised
+
+    @staticmethod
+    def _enforce_consistency(proposal: dict[str, Any]) -> dict[str, Any]:
+        assessment = RuntimeAttributionContract.assess(proposal)
+        proposal["attribution_consistency"] = assessment
+        if assessment["valid"]:
+            return proposal
+        raw_decision = str(proposal.get("decision", "NO_ACTION")).upper()
+        proposal["rejected_inconsistent_decision"] = raw_decision
+        proposal["decision"] = "NO_ACTION"
+        proposal["runtime_defect_supported"] = False
+        proposal["non_mutation_reason"] = "insufficient_evidence"
+        proposal["final_disposition"] = {
+            "action": "NO_ACTION",
+            "supported_by": [],
+            "reason": "Host rejected an internally inconsistent causal attribution",
+        }
+        proposal["reason"] = "attribution_consistency_failed"
         return proposal
 
     def _request_json(self, system: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -468,7 +688,7 @@ class ModelRuntimeMutationReasoner:
 class RuntimeDiagnosisBenchmark:
     """Score blind Runtime reasoning after inference; annotations never enter model input."""
 
-    BENCHMARK_ID = "historical_runtime_regression/v2"
+    BENCHMARK_ID = "historical_runtime_regression/v4"
     CASES: dict[int, dict[str, Any]] = {
         64: {
             "title": "continuation duplication and resurrection",
@@ -543,6 +763,42 @@ class RuntimeDiagnosisBenchmark:
             "missing_fact_surfaces": [],
             "mutation_source_fidelity": "matched",
             "source_baseline_commit": "f14bbd6",
+        },
+        77: {
+            "title": "automatic retry inherits the exhausted prior-attempt budget",
+            "diagnosis_signals": [
+                ["automatic retry", "auto retry", "自动重试"],
+                ["attempt", "new attempt", "尝试"],
+                ["budget", "token", "model call", "预算"],
+                ["reset", "fresh", "inherit", "carried", "重置", "继承"],
+            ],
+            "relevant_files": ["src/aios/runtime.py"],
+            "expected_disposition": "PROPOSE",
+            "diagnosis_evaluable": True,
+            "missing_fact_surfaces": [],
+            "mutation_source_fidelity": "matched",
+            "source_baseline_commit": "c889869",
+            "prospective_holdout": True,
+            "frozen_record": "benchmarks/runtime/task77_holdout.json",
+        },
+        79: {
+            "title": "model execution failure correctly contained by Runtime",
+            "diagnosis_signals": [
+                ["model execution", "model output", "model behavior", "模型执行", "模型输出"],
+                ["serialized tool", "protocol repair", "tool call", "协议修复", "工具调用"],
+                ["degraded", "fallback", "降级", "回退"],
+            ],
+            "relevant_files": [],
+            "expected_disposition": "NO_ACTION",
+            "expected_causal_layer": "model_execution",
+            "disposition_reason": "Runtime produced a protocol-clean degraded result and refused false completion",
+            "diagnosis_evaluable": True,
+            "localization_evaluable": False,
+            "missing_fact_surfaces": [],
+            "mutation_source_fidelity": "not_applicable",
+            "source_baseline_commit": "c889869",
+            "negative_mutation_regression": True,
+            "frozen_record": "benchmarks/runtime/task79_negative_control.json",
         },
     }
 
@@ -623,14 +879,34 @@ class RuntimeDiagnosisBenchmark:
             and set(edited_files).issubset(set(relevant))
         )
         expected = str(annotation["expected_disposition"])
+        expected_causal_layer = annotation.get("expected_causal_layer")
+        final_disposition = (
+            proposal.get("final_disposition")
+            if isinstance(proposal.get("final_disposition"), dict) else {}
+        )
+        observed_causal_layer = (
+            proposal.get("causal_layer")
+            or final_disposition.get("causal_layer")
+            or attribution.get("causal_layer")
+        )
+        causal_layer_correct = bool(
+            expected_causal_layer
+            and str(observed_causal_layer).lower() == str(expected_causal_layer).lower()
+        ) if expected_causal_layer else diagnosis_success
+        consistency = (
+            proposal.get("attribution_consistency")
+            if isinstance(proposal.get("attribution_consistency"), dict)
+            else RuntimeAttributionContract.assess(proposal)
+        )
         diagnosis_evaluable = bool(annotation.get("diagnosis_evaluable", True))
+        localization_evaluable = bool(annotation.get("localization_evaluable", True))
         mutation_evaluable = annotation.get("mutation_source_fidelity") == "matched"
         no_action = decision == "NO_ACTION"
         no_action_correct = no_action and expected == "NO_ACTION"
         no_action_safe = no_action and not generated
         gate_passed = evaluation.get("passed") if isinstance(evaluation, dict) else None
         return {
-            "schema": "runtime_diagnosis_benchmark_case/v1",
+            "schema": "runtime_diagnosis_benchmark_case/v2",
             "benchmark_id": cls.BENCHMARK_ID,
             "annotation_digest": cls.annotation_digest(),
             "task_id": task_id,
@@ -638,17 +914,21 @@ class RuntimeDiagnosisBenchmark:
                 "title": annotation["title"],
                 "relevant_files": relevant,
                 "expected_disposition": expected,
+                "expected_causal_layer": expected_causal_layer,
                 "disposition_reason": annotation.get("disposition_reason"),
                 "not_exposed_to_reasoner": True,
             },
             "eligibility": {
                 "diagnosis_evaluable": diagnosis_evaluable,
+                "localization_evaluable": localization_evaluable,
                 "missing_fact_surfaces": list(annotation.get("missing_fact_surfaces", [])),
                 "mutation_evaluable": mutation_evaluable,
                 "mutation_source_fidelity": annotation.get("mutation_source_fidelity"),
                 "source_baseline_commit": annotation.get("source_baseline_commit"),
                 "reason": (
-                    None if diagnosis_evaluable and mutation_evaluable
+                    None if diagnosis_evaluable and (
+                        mutation_evaluable or expected == "NO_ACTION"
+                    )
                     else "Historical fact/source capsule is not temporally complete for this stage"
                 ),
             },
@@ -657,6 +937,17 @@ class RuntimeDiagnosisBenchmark:
                 "signal_recall": sum(item["passed"] for item in signal_results) / len(signal_results),
                 "signals": signal_results,
             },
+            "final_disposition": {
+                "observed": decision,
+                "expected": expected,
+                "correct": decision == expected,
+            },
+            "causal_attribution": {
+                "observed_layer": observed_causal_layer,
+                "expected_layer": expected_causal_layer,
+                "correct": causal_layer_correct,
+            },
+            "reasoning_consistency": consistency,
             "localization": {
                 "success": bool(relevant_admitted),
                 "causal_success": bool(diagnosis_success and relevant_admitted),
@@ -689,7 +980,8 @@ class RuntimeDiagnosisBenchmark:
                 "predicted": no_action,
                 "precision_eligible": no_action,
                 "correct_for_known_disposition": no_action_correct,
-                "causally_correct": bool(diagnosis_success and no_action_correct),
+                "causally_correct": no_action_correct,
+                "diagnostically_supported": bool(diagnosis_success and causal_layer_correct),
                 "epistemically_safe": no_action_safe,
             },
             "external_gate": {
@@ -708,7 +1000,7 @@ class RuntimeDiagnosisBenchmark:
         )
         if run is None:
             return {
-                "schema": "runtime_diagnosis_benchmark_case/v1",
+                "schema": "runtime_diagnosis_benchmark_case/v2",
                 "task_id": task_id,
                 "status": "missing_experiment",
             }
@@ -733,10 +1025,11 @@ class RuntimeDiagnosisBenchmark:
         no_action_cases = [item for item in scored if item["no_action"]["precision_eligible"]]
         correctly_diagnosed = [item for item in scored if item["diagnosis"]["success"]]
         diagnosis_eligible = [item for item in scored if item["eligibility"]["diagnosis_evaluable"]]
+        localization_eligible = [item for item in scored if item["eligibility"]["localization_evaluable"]]
         mutation_eligible = [item for item in scored if item["eligibility"]["mutation_evaluable"]]
         gated = [item for item in scored if item["external_gate"]["evaluated"]]
         report = {
-            "schema": "runtime_diagnosis_benchmark_suite/v1",
+            "schema": "runtime_diagnosis_benchmark_suite/v2",
             "benchmark_id": self.BENCHMARK_ID,
             "annotation_digest": self.annotation_digest(),
             "benchmark_tasks": selected,
@@ -748,6 +1041,15 @@ class RuntimeDiagnosisBenchmark:
                     sum(item["diagnosis"]["success"] for item in diagnosis_eligible)
                     / len(diagnosis_eligible) if diagnosis_eligible else None
                 ),
+                "final_disposition_accuracy": rate(
+                    lambda item: item["final_disposition"]["correct"]
+                ),
+                "causal_attribution_accuracy": rate(
+                    lambda item: item["causal_attribution"]["correct"]
+                ),
+                "reasoning_consistency_rate": rate(
+                    lambda item: item["reasoning_consistency"]["valid"]
+                ),
                 "localization_selection_accuracy": rate(
                     lambda item: item["localization"]["selection_success"]
                 ),
@@ -755,6 +1057,10 @@ class RuntimeDiagnosisBenchmark:
                     lambda item: item["localization"]["delivery_success"]
                 ),
                 "localization_accuracy": rate(lambda item: item["localization"]["success"]),
+                "localization_accuracy_eligible": (
+                    sum(item["localization"]["success"] for item in localization_eligible)
+                    / len(localization_eligible) if localization_eligible else None
+                ),
                 "localization_given_correct_diagnosis": (
                     sum(item["localization"]["success"] for item in correctly_diagnosed)
                     / len(correctly_diagnosed) if correctly_diagnosed else None
@@ -783,12 +1089,16 @@ class RuntimeDiagnosisBenchmark:
             },
             "metric_contract": {
                 "not_a_scalar_reward": True,
-                "stages_remain_separate": ["diagnosis", "localization", "mutation", "external_gate"],
+                "stages_remain_separate": [
+                    "final_disposition", "causal_attribution", "reasoning_consistency",
+                    "diagnosis", "localization", "mutation", "external_gate",
+                ],
                 "annotations_are_post_inference_only": True,
                 "historical_trace_and_source_fidelity_gate_denominators": True,
             },
             "eligibility_summary": {
                 "diagnosis_evaluable_tasks": [item["task_id"] for item in diagnosis_eligible],
+                "localization_evaluable_tasks": [item["task_id"] for item in localization_eligible],
                 "mutation_evaluable_tasks": [item["task_id"] for item in mutation_eligible],
             },
             "cases": cases,
@@ -819,48 +1129,76 @@ class RuntimeCandidateManager:
 
     def propose(self, task_id: int) -> dict[str, Any]:
         facts = self.observe(task_id)
-        index = self.experience.source_index(self.source_root)
-        proposal = self.reasoner.propose(facts, index, self.source_root)
-        if str(proposal.get("decision", "NO_ACTION")).upper() != "PROPOSE":
-            report = {
-                "status": "observed", "changed": False, "production_activated": False,
-                "task_id": task_id, "facts": facts, "proposal": proposal,
+        temporary, source_root, source_provenance = self._failure_time_source(task_id)
+        try:
+            index = self.experience.source_index(source_root)
+            proposal = self.reasoner.propose(facts, index, source_root)
+            if str(proposal.get("decision", "NO_ACTION")).upper() != "PROPOSE":
+                report = {
+                    "status": "observed", "changed": False, "production_activated": False,
+                    "task_id": task_id, "facts": facts, "proposal": proposal,
+                    "source_provenance": source_provenance,
+                }
+                self.store.add_evolution_run(f"runtime:{task_id}", facts, [], "observed", report)
+                return report
+            RuntimeMutationPolicy.validate_proposal(proposal)
+            candidate_id = f"rtc_{uuid.uuid4().hex}"
+            candidate_root = self.root / candidate_id
+            repository = candidate_root / "repo"
+            candidate_root.mkdir(parents=True)
+            self._copy_repository(repository, source_root)
+            baseline = self._manifest(repository)
+            self._apply(repository, proposal)
+            changed = self._changed_paths(repository, baseline)
+            forbidden = [
+                path for path in changed
+                if not RuntimeMutationPolicy.mutable(path)
+                and not path.startswith(RuntimeMutationPolicy.TEST_PREFIX)
+            ]
+            if forbidden:
+                shutil.rmtree(candidate_root)
+                raise RuntimeMutationPolicyError(f"Candidate modified forbidden paths: {forbidden}")
+            metadata = {
+                "schema": "runtime_candidate/v1", "candidate_id": candidate_id,
+                "source_task_id": task_id, "status": "proposed",
+                "production_activated": False, "facts_digest": facts["fact_digest"],
+                "baseline_manifest": baseline, "changed_paths": changed,
+                "source_provenance": source_provenance,
+                "proposal": proposal, "evaluation": None,
             }
-            self.store.add_evolution_run(f"runtime:{task_id}", facts, [], "observed", report)
+            self._write_json(candidate_root / "facts.json", facts)
+            self._write_json(candidate_root / "candidate.json", metadata)
+            report = {
+                "status": "proposed", "changed": True, "production_activated": False,
+                "candidate_id": candidate_id, "task_id": task_id,
+                "changed_paths": changed, "proposal": proposal,
+                "source_provenance": source_provenance,
+            }
+            self.store.add_evolution_run(f"runtime:{task_id}", facts, [], "candidate_proposed", report)
             return report
-        RuntimeMutationPolicy.validate_proposal(proposal)
-        candidate_id = f"rtc_{uuid.uuid4().hex}"
-        candidate_root = self.root / candidate_id
-        repository = candidate_root / "repo"
-        candidate_root.mkdir(parents=True)
-        self._copy_repository(repository)
-        baseline = self._manifest(repository)
-        self._apply(repository, proposal)
-        changed = self._changed_paths(repository, baseline)
-        forbidden = [
-            path for path in changed
-            if not RuntimeMutationPolicy.mutable(path)
-            and not path.startswith(RuntimeMutationPolicy.TEST_PREFIX)
-        ]
-        if forbidden:
-            shutil.rmtree(candidate_root)
-            raise RuntimeMutationPolicyError(f"Candidate modified forbidden paths: {forbidden}")
-        metadata = {
-            "schema": "runtime_candidate/v1", "candidate_id": candidate_id,
-            "source_task_id": task_id, "status": "proposed",
-            "production_activated": False, "facts_digest": facts["fact_digest"],
-            "baseline_manifest": baseline, "changed_paths": changed,
-            "proposal": proposal, "evaluation": None,
+        finally:
+            if temporary is not None:
+                temporary.cleanup()
+
+    def _failure_time_source(
+        self, task_id: int,
+    ) -> tuple[tempfile.TemporaryDirectory[str] | None, Path, dict[str, Any]]:
+        from .runtime_provenance import RuntimeProvenanceManager
+
+        provenance = RuntimeProvenanceManager(self.settings, self.store)
+        bindings = provenance.bindings(task_id)
+        if not bindings:
+            return None, self.source_root, {
+                "mode": "current_source_fallback", "source_time_aligned": False,
+            }
+        temporary = tempfile.TemporaryDirectory(prefix=f"aios-task{task_id}-source-")
+        restored = provenance.restore_execution(task_id, Path(temporary.name))
+        return temporary, Path(temporary.name), {
+            "mode": "failure_time_snapshot", "source_time_aligned": True,
+            "snapshot_id": restored["snapshot_id"],
+            "cycle_id": restored["cycle_id"],
+            "execution_manifest_hash": restored["execution_manifest_hash"],
         }
-        self._write_json(candidate_root / "facts.json", facts)
-        self._write_json(candidate_root / "candidate.json", metadata)
-        report = {
-            "status": "proposed", "changed": True, "production_activated": False,
-            "candidate_id": candidate_id, "task_id": task_id,
-            "changed_paths": changed, "proposal": proposal,
-        }
-        self.store.add_evolution_run(f"runtime:{task_id}", facts, [], "candidate_proposed", report)
-        return report
 
     def show(self, candidate_id: str) -> dict[str, Any]:
         path = self._candidate_path(candidate_id) / "candidate.json"
@@ -899,12 +1237,15 @@ class RuntimeCandidateManager:
             raise RuntimeMutationPolicyError("Runtime candidate path escapes managed root")
         return path
 
-    def _copy_repository(self, destination: Path) -> None:
+    def _copy_repository(self, destination: Path, source_root: Path | None = None) -> None:
+        source_root = (source_root or self.source_root).resolve()
         destination.mkdir(parents=True)
-        shutil.copytree(self.source_root / "src", destination / "src")
+        shutil.copytree(source_root / "src", destination / "src")
         shutil.copytree(self.source_root / "tests", destination / "tests")
         for name in ("pyproject.toml", "README.md"):
-            source = self.source_root / name
+            source = source_root / name
+            if not source.is_file():
+                source = self.source_root / name
             if source.is_file():
                 shutil.copy2(source, destination / name)
 
@@ -964,7 +1305,8 @@ class ExternalRuntimeEvaluator:
         ]
         syntax = self._syntax_gate(repository, changed)
         source_task_id = int(metadata.get("source_task_id", 0) or 0)
-        if source_task_id != 74:
+        gate_path, gate_error = self._registered_gate(source_task_id)
+        if gate_path is None:
             evaluation = {
                 "schema": "external_runtime_evaluation/v1",
                 "candidate_id": candidate_id,
@@ -979,7 +1321,7 @@ class ExternalRuntimeEvaluator:
                 "syntax_gate": syntax,
                 "external_gate": {
                     "supported": False,
-                    "reason": f"No Host-owned immutable evaluator is registered for Task {source_task_id}",
+                    "reason": gate_error,
                 },
                 "candidate_tests": {
                     "passed": False, "skipped": True,
@@ -995,8 +1337,10 @@ class ExternalRuntimeEvaluator:
             )
             return evaluation
         docker_ready = self._docker_ready()
-        baseline_gate = self._run_gate(self.settings.root) if docker_ready else self._blocked("docker unavailable")
-        candidate_gate = self._run_gate(repository) if docker_ready else self._blocked("docker unavailable")
+        baseline_gate = self._failure_time_baseline_gate(
+            source_task_id, gate_path.name,
+        ) if docker_ready else self._blocked("docker unavailable")
+        candidate_gate = self._run_gate(repository, gate_path.name) if docker_ready else self._blocked("docker unavailable")
         candidate_tests = (
             self._run_candidate_tests(repository)
             if docker_ready and (repository / "candidate_tests").is_dir()
@@ -1021,7 +1365,10 @@ class ExternalRuntimeEvaluator:
             "changed_paths": changed,
             "policy_gate": {"passed": not forbidden, "forbidden_changes": forbidden},
             "syntax_gate": syntax,
-            "task74_external_gate": {
+            "external_gate": {
+                "supported": True,
+                "task_id": source_task_id,
+                "evaluator": gate_path.name,
                 "baseline": baseline_gate,
                 "candidate": candidate_gate,
                 "required_transition": "baseline FAIL -> candidate PASS",
@@ -1035,6 +1382,16 @@ class ExternalRuntimeEvaluator:
         )
         return evaluation
 
+    def _failure_time_baseline_gate(self, task_id: int, gate_name: str) -> dict[str, Any]:
+        from .runtime_provenance import RuntimeProvenanceManager
+
+        provenance = RuntimeProvenanceManager(self.settings, self.manager.store)
+        if not provenance.bindings(task_id):
+            return self._run_gate(self.settings.root, gate_name)
+        with tempfile.TemporaryDirectory(prefix=f"aios-task{task_id}-baseline-") as directory:
+            provenance.restore_execution(task_id, Path(directory))
+            return self._run_gate(Path(directory), gate_name)
+
     @staticmethod
     def _syntax_gate(repository: Path, changed: list[str]) -> dict[str, Any]:
         errors = []
@@ -1047,10 +1404,21 @@ class ExternalRuntimeEvaluator:
                 errors.append(f"{relative}: {type(exc).__name__}: {exc}")
         return {"passed": not errors, "errors": errors}
 
-    def _run_gate(self, repository: Path) -> dict[str, Any]:
+    def _registered_gate(self, task_id: int) -> tuple[Path | None, str | None]:
+        matches = sorted(
+            path for path in self.external_root.glob(f"task{task_id}_*.py")
+            if path.is_file()
+        )
+        if not matches:
+            return None, f"No Host-owned immutable evaluator is registered for Task {task_id}"
+        if len(matches) != 1:
+            return None, f"Task {task_id} has ambiguous Host-owned evaluators: {[path.name for path in matches]}"
+        return matches[0], None
+
+    def _run_gate(self, repository: Path, gate_name: str) -> dict[str, Any]:
         return self._docker_python(
             repository,
-            ["python", "/external/task74_recovery_gate.py"],
+            ["python", f"/external/{gate_name}"],
             mount_external=True,
         )
 

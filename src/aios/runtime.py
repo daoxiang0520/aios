@@ -1614,6 +1614,17 @@ class AIOSRuntime:
             and not terminal_protocol_failure
             and guided_missing_executable_retry
         ):
+            reset = {
+                "previous_status": task.status.value,
+                "reason": "automatic_retry",
+                "failed_cycle_id": cycle_id,
+                "completed_attempt": task.attempts,
+                "next_attempt": task.attempts + 1,
+            }
+            reset_id = self.store.add_checkpoint(task_id, "retry_reset", reset)
+            self.store.trace(cycle_id, "retry_reset", {
+                "task_id": task_id, "checkpoint_id": reset_id, **reset,
+            })
             self.store.update_task(task_id, TaskStatus.RETRYING, result=result, error=error)
             payload = dict(event.payload)
             payload["task_id"] = task_id

@@ -1,9 +1,10 @@
 # Self-Evolving AIOS
 
-Current release: **v0.8.0-alpha.2.1**. This build retains the bounded Candidate
-Runtime Mutation boundary, adds failure-time Runtime provenance, and keeps the Autonomous Diagnosis Benchmark that scores
-diagnosis, source localization, mutation precision, NO_ACTION precision, and the
-external gate separately. Historical answers are post-inference annotations and
+Current release: **v0.8.0-alpha.3**. This build retains the bounded Candidate
+Runtime Mutation boundary, adds phase/attempt/cycle-bound temporal evidence, and
+adds a Host-owned attribution-consistency contract. The Autonomous Diagnosis Benchmark now scores
+final disposition, causal attribution, internal consistency, source localization,
+mutation precision, and the external gate separately. Historical answers are post-inference annotations and
 are never exposed to the Runtime reasoner. Production, Root of Trust, activation,
 and external fitness remain Host-owned and immutable.
 
@@ -25,15 +26,18 @@ and external fitness remain Host-owned and immutable.
 - `completed`、`degraded`、`blocked_capability`、`needs_authority` 等任务语义；
 - Docker-only SandboxBroker：事务工作区、资源限制、禁用宿主 Shell 回退；
 - `aiosctl` 只读状态接口与沙盒内状态快照；
-- `runtime_experience/v1` 事实 Capsule：联合投影 Tool Result、最终声明、Verifier checks 与成本，但不输出 Host 推荐修复；
+- `runtime_experience/v2` 事实 Capsule：联合投影 Tool Result、最终声明、Verifier checks 与成本；关键事实携带 phase/attempt/cycle 时间语义，但不输出 Host 推荐修复；
 - 两阶段 Runtime Evolution Reasoner：先从源码符号索引自主选择检查文件，再读取所选源码并提出最小 Candidate patch；
 - Candidate Runtime 源码快照与精确替换策略；生产源码永远不是写入目标；
 - Root of Trust 禁止变更：Authority、SecurityKernel、Sandbox、审计/存储、CLI/部署、Evolution Controller 和外部 Evaluator；
 - Host-owned Docker 外部门禁：Candidate 只读挂载、无网络、降权执行，要求 Task 74 基线 FAIL → Candidate PASS；
 - Runtime Candidate 只能进入 `needs_review/rejected`，v0.8-alpha.1 不提供自动生产激活接口；
-- Autonomous Diagnosis Benchmark 覆盖 Task 64/67/70/72/74，分别测量 Diagnosis、Localization、Mutation 与 External Gate，不压成单一 reward；
+- Autonomous Diagnosis Benchmark 覆盖 Task 64/67/70/72/74/77/79，分别测量 Final Disposition、Causal Attribution、Reasoning Consistency、Localization、Mutation 与 External Gate，不压成单一 reward；
 - 历史 defect 标注只在模型推理完成后用于离线评分，不进入 Experience Capsule、源码索引或 Reasoner prompt；
 - `NO_ACTION` 同时区分“没有强行修改”的 epistemic safety 与“符合已知最优处置”的 precision；
+- Task 77 首次 prospective holdout 已永久冻结为 Regression Case：相关源码选择与完整投递成功，但两次 Reasoner 均未识别自动重试继承旧 Attempt 预算的因果链；后续人工修复不得改写首次成绩；
+- Task 79 已冻结为 Negative Mutation Regression：`NO_ACTION` 最终处置正确，但 causal layer 与假设生命周期错误；它与 Task 77 组成 `SHOULD_NOT_MUTATE / SHOULD_MUTATE` 判别对；
+- Reasoner hypothesis 具有 `supported/rejected/unresolved` 最终状态；Host 确定性检查 hypothesis、runtime-defect judgment 与 final disposition，矛盾输出被安全收敛为可审计的 `NO_ACTION/attribution_consistency_failed`，不得生成 Candidate；
 - Localization 分开记录模型 `proposed_files`、Host `admitted_files`、首个相关文件排名与源码预算裁剪，避免把检索预算问题误记为模型定位失败；
 - Historical Benchmark v2 对 Trace 事实完整性和 failure-era source fidelity 设置 eligibility gate；故障 Trace 配修复后源码的 Case 不进入有效 Diagnosis/Mutation 分母；
 - 每个新 Task Cycle 在 Intent/Preflight 前绑定内容寻址的 execution-runtime 与 evaluator 源码快照；跨 Cycle 相同对象自动去重；

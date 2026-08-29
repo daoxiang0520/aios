@@ -1,5 +1,19 @@
 # AIOS v0.6 实现与测试报告
 
+## v0.8.0-alpha.3 Temporal + Attribution Consistency（2026-08-29）
+
+Task 77 与 Task 79 形成首组 Runtime failure discrimination pair：Task 77 是 Runtime 确有 Attempt-budget 生命周期缺陷却错误 `NO_ACTION`；Task 79 是模型未完成论文到程序的转换、最终协议修复失败，而 Runtime 正确生成合法 `degraded` 结果并阻止假完成。Task 79 的最终 `NO_ACTION` 正确，但仍保留 `selected_hypothesis=H3/controller fallback defect`，并把 post-fallback 合法输出误作 raw model output 证据、把中间 checkpoint 预算误作任务最终预算。因此本版不扩大 mutation surface，只强化 Perception 与结构一致性。
+
+- `runtime_experience/v2` 为 Tool Result、Final Claim、Evaluation 与 Host Decision 统一附加 `at.phase/attempt/task_cycle/cycle_id/observed_at`；
+- 新增 `temporal_evidence`：`budget_deferred` 中的 used/remaining budget 固定标记为 `phase=checkpoint`，最终 `model_tokens/model_api_calls/task_cycles` 固定标记为 `phase=task_final`，禁止跨时间切片偷换；
+- 两阶段 Reasoner contract 要求 hypothesis 包含 `causal_layer`、`runtime_defect` 与最终 `supported/rejected/unresolved` 状态；读取源码后通过 `hypothesis_revisions` 显式记录状态转换；
+- Host-owned `RuntimeAttributionContract` 确定性验证 final disposition、supported hypothesis 与 runtime-defect judgment。若 `NO_ACTION` 仍保留 supported mutable Runtime defect，且不存在 authority/root-of-trust/safety/insufficient-evidence 原因，则标记结构不一致并安全拒绝 Candidate；
+- Benchmark 升级为 `historical_runtime_regression/v4`，独立输出 `final_disposition.correct`、`causal_attribution.correct` 与 `reasoning_consistency.valid`，不再用一个 decision accuracy 掩盖错误归因；
+- Task 79 冻结为 `benchmarks/runtime/task79_negative_control.json`：`FinalDisposition PASS / CausalAttribution FAIL / ReasoningConsistency FAIL / NO_ACTION causally correct`；与 Task 77 的 `SHOULD_MUTATE` 组成最小判别回归对；
+- 不修改 Controller fallback、不放宽 Verifier，也不加入 PDF 任务策略 prompt。Host 只约束证据时点和逻辑自洽，模型仍负责因果判断。
+
+alpha.3 专项测试 **21/21** 通过。对冻结的真实 Evolution Run 20/22 执行离线 Task 77/79 判别回归：`FinalDispositionAccuracy=0.5`、`CausalAttributionAccuracy=0`、`ReasoningConsistencyRate=0`，准确保留了“Task 77 错误 NO_ACTION / Task 79 正确 NO_ACTION 但错误归因”的差异。完整套件共 168 项：163 通过，3 项因 Docker daemon 不可用跳过，2 项既有 v0.5 网络能力测试因同一 Docker 健康前置条件失败；失败文件与本版修改的 Runtime Evolution 面无代码交集，未通过放宽 capability 判断掩盖环境失败。
+
 ## v0.8.0-alpha.2 Autonomous Diagnosis Benchmark（2026-08-28）
 
 本版本不扩大生产 mutation surface，也不为 Task 74 人工指定 `evaluation.py`。目标是把 Autonomous Runtime Repair 拆成可测量的四段：`Diagnosis → Localization → Mutation → External Gate`，先判断系统究竟卡在哪一段，再决定是否需要 alpha.3 的 causal source index 或 bounded source expansion。
@@ -438,6 +452,14 @@ alpha.2 的盲测证明：历史 Trace 若缺少 Host 决策事实，或故障 T
 7. 新增 CLI：`python -m aios --config config.json evolution runtime-provenance <task_id>`，同时输出全部 binding 与 eligibility assessment。
 
 专项回归覆盖内容寻址去重、按 Cycle 恢复、Host 决策 Capsule、Diagnosis/Repair 分层资格、external gate 要求以及对象篡改撤销。专项 v0.8 测试 15/15 通过；完整测试 160/160 通过，包含真实 Docker 用例且无跳过。旧 Task 64/67/70/72 不做追溯重建，继续保持 `source fidelity unavailable`；Task 74 仍只按已有真实材料评价。
+
+### Task 77 Prospective Holdout 与人工确认修复（2026-08-29）
+
+Task 77 是首个 provenance-complete Future Holdout。首次盲诊与建立 Gate 后的第二次 repair attempt 均返回 `NO_ACTION`；两次运行共享 `fact_digest=3d4a66c47dc4adbdc45824e47579e1fed9666730a18fd042d5ac0afb1276de2e`。第二次明确使用 failure-time snapshot，且 `runtime.py` 被完整交付，但 Reasoner 仍将失败归因于 Agent 重复读取和未完成项目，没有识别 `Attempt 1 budget exhausted → automatic retry → old budget inherited → Attempt 2 starts exhausted`。因此首次成绩永久冻结为 `Diagnosis FAIL / Localization+Delivery opportunity PASS / Mutation absent / NO_ACTION causally incorrect`，并转入 Regression Case；后续修复不得改写 Holdout 成绩。
+
+Host-owned Task 77 Gate 固化一般语义 `BudgetLifetime = Attempt`，覆盖：同一 Attempt continuation 继承、自动重试重置、人工重试重置、近耗尽重试获得完整预算、达到最大次数不再重试。人工确认根因后，Host 在自动 `_handle_failure()` 安排新 Attempt 时建立预算重置边界；未修改 Verifier、Reasoner 或 Prompt，也未增加 retry 专用认知规则。
+
+真实 Docker 反事实结果：failure-time baseline `FAIL`，其中自动重试和近耗尽重试两项失败；当前修复 `PASS`，全部语义检查通过。Runtime Diagnosis Benchmark 升级到 v3 并纳入 Task 77 的冻结标注。预算专项 6/6、v0.8 专项 18/18、完整回归 165/165 全部通过，无跳过。本次结果定义为 `HumanDiagnosis + ExternallyVerifiedFix`，不宣称 Autonomous Repair。
 
 ## v0.6.6.2 Context Working Set & Continuation Efficiency（2026-08-28）
 

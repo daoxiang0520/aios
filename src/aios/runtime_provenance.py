@@ -151,7 +151,7 @@ class RuntimeProvenanceManager:
                 f"task{task_id}_*.py"
             ) if path.is_file()
         )
-        external_gate_available = bool(external_gates)
+        external_gate_available = len(external_gates) == 1
         diagnosis_eligible = trace_sufficient
         repair_eligible = bool(
             diagnosis_eligible
@@ -178,6 +178,10 @@ class RuntimeProvenanceManager:
             "bound_cycle_ids": sorted(bound_cycles),
             "snapshot_ids": [item.get("snapshot_id") for item in bindings],
             "external_gates": external_gates,
+            "external_gate_state": (
+                "available" if len(external_gates) == 1
+                else "missing" if not external_gates else "ambiguous"
+            ),
             "integrity": integrity,
             "contract": {
                 "diagnosis_eligible": "TraceSufficient",

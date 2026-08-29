@@ -11,6 +11,7 @@ from aios.config import Settings
 from aios.runtime_evolution import (
     ExternalRuntimeEvaluator,
     ModelRuntimeMutationReasoner,
+    RuntimeAttributionContract,
     RuntimeCandidateManager,
     RuntimeDiagnosisBenchmark,
     RuntimeExperienceBuilder,
@@ -61,14 +62,33 @@ class StubTwoStageReasoner(ModelRuntimeMutationReasoner):
             return {
                 "decision": "INVESTIGATE",
                 "hypotheses": [
-                    {"id": "H1", "claim": "model strategy", "evidence_refs": ["trace:2"]},
-                    {"id": "H2", "claim": "evaluation semantics", "evidence_refs": ["trace:4"]},
+                    {
+                        "id": "H1", "claim": "model strategy", "causal_layer": "model_execution",
+                        "runtime_defect": False, "status": "unresolved", "evidence_refs": ["trace:2"],
+                    },
+                    {
+                        "id": "H2", "claim": "evaluation semantics", "causal_layer": "runtime",
+                        "runtime_defect": True, "status": "unresolved", "evidence_refs": ["trace:4"],
+                    },
                 ],
                 "selected_hypothesis": "H2",
                 "inspect_files": ["src/aios/evaluation.py"],
                 "reason": "cross-layer facts disagree",
             }
-        return StubRuntimeReasoner().propose(None, None, None)
+        proposal = StubRuntimeReasoner().propose(None, None, None)
+        proposal.update({
+            "causal_layer": "runtime",
+            "runtime_defect_supported": True,
+            "non_mutation_reason": None,
+            "hypothesis_revisions": [
+                {"id": "H1", "status": "rejected", "reason": "tool evidence contradicts it"},
+                {"id": "H2", "status": "supported", "reason": "source confirms the defect"},
+            ],
+            "final_disposition": {
+                "action": "PROPOSE", "supported_by": ["H2"], "reason": "Runtime defect confirmed",
+            },
+        })
+        return proposal
 
 
 class V080CandidateRuntimeMutationTests(unittest.TestCase):
@@ -115,7 +135,9 @@ class V080CandidateRuntimeMutationTests(unittest.TestCase):
             "evidence": {"model_api_calls": 16, "model_tokens": 188327, "failed_actions": 1}
         })
         self.cycle = "task74-cycle"
-        self.store.add_checkpoint(self.task_id, "started", {"cycle_id": self.cycle})
+        self.store.add_checkpoint(self.task_id, "started", {
+            "cycle_id": self.cycle, "attempt": 1, "task_cycle": 1,
+        })
         self.store.trace(self.cycle, "plan_created", {
             "round": 1, "done": False, "summary": "compile",
             "actions": [{"tool": "bash", "arguments": {"command": "g++ solution.cpp"}}],
@@ -148,6 +170,33 @@ class V080CandidateRuntimeMutationTests(unittest.TestCase):
         self.assertTrue(check["passed"])
         self.assertTrue(facts["observation_contract"]["no_host_recommended_fix"])
         self.assertNotIn("recommended_fix", facts)
+        self.assertEqual(facts["schema"], "runtime_experience/v2")
+        self.assertEqual(facts["executions"][0]["at"]["attempt"], 1)
+        final_tokens = next(
+            item for item in facts["temporal_evidence"] if item["fact"] == "model_tokens"
+        )
+        self.assertEqual(final_tokens["at"]["phase"], "task_final")
+
+    def test_temporal_evidence_keeps_checkpoint_budget_distinct_from_task_final(self):
+        self.store.add_checkpoint(self.task_id, "budget_deferred", {
+            "cycle_id": self.cycle,
+            "budget": {"used_tokens": 200000, "used_model_calls": 18},
+            "remaining": {"tokens": 100000, "model_calls": 6},
+        })
+        self.store.update_task(self.task_id, TaskStatus.DEGRADED, result={
+            "evidence": {"model_api_calls": 25, "model_tokens": 282797, "task_cycles": 4}
+        })
+        facts = RuntimeExperienceBuilder(self.store).build(self.task_id)
+        checkpoint_remaining = next(
+            item for item in facts["temporal_evidence"] if item["fact"] == "remaining.tokens"
+        )
+        final_tokens = next(
+            item for item in facts["temporal_evidence"] if item["fact"] == "model_tokens"
+        )
+        self.assertEqual(checkpoint_remaining["value"], 100000)
+        self.assertEqual(checkpoint_remaining["at"]["phase"], "checkpoint")
+        self.assertEqual(final_tokens["value"], 282797)
+        self.assertEqual(final_tokens["at"]["phase"], "task_final")
 
     def test_two_stage_reasoner_selects_source_before_receiving_code(self):
         reasoner = StubTwoStageReasoner()
@@ -159,6 +208,9 @@ class V080CandidateRuntimeMutationTests(unittest.TestCase):
         self.assertNotIn("selected_sources", reasoner.calls[0][1])
         self.assertEqual(proposal["inspected_files"], ["src/aios/evaluation.py"])
         self.assertEqual(proposal["attribution"]["selected_hypothesis"], "H2")
+        states = {item["id"]: item["status"] for item in proposal["attribution"]["hypotheses"]}
+        self.assertEqual(states, {"H1": "rejected", "H2": "supported"})
+        self.assertTrue(proposal["attribution_consistency"]["valid"])
         self.assertNotIn("blind_annotation", json.dumps(reasoner.calls[0][1]))
         self.assertNotIn("relevant_files", json.dumps(reasoner.calls[0][1]))
 
@@ -183,6 +235,78 @@ class V080CandidateRuntimeMutationTests(unittest.TestCase):
         self.assertFalse(result["mutation"]["generated"])
         self.assertTrue(result["no_action"]["epistemically_safe"])
         self.assertFalse(result["no_action"]["correct_for_known_disposition"])
+
+    def test_task77_frozen_holdout_scores_causal_diagnosis_failure(self):
+        proposal = {
+            "decision": "NO_ACTION",
+            "attribution_summary": (
+                "The agent reread README and did not finish before budget exhaustion; "
+                "the Runtime is working as designed."
+            ),
+            "attribution": {
+                "inspect_files": ["src/aios/runtime.py", "src/aios/evaluation.py"],
+                "hypotheses": [{"claim": "Agent behavior caused incomplete work"}],
+            },
+            "proposed_files": ["src/aios/runtime.py", "src/aios/evaluation.py"],
+            "inspected_files": ["src/aios/runtime.py"],
+            "source_delivery": {
+                "admitted_files": ["src/aios/runtime.py"],
+                "budget_truncated": True,
+            },
+        }
+        result = RuntimeDiagnosisBenchmark.score(77, proposal)
+        self.assertFalse(result["diagnosis"]["success"])
+        self.assertTrue(result["localization"]["selection_success"])
+        self.assertTrue(result["localization"]["delivery_success"])
+        self.assertFalse(result["localization"]["causal_success"])
+        self.assertTrue(result["no_action"]["epistemically_safe"])
+        self.assertFalse(result["no_action"]["correct_for_known_disposition"])
+
+    def test_task79_negative_control_separates_disposition_attribution_and_consistency(self):
+        proposal = {
+            "decision": "NO_ACTION",
+            "attribution_summary": (
+                "The model emitted a serialized tool call; protocol repair failed, but the fallback "
+                "correctly produced a protocol-clean degraded answer."
+            ),
+            "attribution": {
+                "decision": "INVESTIGATE",
+                "selected_hypothesis": "H3",
+                "hypotheses": [{
+                    "id": "H3", "claim": "controller fallback defect", "causal_layer": "runtime",
+                    "runtime_defect": True, "status": "supported",
+                }],
+                "inspect_files": ["src/aios/controller.py", "src/aios/runtime.py"],
+            },
+            "proposed_files": ["src/aios/controller.py", "src/aios/runtime.py"],
+        }
+        result = RuntimeDiagnosisBenchmark.score(79, proposal)
+        self.assertTrue(result["final_disposition"]["correct"])
+        self.assertEqual(result["causal_attribution"]["expected_layer"], "model_execution")
+        self.assertFalse(result["causal_attribution"]["correct"])
+        self.assertFalse(result["reasoning_consistency"]["valid"])
+        self.assertTrue(result["no_action"]["causally_correct"])
+        self.assertFalse(result["no_action"]["diagnostically_supported"])
+
+    def test_host_safely_rejects_inconsistent_runtime_no_action(self):
+        proposal = {
+            "decision": "NO_ACTION",
+            "runtime_defect_supported": True,
+            "attribution": {
+                "selected_hypothesis": "H1",
+                "hypotheses": [{
+                    "id": "H1", "claim": "mutable Runtime defect", "causal_layer": "runtime",
+                    "runtime_defect": True, "status": "supported",
+                }],
+            },
+            "final_disposition": {"action": "NO_ACTION", "supported_by": ["H1"]},
+        }
+        assessment = RuntimeAttributionContract.assess(proposal)
+        self.assertFalse(assessment["valid"])
+        safe = ModelRuntimeMutationReasoner._enforce_consistency(proposal)
+        self.assertEqual(safe["decision"], "NO_ACTION")
+        self.assertEqual(safe["reason"], "attribution_consistency_failed")
+        self.assertEqual(safe["rejected_inconsistent_decision"], "NO_ACTION")
 
     def test_localization_rank_separates_model_selection_from_host_delivery(self):
         proposal = {
@@ -277,6 +401,27 @@ class V080CandidateRuntimeMutationTests(unittest.TestCase):
         self.assertTrue((candidate / "candidate_tests" / "test_recovery.py").is_file())
         self.assertFalse(report["production_activated"])
 
+    def test_candidate_uses_failure_time_source_instead_of_current_source(self):
+        provenance = RuntimeProvenanceManager(self.settings, self.store)
+        provenance.capture_cycle(self.task_id, "failure-time-source")
+        production_path = self.root / "src" / "aios" / "evaluation.py"
+        current = production_path.read_text(encoding="utf-8")
+        production_path.write_text(
+            current.replace(
+                "recovered = failures > 0 and task_done", "recovered = True",
+            ),
+            encoding="utf-8",
+        )
+        manager = RuntimeCandidateManager(self.settings, self.store, StubRuntimeReasoner())
+        report = manager.propose(self.task_id)
+        candidate = manager.repository(report["candidate_id"])
+        candidate_source = (candidate / "src" / "aios" / "evaluation.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("recovered = False", candidate_source)
+        self.assertNotIn("recovered = True", candidate_source)
+        self.assertEqual(report["source_provenance"]["mode"], "failure_time_snapshot")
+
     def test_root_of_trust_edit_is_rejected_before_snapshot(self):
         proposal = StubRuntimeReasoner().propose(None, None, None)
         proposal["patch"]["edits"][0]["path"] = "src/aios/security.py"
@@ -307,6 +452,24 @@ class V080CandidateRuntimeMutationTests(unittest.TestCase):
         self.assertEqual(result["selection"], "unsupported_external_gate")
         self.assertFalse(result["external_gate"]["supported"])
         self.assertFalse(result["candidate_tests"]["passed"])
+
+    def test_external_evaluator_resolves_one_task_specific_gate(self):
+        external = self.root / "external_evaluators"
+        external.mkdir()
+        gate = external / f"task{self.task_id}_semantic.py"
+        gate.write_text("raise SystemExit(1)\n", encoding="utf-8")
+        manager = RuntimeCandidateManager(self.settings, self.store, StubRuntimeReasoner())
+        evaluator = ExternalRuntimeEvaluator(self.settings, manager)
+        resolved, error = evaluator._registered_gate(self.task_id)
+        self.assertEqual(resolved, gate)
+        self.assertIsNone(error)
+
+        (external / f"task{self.task_id}_duplicate.py").write_text(
+            "raise SystemExit(1)\n", encoding="utf-8",
+        )
+        resolved, error = evaluator._registered_gate(self.task_id)
+        self.assertIsNone(resolved)
+        self.assertIn("ambiguous", error)
 
     def test_runtime_provenance_is_content_addressed_and_restorable(self):
         manager = RuntimeProvenanceManager(self.settings, self.store)

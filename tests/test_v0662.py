@@ -115,6 +115,47 @@ class V0662ContextEfficiencyTests(unittest.TestCase):
         self.assertEqual(budget.used_model_calls, 0)
         self.assertEqual(state["objective"], "new")
 
+    def test_automatic_retry_starts_a_fresh_attempt_budget(self) -> None:
+        runtime = AIOSRuntime(self.settings)
+        task_id = runtime.store.create_task(Task("x", "x"))
+        task = runtime.store.start_task_attempt(task_id)
+        runtime.store.add_checkpoint(task_id, "budget_deferred", {
+            "budget": {
+                "used_model_calls": 3, "used_tool_calls": 7,
+                "used_tokens": 9000, "used_cycles": 3,
+            },
+            "working_state": {"objective": "old"},
+        })
+        runtime._handle_failure(
+            task, Event("TASK_REQUEST", {"task_id": task_id, "message": "x"}),
+            [], "Verification failed: task_declared_done", "failed-cycle", {},
+        )
+        budget = runtime._task_budget(task_id)
+        state = runtime._task_working_state(task_id, "new")
+        self.assertEqual(budget.used_model_calls, 0)
+        self.assertEqual(budget.used_tool_calls, 0)
+        self.assertEqual(budget.used_tokens, 0)
+        self.assertEqual(budget.used_cycles, 0)
+        self.assertEqual(state["objective"], "new")
+        self.assertEqual(runtime.store.get_task(task_id).status.value, "retrying")
+        self.assertEqual(runtime.store.count_pending_events(), 1)
+
+    def test_continuation_still_inherits_budget_with_automatic_retry_fix(self) -> None:
+        runtime = AIOSRuntime(self.settings)
+        task_id = runtime.store.create_task(Task("x", "x"))
+        runtime.store.add_checkpoint(task_id, "budget_deferred", {
+            "budget": {
+                "used_model_calls": 3, "used_tool_calls": 2,
+                "used_tokens": 9000, "used_cycles": 2,
+            },
+            "working_state": {"objective": "continued"},
+        })
+        budget = runtime._task_budget(task_id)
+        state = runtime._task_working_state(task_id, "new")
+        self.assertEqual(budget.used_model_calls, 3)
+        self.assertEqual(budget.used_tokens, 9000)
+        self.assertEqual(state["objective"], "continued")
+
 
 if __name__ == "__main__":
     unittest.main()

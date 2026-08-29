@@ -1,0 +1,60 @@
+{
+  "schema": "prospective_runtime_holdout/v1",
+  "task_id": 77,
+  "status": "frozen_regression_case",
+  "holdout_first": true,
+  "annotation_created_after_reasoner_runs": true,
+  "facts_digest": "3d4a66c47dc4adbdc45824e47579e1fed9666730a18fd042d5ac0afb1276de2e",
+  "failure_time_source": {
+    "snapshot_id": "rps_38d68dc8ec605ade6202bd3bc284d213afb468783d98def5bc2db50565a3c3fb",
+    "execution_manifest_hash": "ebcbc88d7cb3cddcc13b3d50ee9895ecf7420ff0c7c205e76db3398e331fc35e",
+    "source_time_aligned": true
+  },
+  "blind_runs": [
+    {
+      "phase": "initial_autonomous_diagnosis",
+      "evolution_run_id": 19,
+      "proposal_digest": "c89d3494b3fa716c88c6410316fd186224a7d298be8f0979242e11c3c5d78c57",
+      "decision": "NO_ACTION",
+      "autonomous_diagnosis": "failed"
+    },
+    {
+      "phase": "post_gate_repair_attempt",
+      "evolution_run_id": 20,
+      "proposal_digest": "ced19ce948c0b6ec2f1dc7aa2dabffd1fdc8ffe2d3b04b257bb2a42636d9eb18",
+      "decision": "NO_ACTION",
+      "autonomous_diagnosis": "failed",
+      "failure_time_source_used": true
+    }
+  ],
+  "frozen_score": {
+    "diagnosis_success": false,
+    "relevant_source_selected": true,
+    "relevant_source_delivered": true,
+    "relevant_source_complete": true,
+    "mutation_generated": false,
+    "external_gate_available": true,
+    "external_gate_executed": false,
+    "no_action_epistemically_safe": true,
+    "no_action_causally_correct": false,
+    "failure_stage": "causal_diagnosis"
+  },
+  "human_ground_truth": {
+    "semantic_invariant": "BudgetLifetime = Attempt",
+    "causal_chain": [
+      "first attempt nearly exhausts TaskBudget",
+      "automatic retry is scheduled",
+      "automatic retry does not establish a fresh attempt budget boundary",
+      "the prior budget_deferred state is inherited",
+      "the next attempt starts nearly exhausted",
+      "the retry cannot make meaningful progress"
+    ],
+    "fix_class": "HumanDiagnosis + ExternallyVerifiedFix"
+  },
+  "research_contract": {
+    "may_be_used_as_future_holdout_again": false,
+    "may_be_used_as_regression": true,
+    "later_success_must_not_overwrite_blind_score": true,
+    "annotation_not_exposed_to_reasoner": true
+  }
+}
