@@ -1,13 +1,10 @@
 # Self-Evolving AIOS
 
-Current release: **v0.8.0-alpha.6**. This build retains alpha.5's invariant-guided
-attribution while replacing ambiguous model/Host fields with a typed, machine-grounded
-Evolution Protocol. The Autonomous Diagnosis Benchmark now scores final disposition,
-causal attribution, schema canonicalization, invariant attribution, typed-protocol validity,
-internal consistency, source localization, Mutation Semantic
-Precision, and the external gate separately. Historical answers are post-inference annotations and
-are never exposed to the Runtime reasoner. Production, Root of Trust, activation,
-and external fitness remain Host-owned and immutable.
+Current release: **v0.8.0-alpha.6.1**. This correctness patch makes Windows sandbox
+discard robust to ReadOnly files and separates immutable model attribution, model-intended
+disposition, and effective Host disposition in Evolution records. It adds observational
+measurement for source support and unsupported Agent-action claims without changing the
+Reasoner prompt, mutation surface, production activation policy, or external fitness authority.
 
 ## Agent Workbench（第一版）
 
@@ -65,6 +62,10 @@ python -m aios --config config.json run
 - alpha.6 的最终 action 严格限定为 `PROPOSE / NO_ACTION`。Mutation Boundary 作为 Host-owned `runtime_mutation_boundary/v2` 事实提供，明确 `src/aios/evaluation.py` 可变而 `external_evaluators/` 不可变；模型不再从自然语言文件名猜测权限；
 - Future Holdout Task 83 首次在未见 Runtime Experience 上得到近似正确诊断、正确 Verifier 定位和正确 Mutation 意图，但正则化 goal matching 补丁语义不安全且未创建 Candidate；Run 39 已冻结且不重采样；
 - Host-owned Task 83 gate 以显式等价后置条件证明定义 compensation，不接受命令字符串相似、任意后续成功或部分补偿；`model_intended_decision` 作为不可变观察证据保存，Host rejection 只改变 effective decision；
+- alpha.6.1 修复 Windows ReadOnly 文件导致 Sandbox discard/下一 Attempt prepare 连续失败的问题；`.git` 元数据不进入 workspace commit，生产工作区隔离保持不变；
+- Evolution Run 分开保存 `model_attribution / model_intended_disposition / effective_host_disposition`，模型跨阶段改变 Runtime-defect 判断但没有显式 hypothesis revision 时，仅标记 attribution inconsistency；Host 不替模型选择真值；
+- Benchmark 只新增轻量事实测量：`source_support` 区分相关源码是否选择/投递，`unsupported_action_claim` 核对模型明确声称的 Agent 行为是否存在于 Action History；二者都不是 Reasoner 硬门禁；
+- Task 84 作为冻结 Root-of-Trust abstention regression：Runtime bug 存在但 `sandbox.py` 不可由 Evolution 修改，期望 `NO_ACTION / authority_boundary|root_of_trust / sandbox_lifecycle`，不重跑原盲测；
 - DeepSeek Runtime Evolution 请求继续启用官方 `response_format={"type":"json_object"}`，并新增真实 JSON 样例及单顶层文档 framing；只允许剥离完整外层 Markdown fence，多个 JSON 文档绝不猜选。空内容、截断、双文档等失败会形成不含原文的 `protocol_failed` Evolution Run，且不自动重采样；
 - Mutation Semantic Precision 保持向量指标：`contract_valid / source_relevant / path_reachable / gate_effective / regression_safe`，不折叠成单一奖励分数；
 - Reasoner hypothesis 具有 `supported/rejected/unresolved` 最终状态；Host 确定性检查 hypothesis、runtime-defect judgment 与 final disposition，矛盾输出被安全收敛为可审计的 `NO_ACTION/attribution_consistency_failed`，不得生成 Candidate；

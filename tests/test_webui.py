@@ -56,6 +56,21 @@ class WebUITest(unittest.TestCase):
         self.assertEqual(run["model_intended_decision"], "PROPOSE")
         self.assertEqual(run["effective_host_decision"], "NO_ACTION")
 
+    def test_topbar_remains_visible_when_narrow_layout_scrolls(self) -> None:
+        css = (self.app.assets / "app.css").read_text(encoding="utf-8")
+        self.assertIn(".topbar{position:sticky;top:0;z-index:20}", css)
+        self.assertIn("html,body{height:100%;overflow:hidden}", css)
+        self.assertIn("height:calc(100dvh - 64px);overflow:hidden", css)
+        self.assertIn("grid-template-columns:1fr", css)
+        self.assertIn(".tasks-panel,.work-panel,.activity-panel{min-height:0;overflow:hidden}", css)
+        self.assertIn(".composer{position:absolute}", css)
+        self.assertIn(".task-header{flex:0 0 76px}.tabs{flex:0 0 44px}", css)
+        self.assertIn(".tabs{overflow-x:auto;overflow-y:hidden", css)
+        self.assertIn(".tabs button{flex:0 0 auto}", css)
+        javascript = (self.app.assets / "app.js").read_text(encoding="utf-8")
+        self.assertIn("taskTabs.scrollLeft+=e.deltaY", javascript)
+        self.assertIn('button.scrollIntoView({behavior:"smooth"', javascript)
+
 
 if __name__ == "__main__":
     unittest.main()

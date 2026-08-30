@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -245,7 +247,7 @@ class DockerSandboxBroker:
         if session_root.parent != self.root:
             raise ValueError("Invalid sandbox session path")
         if session_root.exists():
-            shutil.rmtree(session_root)
+            self._remove_tree(session_root)
         session_root.mkdir(parents=True)
         snapshot = session_root / "workspace"
         state_path = session_root / "state"
@@ -522,7 +524,7 @@ class DockerSandboxBroker:
     def purge_task_dependencies(self, task_id: int) -> None:
         path = (self.dependencies_root / f"task_{task_id}").resolve()
         if path.parent == self.dependencies_root and path.exists():
-            shutil.rmtree(path)
+            self._remove_tree(path)
 
     def _effective_timeout(self, requested: int | None) -> int:
         value = self.config.default_timeout_seconds if requested is None else int(requested)
@@ -586,7 +588,19 @@ class DockerSandboxBroker:
         session_root = self.session.path.parent
         self.session = None
         if session_root.parent == self.root and session_root.exists():
-            shutil.rmtree(session_root)
+            self._remove_tree(session_root)
+
+    @staticmethod
+    def _remove_tree(path: Path) -> None:
+        """Remove a managed tree even when containers created Windows read-only files."""
+        def make_writable_and_retry(function: Any, target: str, exc_info: Any) -> None:
+            error = exc_info[1]
+            if not isinstance(error, PermissionError):
+                raise error
+            os.chmod(target, stat.S_IWRITE | stat.S_IREAD)
+            function(target)
+
+        shutil.rmtree(path, onerror=make_writable_and_retry)
 
     @staticmethod
     def _manifest(root: Path) -> dict[str, str]:
@@ -595,7 +609,10 @@ class DockerSandboxBroker:
         manifest: dict[str, str] = {}
         for path in root.rglob("*"):
             if path.is_file():
-                manifest[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+                relative = path.relative_to(root)
+                if ".git" in relative.parts:
+                    continue
+                manifest[relative.as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
         return manifest
 
 
