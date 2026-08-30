@@ -1,0 +1,90 @@
+{
+  "schema": "runtime_future_holdout/v1",
+  "holdout_id": "task83_run39_2026-08-30",
+  "recorded_at": "2026-08-30",
+  "task": {
+    "id": 83,
+    "title": "读取，复现并验证https://github.com/daoxiang0520/mmwave-gesture-pointcloud-dataset",
+    "status": "dead_letter",
+    "attempts": 3,
+    "error": "Verification failed: tool_failures_recovered, task_declared_done"
+  },
+  "holdout_validity": {
+    "future_holdout": true,
+    "unseen_runtime_experience": true,
+    "targeted_variant_of_tasks_77_79_80": false,
+    "human_diagnosis_exposed_before_inference": false,
+    "runtime_propose_invocations": 1,
+    "resamples": 0,
+    "failure_time_source_used": true,
+    "evidence_catalog_used": true,
+    "mutation_boundary_used": true,
+    "symbol_index_used": true
+  },
+  "freeze": {
+    "base_git_commit": "77e6bf80d7459bfe2c04aa55a3cea3ce4d1f364c",
+    "version": "0.8.0a6",
+    "runtime_evolution_sha256_at_inference": "1F259F8DFB0AB7DD0F6981754FB5734B8158461F910A24D85443B7308C62DD4E",
+    "execution_snapshot_id": "rps_df84803ede92ebe78e0bd7e0993e59cbcd59105cc45d4fec77f9fe8798010aa7",
+    "execution_manifest_hash": "ae9aeee0e5b85e16f7adf54c21aa3f9f9c693f9815c301264b7b66c623456480",
+    "source_time_aligned": true,
+    "evidence_namespace_size": 245,
+    "api_key_persisted_or_disclosed": false
+  },
+  "inference_result": {
+    "evolution_run_id": 39,
+    "persisted_status": "observed",
+    "model_intended_decision": "PROPOSE",
+    "effective_host_decision": "NO_ACTION",
+    "host_rejection_reason": "patch_causality_contract_failed",
+    "causal_layer": "evaluation",
+    "selected_hypothesis": "H1",
+    "typed_protocol_valid": true,
+    "attribution_consistency_valid": true,
+    "invariant_attribution_valid": true,
+    "patch_causality_valid": false,
+    "patch_causality_errors": [
+      "reachable patch is missing required inputs"
+    ],
+    "required_inputs_available": false,
+    "candidate_created": false,
+    "production_activated": false
+  },
+  "post_inference_human_assessment": {
+    "diagnosis": "mostly_correct",
+    "localization": "correct",
+    "mutation_intent": "correct",
+    "patch_semantic_safety": "failed",
+    "autonomous_repair": "not_demonstrated",
+    "reason": "The exact-action recovery rule exposes a real compensation gap, but command/URL regex matching cannot prove equivalent postconditions and can clear unrelated failures."
+  },
+  "host_owned_gate": {
+    "created_post_inference": true,
+    "path": "external_evaluators/task83_verified_compensation_gate.py",
+    "sha256": "0377BE8793B92DAAB380A0A61B439BCC7D83C17684211C9A4E10F0D02B8E245F",
+    "semantic_invariant": "FailureResolved = SameActionSuccess OR VerifiedEquivalentPostconditions",
+    "baseline_passed": false,
+    "checks": {
+      "same_action_success_resolves_failure": true,
+      "verified_equivalent_postconditions_resolve_failure": false,
+      "unrelated_later_success_does_not_resolve_failure": true,
+      "partial_postcondition_proof_does_not_resolve_failure": true,
+      "uncompensated_cross_cycle_failure_remains_unresolved": true
+    },
+    "command_similarity_is_evidence": false,
+    "later_success_alone_is_evidence": false
+  },
+  "human_confirmed_measurement_repair": {
+    "description": "Preserve model_intended_decision across repeated Host enforcement.",
+    "runtime_evolution_sha256_after_repair": "6782CC81D0846EA855AC027D3A58EBBB41D805008E4557489727188814CDAABA",
+    "run39_score_backfilled": false,
+    "reasoner_contract_changed": false,
+    "reasoner_prompt_changed": false
+  },
+  "final_disposition": {
+    "action": "FREEZE_AS_REGRESSION",
+    "rerun_allowed": false,
+    "candidate_evaluation": "not_run_no_candidate",
+    "next_step": "Wait for a new provenance-complete Future Holdout."
+  }
+}

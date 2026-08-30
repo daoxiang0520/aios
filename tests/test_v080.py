@@ -12,7 +12,11 @@ from aios.runtime_evolution import (
     ExternalRuntimeEvaluator,
     ModelRuntimeMutationReasoner,
     RuntimeAttributionContract,
+    RuntimeEvolutionProtocolError,
+    RuntimeInvariantAttributionContract,
     RuntimePatchCausalityContract,
+    RuntimeSchemaCanonicalizer,
+    RuntimeTypedEvolutionProtocol,
     RuntimeCandidateManager,
     RuntimeDiagnosisBenchmark,
     RuntimeExperienceBuilder,
@@ -79,10 +83,26 @@ class StubTwoStageReasoner(ModelRuntimeMutationReasoner):
                     {
                         "id": "H1", "claim": "model strategy", "causal_layer": "model_execution",
                         "runtime_defect": False, "status": "unresolved", "evidence_refs": ["trace:2"],
+                        "supported_by_evidence": ["E0001"],
                     },
                     {
                         "id": "H2", "claim": "evaluation semantics", "causal_layer": "runtime",
                         "runtime_defect": True, "status": "unresolved", "evidence_refs": ["trace:4"],
+                        "supported_by_evidence": ["E0001"],
+                        "observed_transition": {
+                            "before": "a failed action is unresolved",
+                            "boundary": "cycle continuation",
+                            "after": "the task is accepted without recovery",
+                        },
+                        "expected_invariant": {
+                            "statement": "unresolved failures persist until recovery evidence",
+                            "boundary_behavior": "persist",
+                        },
+                        "contradiction": "completion erased an unresolved failure",
+                        "causal_predecessors": [{
+                            "component": "Verifier", "state_owner": "Attempt state",
+                            "counterfactual": "preserving the failure would block completion",
+                        }],
                     },
                 ],
                 "selected_hypothesis": "H2",
@@ -99,7 +119,8 @@ class StubTwoStageReasoner(ModelRuntimeMutationReasoner):
                 {"id": "H2", "status": "supported", "reason": "source confirms the defect"},
             ],
             "final_disposition": {
-                "action": "PROPOSE", "supported_by": ["H2"], "reason": "Runtime defect confirmed",
+                "action": "PROPOSE", "supported_by_hypotheses": ["H2"],
+                "supported_by_evidence": ["E0001"], "reason": "Runtime defect confirmed",
             },
         })
         return proposal
@@ -190,6 +211,16 @@ class V080CandidateRuntimeMutationTests(unittest.TestCase):
             item for item in facts["temporal_evidence"] if item["fact"] == "model_tokens"
         )
         self.assertEqual(final_tokens["at"]["phase"], "task_final")
+        evidence_ids = [item["id"] for item in facts["evidence_catalog"]]
+        self.assertTrue(evidence_ids)
+        self.assertEqual(len(evidence_ids), len(set(evidence_ids)))
+        self.assertTrue(all(item.startswith("E") for item in evidence_ids))
+        boundary = facts["mutation_boundary"]
+        self.assertIn("src/aios/evaluation.py", boundary["mutable_files"])
+        self.assertEqual(
+            boundary["clarifications"]["src/aios/evaluation.py"],
+            "mutable task verification and completion logic",
+        )
 
     def test_temporal_evidence_keeps_checkpoint_budget_distinct_from_task_final(self):
         self.store.add_checkpoint(self.task_id, "budget_deferred", {
@@ -225,6 +256,9 @@ class V080CandidateRuntimeMutationTests(unittest.TestCase):
         states = {item["id"]: item["status"] for item in proposal["attribution"]["hypotheses"]}
         self.assertEqual(states, {"H1": "rejected", "H2": "supported"})
         self.assertTrue(proposal["attribution_consistency"]["valid"])
+        self.assertTrue(proposal["typed_protocol"]["valid"])
+        self.assertIn("reference_namespaces", reasoner.calls[0][1])
+        self.assertIn("mutation_boundary", reasoner.calls[1][1])
         self.assertNotIn("blind_annotation", json.dumps(reasoner.calls[0][1]))
         self.assertNotIn("relevant_files", json.dumps(reasoner.calls[0][1]))
 
@@ -378,6 +412,34 @@ class V080CandidateRuntimeMutationTests(unittest.TestCase):
         self.assertIsNone(semantic["gate_effective"])
         self.assertTrue(semantic["vector_only"])
 
+    def test_model_intent_survives_repeated_patch_causality_enforcement(self):
+        proposal = {
+            "decision": "PROPOSE",
+            "failure_path": [{
+                "path": "src/aios/evaluation.py",
+                "function": "Verifier._unresolved_action_failures",
+                "role": "failure recovery",
+            }],
+            "patch_target": {
+                "path": "src/aios/evaluation.py",
+                "function": "Verifier._unresolved_action_failures",
+            },
+            "required_inputs": ["action_history", "action_results"],
+            "available_inputs": ["action_history"],
+            "reachability": {"valid": True, "reason": "normal verifier path"},
+            "patch": {"edits": [{
+                "path": "src/aios/evaluation.py",
+                "old_text": "old",
+                "new_text": "new",
+            }]},
+        }
+        first = RuntimePatchCausalityContract.enforce(proposal)
+        second = RuntimePatchCausalityContract.enforce(first)
+        self.assertEqual(second["decision"], "NO_ACTION")
+        self.assertEqual(second["model_intended_decision"], "PROPOSE")
+        self.assertEqual(second["rejected_invalid_patch_decision"], "PROPOSE")
+        self.assertEqual(second["reason"], "patch_causality_contract_failed")
+
     def test_host_safely_rejects_inconsistent_runtime_no_action(self):
         proposal = {
             "decision": "NO_ACTION",
@@ -397,6 +459,157 @@ class V080CandidateRuntimeMutationTests(unittest.TestCase):
         self.assertEqual(safe["decision"], "NO_ACTION")
         self.assertEqual(safe["reason"], "attribution_consistency_failed")
         self.assertEqual(safe["rejected_inconsistent_decision"], "NO_ACTION")
+
+    def test_host_canonicalizes_unambiguous_supported_by_string_before_validation(self):
+        proposal = {
+            "decision": "PROPOSE",
+            "runtime_defect_supported": True,
+            "attribution": {
+                "selected_hypothesis": "H1",
+                "hypotheses": [{
+                    "id": "H1", "claim": "mutable Runtime defect", "causal_layer": "runtime",
+                    "runtime_defect": True, "status": "supported",
+                }],
+                "final_disposition": {
+                    "action": "INVESTIGATE", "supported_by": "H1",
+                },
+            },
+            "final_disposition": {
+                "action": "PROPOSE", "supported_by": "H1", "reason": "defect confirmed",
+            },
+        }
+        safe = ModelRuntimeMutationReasoner._enforce_consistency(proposal)
+        self.assertEqual(safe["decision"], "PROPOSE")
+        self.assertEqual(safe["final_disposition"]["supported_by"], ["H1"])
+        self.assertEqual(
+            safe["attribution"]["final_disposition"]["supported_by"], ["H1"],
+        )
+        self.assertTrue(safe["attribution_consistency"]["valid"])
+        self.assertTrue(safe["schema_canonicalization"]["changed"])
+        self.assertFalse(safe["schema_canonicalization"]["semantic_repair_performed"])
+
+    def test_schema_canonicalization_does_not_repair_semantic_disagreement(self):
+        proposal = {
+            "decision": "NO_ACTION",
+            "runtime_defect_supported": False,
+            "attribution": {"selected_hypothesis": None, "hypotheses": []},
+            "final_disposition": {
+                "action": "PROPOSE", "supported_by": "H1", "reason": "contradiction",
+            },
+        }
+        safe = ModelRuntimeMutationReasoner._enforce_consistency(proposal)
+        self.assertEqual(safe["decision"], "NO_ACTION")
+        self.assertEqual(safe["reason"], "attribution_consistency_failed")
+        self.assertIn(
+            "final_disposition.action disagrees with decision",
+            safe["attribution_consistency"]["errors"],
+        )
+
+    def test_invariant_contract_requires_transition_invariant_and_counterfactual(self):
+        proposal = {
+            "invariant_guided_required": True,
+            "attribution": {
+                "selected_hypothesis": "H1",
+                "hypotheses": [{
+                    "id": "H1",
+                    "observed_transition": {
+                        "before": "budget nearly exhausted", "boundary": "retry",
+                        "after": "new attempt begins nearly exhausted",
+                    },
+                    "expected_invariant": {
+                        "statement": "attempt budget is fresh", "boundary_behavior": "reset",
+                    },
+                    "contradiction": "old budget persisted across retry",
+                    "causal_predecessors": [{
+                        "component": "Runtime", "state_owner": "Attempt budget",
+                        "counterfactual": "a fresh budget would allow the retry to execute",
+                    }],
+                }],
+            },
+        }
+        self.assertTrue(RuntimeInvariantAttributionContract.assess(proposal)["valid"])
+        del proposal["attribution"]["hypotheses"][0]["contradiction"]
+        assessment = RuntimeInvariantAttributionContract.assess(proposal)
+        self.assertFalse(assessment["valid"])
+        self.assertIn("selected hypothesis requires a contradiction", assessment["errors"])
+
+    def test_non_string_supported_by_remains_a_contract_error(self):
+        proposal = {
+            "decision": "NO_ACTION",
+            "runtime_defect_supported": False,
+            "attribution": {"selected_hypothesis": None, "hypotheses": []},
+            "final_disposition": {"action": "NO_ACTION", "supported_by": {"id": "H1"}},
+        }
+        RuntimeSchemaCanonicalizer.canonicalize(proposal)
+        assessment = RuntimeAttributionContract.assess(proposal)
+        self.assertFalse(assessment["valid"])
+        self.assertFalse(proposal["schema_canonicalization"]["changed"])
+
+    def test_typed_protocol_separates_hypothesis_and_evidence_namespaces(self):
+        proposal = {
+            "typed_protocol_required": True,
+            "decision": "PROPOSE",
+            "evidence_namespace": ["E0001"],
+            "attribution": {
+                "selected_hypothesis": "H1",
+                "hypotheses": [{
+                    "id": "H1", "status": "supported",
+                    "supported_by_evidence": ["E0001"],
+                }],
+            },
+            "final_disposition": {
+                "action": "PROPOSE",
+                "supported_by_hypotheses": ["H1"],
+                "supported_by_evidence": ["E0001"],
+            },
+        }
+        self.assertTrue(RuntimeTypedEvolutionProtocol.assess(proposal)["valid"])
+        proposal["final_disposition"]["supported_by_hypotheses"] = ["E0001"]
+        assessment = RuntimeTypedEvolutionProtocol.assess(proposal)
+        self.assertFalse(assessment["valid"])
+        self.assertIn("unknown hypothesis reference E0001", assessment["errors"])
+
+    def test_typed_protocol_rejects_invented_disposition(self):
+        proposal = {
+            "typed_protocol_required": True,
+            "decision": "FIX_RUNTIME",
+            "evidence_namespace": [],
+            "attribution": {"hypotheses": [], "selected_hypothesis": None},
+            "final_disposition": {
+                "action": "FIX_RUNTIME", "supported_by_hypotheses": [],
+                "supported_by_evidence": [],
+            },
+        }
+        assessment = RuntimeTypedEvolutionProtocol.assess(proposal)
+        self.assertFalse(assessment["valid"])
+        self.assertIn("decision must be PROPOSE or NO_ACTION", assessment["errors"])
+
+    def test_single_json_framing_never_selects_between_multiple_documents(self):
+        self.assertEqual(
+            ModelRuntimeMutationReasoner._parse_single_json_object('```json\n{"x": 1}\n```'),
+            {"x": 1},
+        )
+        with self.assertRaises(json.JSONDecodeError):
+            ModelRuntimeMutationReasoner._parse_single_json_object('{"x": 1}{"x": 2}')
+
+    def test_protocol_failure_is_persisted_without_retry_or_raw_content(self):
+        class BrokenReasoner:
+            def propose(self, facts, source_index, source_root):
+                raise RuntimeEvolutionProtocolError(
+                    "mutation_authoring", "multiple_json_documents",
+                    "finish_reason=stop; content_chars=42; offset=21",
+                )
+
+        manager = RuntimeCandidateManager(self.settings, self.store, BrokenReasoner())
+        report = manager.propose(self.task_id)
+        self.assertEqual(report["status"], "protocol_failed")
+        failure = report["protocol_failure"]
+        self.assertEqual(failure["category"], "multiple_json_documents")
+        self.assertFalse(failure["retry_performed"])
+        self.assertFalse(failure["raw_content_persisted"])
+        scored = RuntimeDiagnosisBenchmark(self.store).latest(self.task_id)
+        self.assertEqual(scored["status"], "protocol_failed")
+        self.assertEqual(scored["source_evolution_run_id"], 1)
 
     def test_localization_rank_separates_model_selection_from_host_delivery(self):
         proposal = {

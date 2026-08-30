@@ -1,10 +1,11 @@
 # Self-Evolving AIOS
 
-Current release: **v0.8.0-alpha.4**. This build freezes alpha.3's temporal and
-attribution measurement boundary, carries Task failures for the lifetime of an Attempt,
-and adds a lightweight Host-validated failure-path / patch-reachability contract. The
-Autonomous Diagnosis Benchmark now scores final disposition, causal attribution,
-internal consistency, source localization, Mutation Semantic Precision, and the external gate separately. Historical answers are post-inference annotations and
+Current release: **v0.8.0-alpha.6**. This build retains alpha.5's invariant-guided
+attribution while replacing ambiguous model/Host fields with a typed, machine-grounded
+Evolution Protocol. The Autonomous Diagnosis Benchmark now scores final disposition,
+causal attribution, schema canonicalization, invariant attribution, typed-protocol validity,
+internal consistency, source localization, Mutation Semantic
+Precision, and the external gate separately. Historical answers are post-inference annotations and
 are never exposed to the Runtime reasoner. Production, Root of Trust, activation,
 and external fitness remain Host-owned and immutable.
 
@@ -40,6 +41,13 @@ and external fitness remain Host-owned and immutable.
 - Task 80 已冻结为 Prospective Mutation Authoring Holdout：Host-owned Attempt completion gate 区分零动作语言任务、计划文本与真实执行证据；首次盲跑和唯一一次 post-gate 结果分别保留，后者因错误归因、不可达补丁和 attribution contract 违规被 Host 安全拒绝，不宣称自主修复成功；
 - Benchmark 分开记录 `generated_by_model` 与 `admitted_by_host`，External Gate 报告显式提供 `failure_path_exercised / candidate_changes_failure_outcome` PatchReachability；
 - alpha.4 要求 Runtime Candidate 在成立前声明 `failure_path / patch_target / required_inputs / available_inputs / reachability / semantic_invariant`；Host 只检查结构和内部一致性，不建立 CodeGraph，也不替模型判断因果真伪；
+- alpha.5 在 Attribution validation 前只规范化无歧义的表示差异：`supported_by: "H1"` 可确定性转换为 `supported_by: ["H1"]` 并留下审计记录；Host 不修改 decision、selected hypothesis、causal layer 或 hypothesis status，非字符串复杂类型继续拒绝；
+- alpha.5 要求选中假设显式给出 `observed_transition(before/boundary/after)`、`expected_invariant(statement/boundary_behavior)`、`contradiction` 和带 counterfactual 的 causal predecessors；Host 只检查结构完整，因果内容仍由模型负责；
+- alpha.6 将 hypothesis references 与 evidence references 分为 `H*` / `E*` 命名空间，使用 `supported_by_hypotheses` 与 `supported_by_evidence` 两个独立字段；Host 验证引用存在性且禁止旧的歧义 `supported_by`；
+- alpha.6 的最终 action 严格限定为 `PROPOSE / NO_ACTION`。Mutation Boundary 作为 Host-owned `runtime_mutation_boundary/v2` 事实提供，明确 `src/aios/evaluation.py` 可变而 `external_evaluators/` 不可变；模型不再从自然语言文件名猜测权限；
+- Future Holdout Task 83 首次在未见 Runtime Experience 上得到近似正确诊断、正确 Verifier 定位和正确 Mutation 意图，但正则化 goal matching 补丁语义不安全且未创建 Candidate；Run 39 已冻结且不重采样；
+- Host-owned Task 83 gate 以显式等价后置条件证明定义 compensation，不接受命令字符串相似、任意后续成功或部分补偿；`model_intended_decision` 作为不可变观察证据保存，Host rejection 只改变 effective decision；
+- DeepSeek Runtime Evolution 请求继续启用官方 `response_format={"type":"json_object"}`，并新增真实 JSON 样例及单顶层文档 framing；只允许剥离完整外层 Markdown fence，多个 JSON 文档绝不猜选。空内容、截断、双文档等失败会形成不含原文的 `protocol_failed` Evolution Run，且不自动重采样；
 - Mutation Semantic Precision 保持向量指标：`contract_valid / source_relevant / path_reachable / gate_effective / regression_safe`，不折叠成单一奖励分数；
 - Reasoner hypothesis 具有 `supported/rejected/unresolved` 最终状态；Host 确定性检查 hypothesis、runtime-defect judgment 与 final disposition，矛盾输出被安全收敛为可审计的 `NO_ACTION/attribution_consistency_failed`，不得生成 Candidate；
 - Localization 分开记录模型 `proposed_files`、Host `admitted_files`、首个相关文件排名与源码预算裁剪，避免把检索预算问题误记为模型定位失败；

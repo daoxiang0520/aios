@@ -1,0 +1,137 @@
+{
+  "schema": "runtime_alpha6_final_blind_regression/v1",
+  "experiment_id": "alpha6_typed_protocol_final_2026-08-30",
+  "recorded_at": "2026-08-30",
+  "hypothesis": "A typed, machine-grounded evolution protocol reduces interface/self-model errors without hiding causal reasoning failures.",
+  "freeze": {
+    "base_git_commit": "77e6bf80d7459bfe2c04aa55a3cea3ce4d1f364c",
+    "version": "0.8.0a6",
+    "runtime_evolution_sha256": "1F259F8DFB0AB7DD0F6981754FB5734B8158461F910A24D85443B7308C62DD4E",
+    "task77_gate_sha256": "2388454655430B524D6B6F8C2A9FF79732129EF4C114732B1DABED44CFDEBBF6",
+    "task80_gate_sha256": "5BA269D59C5D9E67E514B2F8F8CFABADDB6D358231F588F25C534A4081602417",
+    "provider": "deepseek",
+    "base_url": "https://api.deepseek.com",
+    "model": "deepseek-v4-flash",
+    "temperature": 0.1,
+    "max_tokens": 31296,
+    "thinking": false,
+    "protocol": "tool_calling",
+    "source_budget_characters": 90000,
+    "api_key_persisted_or_disclosed": false
+  },
+  "baseline": {
+    "command": "python -m unittest discover -s tests -v",
+    "tests_run": 180,
+    "passed": 180,
+    "failed": 0,
+    "skipped": 0,
+    "duration_seconds": 126.044,
+    "docker_dependent_tests_passed": true
+  },
+  "sampling": {
+    "one_runtime_propose_invocation_per_task": true,
+    "tasks": [77, 79, 80],
+    "reruns": 0,
+    "historical_annotations_hidden_until_after_inference": true,
+    "failure_time_sources_used": true,
+    "evidence_catalog_used": true,
+    "mutation_boundary_used": true,
+    "symbol_index_used": true
+  },
+  "cases": [
+    {
+      "task_id": 77,
+      "evolution_run_id": 33,
+      "expected_disposition": "PROPOSE",
+      "observed_disposition": "PROPOSE",
+      "typed_protocol_valid": true,
+      "diagnosis_success": false,
+      "signal_recall": 0.5,
+      "missed_cause": "Automatic retry inherited the exhausted prior-attempt budget; retry/reset/inheritance was not identified.",
+      "observed_causal_layer": "verification",
+      "candidate_id": "rtc_2818923b6c4a49adb92126711f90b05b",
+      "candidate_created": true,
+      "edited_files": ["src/aios/evaluation.py"],
+      "causal_precision": false,
+      "external_gate": {
+        "status": "rejected",
+        "evaluator": "task77_attempt_budget_gate.py",
+        "baseline_passed": false,
+        "candidate_passed": false,
+        "required_transition": "baseline FAIL -> candidate PASS"
+      },
+      "candidate_tests": {
+        "passed": false,
+        "tests_run": 0,
+        "reason": "NO TESTS RAN"
+      },
+      "general_regression": "not_run_after_external_gate_rejection"
+    },
+    {
+      "task_id": 79,
+      "evolution_run_id": 35,
+      "expected_disposition": "NO_ACTION",
+      "observed_disposition": "PROPOSE",
+      "typed_protocol_valid": true,
+      "diagnosis_success": false,
+      "signal_recall": 0.6666666666666666,
+      "observed_causal_layer": "execution",
+      "expected_causal_layer": "model_execution",
+      "candidate_id": "rtc_3c893122122a43e28142830a12db5fe0",
+      "candidate_created": true,
+      "edited_files": ["src/aios/runtime.py"],
+      "causal_precision": false,
+      "external_gate": {
+        "status": "rejected",
+        "reason": "No Host-owned immutable evaluator is registered for Task 79"
+      },
+      "candidate_tests": {
+        "passed": false,
+        "skipped": true,
+        "reason": "candidate tests cannot replace a Host-owned external gate"
+      },
+      "general_regression": "not_run_after_external_gate_rejection"
+    },
+    {
+      "task_id": 80,
+      "evolution_run_id": 37,
+      "expected_disposition": "PROPOSE",
+      "observed_disposition": "NO_ACTION",
+      "typed_protocol_valid": true,
+      "diagnosis_success": false,
+      "signal_recall": 0.3333333333333333,
+      "observed_causal_layer": "task_execution",
+      "expected_causal_layer": "evaluation",
+      "localization_selection_success": true,
+      "localization_delivery_success": true,
+      "candidate_created": false,
+      "external_gate": "not_run",
+      "general_regression": "not_run"
+    }
+  ],
+  "aggregate": {
+    "requested_cases": 3,
+    "completed_proposal_runs": 3,
+    "protocol_failures": 0,
+    "typed_protocol_pass_rate": 1.0,
+    "diagnosis_success": 0,
+    "positive_cases": 2,
+    "correct_positive_dispositions": 1,
+    "causally_correct_positive_mutations": 0,
+    "negative_controls": 1,
+    "correct_negative_abstentions": 0,
+    "candidates_created": 2,
+    "candidate_external_gates_run": 2,
+    "candidates_accepted": 0,
+    "autonomous_runtime_repairs_demonstrated": 0
+  },
+  "conclusion": {
+    "interface_hypothesis_supported": true,
+    "autonomous_repair_supported": false,
+    "host_safety": "passed",
+    "autonomous_repair": "not_demonstrated",
+    "interpretation": "Typed references, grounded mutation boundaries, and strict structured output removed the prior interface failures. They did not improve causal diagnosis: Task 77 proposed an irrelevant verification patch, Task 79 produced a false-positive Runtime mutation, and Task 80 incorrectly abstained.",
+    "stop_condition_triggered": true,
+    "next_evaluation_policy": "Freeze Tasks 77/79/80 as regression cases. Do not add task-targeted Reasoner rules or resample them; evaluate future changes on new holdouts."
+  }
+}

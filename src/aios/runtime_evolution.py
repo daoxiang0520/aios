@@ -21,6 +21,197 @@ class RuntimeMutationPolicyError(RuntimeError):
     pass
 
 
+class RuntimeEvolutionProtocolError(ControllerError):
+    def __init__(self, stage: str, category: str, detail: str):
+        super().__init__(f"Runtime evolution protocol failed at {stage}: {category}; {detail}")
+        self.stage = stage
+        self.category = category
+        self.detail = detail
+
+
+class RuntimeSchemaCanonicalizer:
+    """Normalize unambiguous model representations without changing their meaning."""
+
+    SCHEMA = "runtime_schema_canonicalization/v1"
+
+    @classmethod
+    def canonicalize(cls, proposal: dict[str, Any]) -> dict[str, Any]:
+        changes: list[dict[str, str]] = []
+        cls._singleton_string_list(
+            proposal.get("final_disposition"), "final_disposition.supported_by", changes,
+        )
+        attribution = proposal.get("attribution")
+        if isinstance(attribution, dict):
+            cls._singleton_string_list(
+                attribution.get("final_disposition"),
+                "attribution.final_disposition.supported_by",
+                changes,
+            )
+        proposal["schema_canonicalization"] = {
+            "schema": cls.SCHEMA,
+            "changed": bool(changes),
+            "changes": changes,
+            "semantic_repair_performed": False,
+        }
+        return proposal
+
+    @staticmethod
+    def _singleton_string_list(
+        container: Any, path: str, changes: list[dict[str, str]],
+    ) -> None:
+        if not isinstance(container, dict):
+            return
+        value = container.get("supported_by")
+        if not isinstance(value, str):
+            return
+        normalized = value.strip()
+        container["supported_by"] = [normalized] if normalized else []
+        changes.append({
+            "path": path,
+            "rule": "scalar_string_to_singleton_string_list",
+            "from_type": "string",
+            "to_type": "array",
+        })
+
+
+class RuntimeInvariantAttributionContract:
+    """Require model-owned state-transition and counterfactual causal reasoning."""
+
+    SCHEMA = "runtime_invariant_attribution/v1"
+
+    @classmethod
+    def assess(cls, proposal: dict[str, Any]) -> dict[str, Any]:
+        required = proposal.get("invariant_guided_required") is True
+        if not required:
+            return {"schema": cls.SCHEMA, "required": False, "valid": True, "errors": []}
+        attribution = proposal.get("attribution") if isinstance(proposal.get("attribution"), dict) else {}
+        hypotheses = attribution.get("hypotheses") if isinstance(attribution.get("hypotheses"), list) else []
+        indexed = {
+            str(item.get("id")): item for item in hypotheses
+            if isinstance(item, dict) and item.get("id")
+        }
+        selected_id = attribution.get("selected_hypothesis")
+        selected = indexed.get(str(selected_id)) if selected_id is not None else None
+        errors: list[str] = []
+        if selected is None:
+            errors.append("invariant attribution requires a declared selected hypothesis")
+        else:
+            transition = selected.get("observed_transition")
+            if not isinstance(transition, dict) or not all(
+                isinstance(transition.get(key), str) and transition.get(key).strip()
+                for key in ("before", "boundary", "after")
+            ):
+                errors.append("selected hypothesis requires observed_transition.before/boundary/after")
+            invariant = selected.get("expected_invariant")
+            if not isinstance(invariant, dict) or not all(
+                isinstance(invariant.get(key), str) and invariant.get(key).strip()
+                for key in ("statement", "boundary_behavior")
+            ):
+                errors.append("selected hypothesis requires expected_invariant.statement/boundary_behavior")
+            if not isinstance(selected.get("contradiction"), str) or not selected.get("contradiction", "").strip():
+                errors.append("selected hypothesis requires a contradiction")
+            predecessors = selected.get("causal_predecessors")
+            if not isinstance(predecessors, list) or not predecessors:
+                errors.append("selected hypothesis requires causal_predecessors")
+            elif not all(
+                isinstance(item, dict)
+                and all(isinstance(item.get(key), str) and item.get(key).strip()
+                        for key in ("component", "state_owner", "counterfactual"))
+                for item in predecessors
+            ):
+                errors.append(
+                    "each causal predecessor requires component, state_owner, and counterfactual"
+                )
+        return {
+            "schema": cls.SCHEMA,
+            "required": True,
+            "valid": not errors,
+            "errors": errors,
+            "selected_hypothesis": selected_id,
+        }
+
+
+class RuntimeTypedEvolutionProtocol:
+    """Validate disjoint reference namespaces and the finite disposition language."""
+
+    SCHEMA = "runtime_typed_evolution_protocol/v1"
+    DISPOSITIONS = {"PROPOSE", "NO_ACTION"}
+
+    @classmethod
+    def assess(cls, proposal: dict[str, Any]) -> dict[str, Any]:
+        required = proposal.get("typed_protocol_required") is True
+        if not required:
+            return {"schema": cls.SCHEMA, "required": False, "valid": True, "errors": []}
+        errors: list[str] = []
+        decision = str(proposal.get("decision", "")).upper()
+        if decision not in cls.DISPOSITIONS:
+            errors.append("decision must be PROPOSE or NO_ACTION")
+        final = proposal.get("final_disposition")
+        if not isinstance(final, dict):
+            errors.append("final_disposition must be an object")
+            final = {}
+        action = str(final.get("action", "")).upper()
+        if action not in cls.DISPOSITIONS:
+            errors.append("final_disposition.action must be PROPOSE or NO_ACTION")
+        elif action != decision:
+            errors.append("final_disposition.action disagrees with decision")
+        if "supported_by" in final:
+            errors.append("ambiguous supported_by is forbidden by the typed protocol")
+
+        attribution = proposal.get("attribution") if isinstance(proposal.get("attribution"), dict) else {}
+        hypotheses = attribution.get("hypotheses") if isinstance(attribution.get("hypotheses"), list) else []
+        hypothesis_ids = {
+            str(item.get("id")) for item in hypotheses
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
+        evidence_ids = {
+            str(item) for item in proposal.get("evidence_namespace", [])
+            if isinstance(item, str)
+        }
+        hypothesis_refs = cls._string_list(
+            final.get("supported_by_hypotheses"),
+            "final_disposition.supported_by_hypotheses", errors,
+        )
+        evidence_refs = cls._string_list(
+            final.get("supported_by_evidence"),
+            "final_disposition.supported_by_evidence", errors,
+        )
+        for reference in hypothesis_refs:
+            if reference not in hypothesis_ids:
+                errors.append(f"unknown hypothesis reference {reference}")
+        for reference in evidence_refs:
+            if reference not in evidence_ids:
+                errors.append(f"unknown evidence reference {reference}")
+        for hypothesis in hypotheses:
+            if not isinstance(hypothesis, dict):
+                continue
+            refs = cls._string_list(
+                hypothesis.get("supported_by_evidence"),
+                f"hypothesis {hypothesis.get('id')} supported_by_evidence", errors,
+            )
+            for reference in refs:
+                if reference not in evidence_ids:
+                    errors.append(f"unknown evidence reference {reference}")
+        return {
+            "schema": cls.SCHEMA,
+            "required": True,
+            "valid": not errors,
+            "errors": errors,
+            "decision": decision,
+            "hypothesis_namespace_size": len(hypothesis_ids),
+            "evidence_namespace_size": len(evidence_ids),
+        }
+
+    @staticmethod
+    def _string_list(value: Any, path: str, errors: list[str]) -> list[str]:
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) and item.strip() for item in value
+        ):
+            errors.append(f"{path} must be a list of non-empty strings")
+            return []
+        return [item.strip() for item in value]
+
+
 class RuntimeAttributionContract:
     """Host-owned structural consistency for model-authored causal judgments."""
 
@@ -57,9 +248,13 @@ class RuntimeAttributionContract:
         if final_action != decision:
             errors.append("final_disposition.action disagrees with decision")
 
-        supported_by = final_disposition.get("supported_by", [])
+        typed = proposal.get("typed_protocol_required") is True
+        supported_by = final_disposition.get(
+            "supported_by_hypotheses" if typed else "supported_by", []
+        )
         if not isinstance(supported_by, list):
-            errors.append("final_disposition.supported_by must be a list")
+            field = "supported_by_hypotheses" if typed else "supported_by"
+            errors.append(f"final_disposition.{field} must be a list")
             supported_by = []
         for hypothesis_id in supported_by:
             hypothesis = indexed.get(str(hypothesis_id))
@@ -195,8 +390,13 @@ class RuntimePatchCausalityContract:
         proposal["patch_causality"] = assessment
         if assessment["valid"]:
             return proposal
-        raw_decision = str(proposal.get("decision", "NO_ACTION")).upper()
-        proposal["rejected_invalid_patch_decision"] = raw_decision
+        raw_decision = str(
+            proposal.get("model_intended_decision")
+            or proposal.get("rejected_invalid_patch_decision")
+            or proposal.get("decision", "NO_ACTION")
+        ).upper()
+        proposal.setdefault("model_intended_decision", raw_decision)
+        proposal.setdefault("rejected_invalid_patch_decision", raw_decision)
         proposal["decision"] = "NO_ACTION"
         proposal["reason"] = "patch_causality_contract_failed"
         return proposal
@@ -369,16 +569,54 @@ class RuntimeExperienceBuilder:
                 "no_host_recommended_fix": True,
             },
             "mutation_boundary": {
+                "schema": "runtime_mutation_boundary/v2",
                 "candidate_only": True,
                 "production_immutable": True,
                 "mutable_files": sorted(RuntimeMutationPolicy.MUTABLE_FILES),
                 "root_of_trust": dict(RuntimeMutationPolicy.ROOT_OF_TRUST),
+                "immutable_prefixes": ["external_evaluators/", "experiments/"],
+                "clarifications": {
+                    "src/aios/evaluation.py": "mutable task verification and completion logic",
+                    "external_evaluators/": "immutable Host-owned fitness gates",
+                },
                 "production_activation": "forbidden",
                 "fitness_authority": "external_host_evaluator",
             },
         }
+        facts["evidence_catalog"] = self._evidence_catalog(facts)
         facts["fact_digest"] = self._digest(facts)
         return facts
+
+    @staticmethod
+    def _evidence_catalog(facts: dict[str, Any]) -> list[dict[str, Any]]:
+        catalog: list[dict[str, Any]] = []
+        for collection, kind in (
+            ("executions", "execution"),
+            ("final_claims", "final_claim"),
+            ("evaluations", "evaluation"),
+            ("host_decisions", "host_decision"),
+            ("temporal_evidence", "temporal"),
+        ):
+            values = facts.get(collection)
+            for index, item in enumerate(values if isinstance(values, list) else []):
+                catalog.append({
+                    "id": f"E{len(catalog) + 1:04d}",
+                    "kind": kind,
+                    "fact_path": f"{collection}[{index}]",
+                    "trace_id": item.get("trace_id") if isinstance(item, dict) else None,
+                    "at": item.get("at") if isinstance(item, dict) else None,
+                })
+        metrics = facts.get("task_metrics") if isinstance(facts.get("task_metrics"), dict) else {}
+        for name, value in metrics.items():
+            if value is None:
+                continue
+            catalog.append({
+                "id": f"E{len(catalog) + 1:04d}",
+                "kind": "task_metric",
+                "fact_path": f"task_metrics.{name}",
+                "value": value,
+            })
+        return catalog
 
     @staticmethod
     def _cycle_context(
@@ -633,6 +871,21 @@ class ModelRuntimeMutationReasoner:
                 "attribution_consistency": {"valid": True, "schema": "runtime_attribution_consistency/v1"},
                 "model_usage": {"model_calls": 0},
             }
+        evidence_ids = [
+            str(item["id"]) for item in facts.get("evidence_catalog", [])
+            if isinstance(item, dict) and item.get("id")
+        ]
+        reference_namespaces = {
+            "hypothesis": {
+                "prefix": "H", "examples": ["H1", "H2"],
+                "usage": "supported_by_hypotheses only",
+            },
+            "evidence": {
+                "prefix": "E", "allowed_ids": evidence_ids,
+                "usage": "supported_by_evidence only",
+            },
+        }
+        self._request_stage = "attribution"
         attribution = self._request_json(
             (
                 "You are the AIOS Runtime evolution reasoner. Analyze only the supplied observed facts. "
@@ -640,23 +893,42 @@ class ModelRuntimeMutationReasoner:
                 "form competing hypotheses and select the strongest. Choose up to four source files to inspect. "
                 "Treat every fact according to its at.phase/attempt/cycle coordinates; transformed output evidence "
                 "does not describe raw model output, and checkpoint metrics do not describe task_final state. "
-                "You may inspect root-of-trust files but must never propose modifying them. Return JSON only: "
+                "The supplied mutation_boundary is the authoritative action space; do not infer mutability from file "
+                "names. Hypothesis IDs and evidence IDs are disjoint namespaces. Return exactly one JSON object: "
                 "{decision:'INVESTIGATE'|'NO_ACTION',hypotheses:[{id,claim,causal_layer,"
-                "runtime_defect,status:'supported'|'rejected'|'unresolved',evidence_refs,counterevidence}],"
+                "runtime_defect,status:'supported'|'rejected'|'unresolved',supported_by_evidence:[E-id],"
+                "counterevidence}],"
                 "selected_hypothesis,inspect_files,reason,causal_layer,runtime_defect_supported,"
                 "non_mutation_reason:null|'authority_boundary'|'root_of_trust'|'safety_risk'|'insufficient_evidence',"
-                "final_disposition:{action,supported_by,reason}}."
+                "final_disposition:{action:'INVESTIGATE'|'NO_ACTION',supported_by_hypotheses:[H-id],"
+                "supported_by_evidence:[E-id],reason}}. For each hypothesis also provide "
+                "observed_transition:{before,boundary,after}, expected_invariant:{statement,boundary_behavior}, "
+                "contradiction, and causal_predecessors:[{component,state_owner,counterfactual}]. A counterfactual "
+                "must state what would differ if that predecessor did not cause the anomaly. Example JSON fragment: "
+                "{\"decision\":\"NO_ACTION\",\"hypotheses\":[{\"id\":\"H1\","
+                "\"supported_by_evidence\":[\"E0001\"]}],\"final_disposition\":{"
+                "\"action\":\"NO_ACTION\",\"supported_by_hypotheses\":[\"H1\"],"
+                "\"supported_by_evidence\":[\"E0001\"],\"reason\":\"...\"}}."
             ),
-            {"facts": facts, "source_index": source_index},
+            {
+                "facts": facts,
+                "source_index": source_index,
+                "reference_namespaces": reference_namespaces,
+                "mutation_boundary": facts.get("mutation_boundary"),
+            },
         )
         if str(attribution.get("decision", "NO_ACTION")).upper() != "INVESTIGATE":
             proposal = {
                 "decision": "NO_ACTION", "reason": attribution.get("reason"),
+                "model_intended_decision": "NO_ACTION",
                 "causal_layer": attribution.get("causal_layer"),
                 "runtime_defect_supported": attribution.get("runtime_defect_supported"),
                 "non_mutation_reason": attribution.get("non_mutation_reason"),
                 "final_disposition": attribution.get("final_disposition"),
                 "attribution": attribution, "model_usage": {"model_calls": 1},
+                "invariant_guided_required": True,
+                "typed_protocol_required": True,
+                "evidence_namespace": evidence_ids,
             }
             return self._enforce_consistency(proposal)
         indexed = {item["path"] for item in source_index}
@@ -682,17 +954,20 @@ class ModelRuntimeMutationReasoner:
             remaining -= take
             if remaining <= 0:
                 break
+        self._request_stage = "mutation_authoring"
         proposal = self._request_json(
             (
                 "You are authoring one minimal AIOS Runtime candidate in an isolated source snapshot. "
                 "Use the observed facts and your prior attribution. Do not weaken verification to improve fitness. "
-                "Do not modify authority, SecurityKernel, sandbox isolation, audit/storage, deployment/CLI, "
-                "experiment/evaluator code, or production. Edits use exact unique old_text replacement. Add focused "
+                "Treat mutation_boundary as authoritative. Only paths listed in mutable_files may be edited; "
+                "src/aios/evaluation.py is mutable task-verification code, while external_evaluators/ is immutable. "
+                "Edits use exact unique old_text replacement. Add focused "
                 "candidate tests when useful. Revise every investigated hypothesis to a final supported/rejected/"
                 "unresolved state after reading source. Return JSON only: {decision:'PROPOSE'|'NO_ACTION',"
                 "causal_layer,runtime_defect_supported,non_mutation_reason:null|'authority_boundary'|'root_of_trust'|"
                 "'safety_risk'|'insufficient_evidence',hypothesis_revisions:[{id,status,reason}],"
-                "final_disposition:{action,supported_by,reason},attribution_summary,"
+                "final_disposition:{action:'PROPOSE'|'NO_ACTION',supported_by_hypotheses:[H-id],"
+                "supported_by_evidence:[E-id],reason},attribution_summary,"
                 "failure_path:[{path,function,role}],patch_target:{path,function},"
                 "required_inputs:[string],available_inputs:[string],"
                 "reachability:{valid:boolean,reason:string},"
@@ -704,9 +979,13 @@ class ModelRuntimeMutationReasoner:
                 "facts": facts,
                 "attribution": attribution,
                 "selected_sources": sources,
-                "mutable_files": sorted(RuntimeMutationPolicy.MUTABLE_FILES),
+                "reference_namespaces": reference_namespaces,
+                "mutation_boundary": facts.get("mutation_boundary"),
             },
         )
+        proposal["model_intended_decision"] = str(
+            proposal.get("decision", "NO_ACTION")
+        ).upper()
         proposal["attribution"] = self._apply_hypothesis_revisions(
             attribution, proposal.get("hypothesis_revisions"),
         )
@@ -719,6 +998,9 @@ class ModelRuntimeMutationReasoner:
             "budget_truncated": len(sources) < len(selected) or any(not item["complete"] for item in delivery),
         }
         proposal["model_usage"] = {"model_calls": 2}
+        proposal["invariant_guided_required"] = True
+        proposal["typed_protocol_required"] = True
+        proposal["evidence_namespace"] = evidence_ids
         proposal = self._enforce_consistency(proposal)
         proposal = RuntimePatchCausalityContract.enforce(proposal)
         RuntimeMutationPolicy.validate_proposal(proposal)
@@ -746,21 +1028,40 @@ class ModelRuntimeMutationReasoner:
 
     @staticmethod
     def _enforce_consistency(proposal: dict[str, Any]) -> dict[str, Any]:
+        proposal = RuntimeSchemaCanonicalizer.canonicalize(proposal)
         assessment = RuntimeAttributionContract.assess(proposal)
         proposal["attribution_consistency"] = assessment
-        if assessment["valid"]:
+        invariant_assessment = RuntimeInvariantAttributionContract.assess(proposal)
+        proposal["invariant_attribution"] = invariant_assessment
+        typed_assessment = RuntimeTypedEvolutionProtocol.assess(proposal)
+        proposal["typed_protocol"] = typed_assessment
+        if assessment["valid"] and invariant_assessment["valid"] and typed_assessment["valid"]:
             return proposal
         raw_decision = str(proposal.get("decision", "NO_ACTION")).upper()
-        proposal["rejected_inconsistent_decision"] = raw_decision
+        proposal.setdefault("model_intended_decision", raw_decision)
+        proposal.setdefault("rejected_inconsistent_decision", raw_decision)
         proposal["decision"] = "NO_ACTION"
         proposal["runtime_defect_supported"] = False
         proposal["non_mutation_reason"] = "insufficient_evidence"
-        proposal["final_disposition"] = {
-            "action": "NO_ACTION",
-            "supported_by": [],
-            "reason": "Host rejected an internally inconsistent causal attribution",
-        }
-        proposal["reason"] = "attribution_consistency_failed"
+        proposal["final_disposition"] = (
+            {
+                "action": "NO_ACTION", "supported_by_hypotheses": [],
+                "supported_by_evidence": [],
+                "reason": "Host rejected an internally inconsistent causal attribution",
+            }
+            if proposal.get("typed_protocol_required") is True
+            else {
+                "action": "NO_ACTION", "supported_by": [],
+                "reason": "Host rejected an internally inconsistent causal attribution",
+            }
+        )
+        proposal["reason"] = (
+            "attribution_consistency_failed"
+            if not assessment["valid"]
+            else "invariant_attribution_contract_failed"
+            if not invariant_assessment["valid"]
+            else "typed_protocol_contract_failed"
+        )
         return proposal
 
     def _request_json(self, system: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -784,18 +1085,51 @@ class ModelRuntimeMutationReasoner:
             request["thinking"] = {"type": config.thinking if config.thinking in {"enabled", "disabled"} else "disabled"}
         response = self.controller._send_request(request, key)
         try:
-            value = json.loads(response["choices"][0]["message"]["content"])
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-            raise ControllerError("Runtime evolution reasoner returned invalid JSON") from exc
+            choice = response["choices"][0]
+            content = choice["message"]["content"]
+            finish_reason = choice.get("finish_reason")
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeEvolutionProtocolError(
+                getattr(self, "_request_stage", "unknown"),
+                "malformed_transport_response", type(exc).__name__,
+            ) from exc
+        if not isinstance(content, str) or not content.strip():
+            raise RuntimeEvolutionProtocolError(
+                getattr(self, "_request_stage", "unknown"),
+                "empty_json_content", f"finish_reason={finish_reason}",
+            )
+        try:
+            value = self._parse_single_json_object(content)
+        except json.JSONDecodeError as exc:
+            category = "multiple_json_documents" if exc.msg == "Extra data" else "invalid_json"
+            raise RuntimeEvolutionProtocolError(
+                getattr(self, "_request_stage", "unknown"), category,
+                f"finish_reason={finish_reason}; content_chars={len(content)}; offset={exc.pos}",
+            ) from exc
         if not isinstance(value, dict):
-            raise ControllerError("Runtime evolution reasoner returned a non-object")
+            raise RuntimeEvolutionProtocolError(
+                getattr(self, "_request_stage", "unknown"),
+                "non_object_json", f"content_type={type(value).__name__}",
+            )
+        return value
+
+    @staticmethod
+    def _parse_single_json_object(content: str) -> Any:
+        framed = content.lstrip("\ufeff").strip()
+        fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", framed, flags=re.DOTALL | re.IGNORECASE)
+        if fence:
+            framed = fence.group(1).strip()
+        decoder = json.JSONDecoder()
+        value, end = decoder.raw_decode(framed)
+        if framed[end:].strip():
+            raise json.JSONDecodeError("Extra data", framed, end)
         return value
 
 
 class RuntimeDiagnosisBenchmark:
     """Score blind Runtime reasoning after inference; annotations never enter model input."""
 
-    BENCHMARK_ID = "historical_runtime_regression/v5"
+    BENCHMARK_ID = "historical_runtime_regression/v7"
     CASES: dict[int, dict[str, Any]] = {
         64: {
             "title": "continuation duplication and resurrection",
@@ -987,7 +1321,8 @@ class RuntimeDiagnosisBenchmark:
 
         decision = str(proposal.get("decision", "NO_ACTION")).upper()
         model_intended_decision = str(
-            proposal.get("rejected_inconsistent_decision")
+            proposal.get("model_intended_decision")
+            or proposal.get("rejected_inconsistent_decision")
             or proposal.get("rejected_invalid_patch_decision")
             or decision
         ).upper()
@@ -1028,8 +1363,30 @@ class RuntimeDiagnosisBenchmark:
             if isinstance(proposal.get("attribution_consistency"), dict)
             else RuntimeAttributionContract.assess(proposal)
         )
+        canonicalization = (
+            proposal.get("schema_canonicalization")
+            if isinstance(proposal.get("schema_canonicalization"), dict)
+            else {
+                "schema": RuntimeSchemaCanonicalizer.SCHEMA,
+                "changed": False,
+                "changes": [],
+                "semantic_repair_performed": False,
+            }
+        )
+        invariant_attribution = (
+            proposal.get("invariant_attribution")
+            if isinstance(proposal.get("invariant_attribution"), dict)
+            else RuntimeInvariantAttributionContract.assess(proposal)
+        )
+        typed_protocol = (
+            proposal.get("typed_protocol")
+            if isinstance(proposal.get("typed_protocol"), dict)
+            else RuntimeTypedEvolutionProtocol.assess(proposal)
+        )
         generated_by_model = bool(model_intended_decision == "PROPOSE" and edits)
-        admitted_by_host = bool(generated and consistency.get("valid"))
+        admitted_by_host = bool(
+            generated and consistency.get("valid") and invariant_attribution.get("valid")
+        )
         diagnosis_evaluable = bool(annotation.get("diagnosis_evaluable", True))
         localization_evaluable = bool(annotation.get("localization_evaluable", True))
         mutation_evaluable = annotation.get("mutation_source_fidelity") == "matched"
@@ -1068,7 +1425,7 @@ class RuntimeDiagnosisBenchmark:
             else {}
         )
         return {
-            "schema": "runtime_diagnosis_benchmark_case/v2",
+            "schema": "runtime_diagnosis_benchmark_case/v4",
             "benchmark_id": cls.BENCHMARK_ID,
             "annotation_digest": cls.annotation_digest(),
             "task_id": task_id,
@@ -1110,6 +1467,9 @@ class RuntimeDiagnosisBenchmark:
                 "correct": causal_layer_correct,
             },
             "reasoning_consistency": consistency,
+            "schema_canonicalization": canonicalization,
+            "invariant_attribution": invariant_attribution,
+            "typed_protocol": typed_protocol,
             "localization": {
                 "success": bool(relevant_admitted),
                 "causal_success": bool(diagnosis_success and relevant_admitted),
@@ -1143,7 +1503,10 @@ class RuntimeDiagnosisBenchmark:
             },
             "mutation_semantic_precision": {
                 "contract_valid": bool(
-                    consistency.get("valid") and patch_causality.get("valid")
+                    consistency.get("valid")
+                    and invariant_attribution.get("valid")
+                    and typed_protocol.get("valid")
+                    and patch_causality.get("valid")
                 ) if model_intended_decision == "PROPOSE" else None,
                 "source_relevant": bool(relevant_admitted) if model_intended_decision == "PROPOSE" else None,
                 "path_reachable": path_reachable if model_intended_decision == "PROPOSE" else None,
@@ -1177,11 +1540,21 @@ class RuntimeDiagnosisBenchmark:
         )
         if run is None:
             return {
-                "schema": "runtime_diagnosis_benchmark_case/v2",
+                "schema": "runtime_diagnosis_benchmark_case/v4",
                 "task_id": task_id,
                 "status": "missing_experiment",
             }
         report = run.get("report") if isinstance(run.get("report"), dict) else {}
+        if report.get("status") == "protocol_failed":
+            return {
+                "schema": "runtime_diagnosis_benchmark_case/v4",
+                "benchmark_id": self.BENCHMARK_ID,
+                "annotation_digest": self.annotation_digest(),
+                "task_id": task_id,
+                "status": "protocol_failed",
+                "protocol_failure": report.get("protocol_failure"),
+                "source_evolution_run_id": run["id"],
+            }
         proposal = report.get("proposal") if isinstance(report.get("proposal"), dict) else {}
         evaluation = report.get("evaluation") if isinstance(report.get("evaluation"), dict) else None
         scored = self.score(task_id, proposal, evaluation)
@@ -1206,7 +1579,7 @@ class RuntimeDiagnosisBenchmark:
         mutation_eligible = [item for item in scored if item["eligibility"]["mutation_evaluable"]]
         gated = [item for item in scored if item["external_gate"]["evaluated"]]
         report = {
-            "schema": "runtime_diagnosis_benchmark_suite/v2",
+            "schema": "runtime_diagnosis_benchmark_suite/v4",
             "benchmark_id": self.BENCHMARK_ID,
             "annotation_digest": self.annotation_digest(),
             "benchmark_tasks": selected,
@@ -1226,6 +1599,15 @@ class RuntimeDiagnosisBenchmark:
                 ),
                 "reasoning_consistency_rate": rate(
                     lambda item: item["reasoning_consistency"]["valid"]
+                ),
+                "canonicalization_applied_rate": rate(
+                    lambda item: item["schema_canonicalization"]["changed"]
+                ),
+                "invariant_attribution_valid_rate": rate(
+                    lambda item: item["invariant_attribution"]["valid"]
+                ),
+                "typed_protocol_valid_rate": rate(
+                    lambda item: item["typed_protocol"]["valid"]
                 ),
                 "localization_selection_accuracy": rate(
                     lambda item: item["localization"]["selection_success"]
@@ -1268,6 +1650,8 @@ class RuntimeDiagnosisBenchmark:
                 "not_a_scalar_reward": True,
                 "stages_remain_separate": [
                     "final_disposition", "causal_attribution", "reasoning_consistency",
+                    "schema_canonicalization", "invariant_attribution",
+                    "typed_protocol",
                     "diagnosis", "localization", "mutation", "external_gate",
                 ],
                 "annotations_are_post_inference_only": True,
@@ -1277,6 +1661,9 @@ class RuntimeDiagnosisBenchmark:
                 "diagnosis_evaluable_tasks": [item["task_id"] for item in diagnosis_eligible],
                 "localization_evaluable_tasks": [item["task_id"] for item in localization_eligible],
                 "mutation_evaluable_tasks": [item["task_id"] for item in mutation_eligible],
+                "protocol_failed_tasks": [
+                    item["task_id"] for item in cases if item.get("status") == "protocol_failed"
+                ],
             },
             "cases": cases,
         }
@@ -1309,7 +1696,29 @@ class RuntimeCandidateManager:
         temporary, source_root, source_provenance = self._failure_time_source(task_id)
         try:
             index = self.experience.source_index(source_root)
-            proposal = self.reasoner.propose(facts, index, source_root)
+            try:
+                proposal = self.reasoner.propose(facts, index, source_root)
+            except RuntimeEvolutionProtocolError as exc:
+                report = {
+                    "status": "protocol_failed",
+                    "changed": False,
+                    "production_activated": False,
+                    "task_id": task_id,
+                    "facts_digest": facts.get("fact_digest"),
+                    "protocol_failure": {
+                        "schema": "runtime_evolution_protocol_failure/v1",
+                        "stage": exc.stage,
+                        "category": exc.category,
+                        "detail": exc.detail,
+                        "retry_performed": False,
+                        "raw_content_persisted": False,
+                    },
+                    "source_provenance": source_provenance,
+                }
+                self.store.add_evolution_run(
+                    f"runtime:{task_id}", facts, [], "protocol_failed", report,
+                )
+                return report
             proposal = RuntimePatchCausalityContract.enforce(proposal)
             if str(proposal.get("decision", "NO_ACTION")).upper() != "PROPOSE":
                 report = {
