@@ -9,6 +9,24 @@ Precision, and the external gate separately. Historical answers are post-inferen
 are never exposed to the Runtime reasoner. Production, Root of Trust, activation,
 and external fitness remain Host-owned and immutable.
 
+## Agent Workbench（第一版）
+
+本地 Web UI 提供三栏工作台：任务列表、对话/任务详情、实时 Runtime 活动；
+`Inspect` 模式额外展示 Evidence、Evolution、模型意图与 Host 处置，并可查看
+Runtime Candidate 的修改内容。UI 仅投影现有 SQLite/Trace/Evolution 状态，不复制
+Runtime、安全或评估决策。
+
+```powershell
+# 终端 1：打开 UI
+python -m aios --config config.json ui
+
+# 终端 2：执行 UI 中排队的任务
+python -m aios --config config.json run
+```
+
+默认地址为 `http://127.0.0.1:8765`。可通过 `ui --host` 和 `ui --port` 修改；
+除非明确需要局域网访问，否则应保持默认回环地址。
+
 > v0.6 将进化面从“增加专用 Tool Schema”迁移为“学习可执行、可测试、可版本化的 Skill”。模型的原生工具面仍固定为 `read / write / edit / bash`。
 
 当前分层为：`Root Capability → Primitive Tool → Skill → Workflow → Harness`。v0.6 实现 Skill 层；Workflow 和 Harness 的自主进化仍是后续版本。

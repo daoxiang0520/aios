@@ -64,6 +64,9 @@ def _parser() -> argparse.ArgumentParser:
 
     run = commands.add_parser("run", help="Run the event loop")
     run.add_argument("--once", action="store_true")
+    ui = commands.add_parser("ui", help="Open the local Agent Workbench")
+    ui.add_argument("--host", default="127.0.0.1")
+    ui.add_argument("--port", type=int, default=8765)
     commands.add_parser("status", help="Show queue and goals")
     trace = commands.add_parser("trace", help="Show recent traces")
     trace.add_argument("--limit", type=int, default=20)
@@ -603,6 +606,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "diagnose":
         _print_json(Diagnoser(store).report())
+        return 0
+
+    if args.command == "ui":
+        from .webui import serve_ui
+
+        serve_ui(settings, store, host=args.host, port=args.port)
         return 0
     if args.command == "capsule":
         _, capsules, _ = _experiment_services(settings, store)
