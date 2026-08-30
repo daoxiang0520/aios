@@ -231,6 +231,8 @@ class RuntimeVariantRunner:
             },
             "cost": {
                 "model_calls": int(measured.get("model_api_calls", 0) or 0),
+                "tool_calls": int(measured.get("executed_actions", 0) or 0),
+                "cycles": int(measured.get("task_cycles", cycles) or cycles),
                 "input_tokens": int(measured.get("input_tokens", 0) or 0),
                 "output_tokens": int(measured.get("output_tokens", 0) or 0),
                 "tokens": int(measured.get("model_tokens", 0) or 0),

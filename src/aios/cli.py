@@ -24,10 +24,16 @@ from .plugins import PluginManager
 from .sandbox import DockerSandboxBroker
 from .skills import SkillManager
 from .runtime import AIOSRuntime
-from .self_evolution import ExperienceAnalyzer, ModelEvolutionReasoner, SelfEvolutionLoop
+from .self_evolution import (
+    ExperienceAnalyzer, ModelEvolutionReasoner, SelfEvolutionLoop,
+    SoftFrictionExperienceBuilder, StrategyOptimizationReasoner,
+)
 from .runtime_evolution import (
     ExternalRuntimeEvaluator, ModelRuntimeMutationReasoner, RuntimeCandidateManager,
     RuntimeDiagnosisBenchmark,
+)
+from .open_evolution import (
+    ModelOpenEvolutionBackend, OpenEvolutionAgent, compare_evolution_modes,
 )
 from .runtime_provenance import RuntimeProvenanceManager
 from .situation import SituationResolver, normalize_resource_path
@@ -137,6 +143,26 @@ def _parser() -> argparse.ArgumentParser:
     evolution_auto.add_argument("--runs", type=int)
     evolution_auto.add_argument("--task-limit", type=int, default=100)
     evolution_auto.add_argument("--trace-limit", type=int, default=1000)
+    optimize_observe = evolution_commands.add_parser(
+        "optimize-observe", help="Build bounded facts from successful but costly tasks",
+    )
+    optimize_observe.add_argument("--task-limit", type=int, default=10)
+    optimize_observe.add_argument("--trace-limit", type=int, default=200)
+    optimize_observe.add_argument(
+        "--task-id", action="append", type=int, default=[],
+        help="Explicit failed/dead-letter Strategy Adaptation sample",
+    )
+    optimize_run = evolution_commands.add_parser(
+        "optimize-run", help="Propose and counterfactually evaluate one Strategy candidate",
+    )
+    optimize_run.add_argument("--capsule", action="append", default=[])
+    optimize_run.add_argument("--runs", type=int)
+    optimize_run.add_argument("--task-limit", type=int, default=10)
+    optimize_run.add_argument("--trace-limit", type=int, default=200)
+    optimize_run.add_argument(
+        "--task-id", action="append", type=int, default=[],
+        help="Explicit failed/dead-letter Strategy Adaptation sample",
+    )
     runtime_observe = evolution_commands.add_parser(
         "runtime-observe", help="Build a fact-only cross-layer Runtime experience capsule",
     )
@@ -164,6 +190,20 @@ def _parser() -> argparse.ArgumentParser:
         "runtime-evaluate", help="Run Host-owned immutable gates against a Runtime candidate",
     )
     runtime_evaluate.add_argument("candidate_id")
+    runtime_open = evolution_commands.add_parser(
+        "runtime-open", help="Run a bounded inspect/experiment/edit/test Open Evolution session",
+    )
+    runtime_open.add_argument("task_id", type=int)
+    runtime_open.add_argument("--max-rounds", type=int, default=12)
+    runtime_open.add_argument(
+        "--benchmark-role",
+        choices=["mechanism_regression", "capability_holdout"],
+        default="mechanism_regression",
+    )
+    runtime_compare = evolution_commands.add_parser(
+        "runtime-compare", help="Compare frozen Structured and Open Evolution observations",
+    )
+    runtime_compare.add_argument("--task-id", action="append", type=int, default=[])
     evolution_commands.add_parser("tools")
     rollback = evolution_commands.add_parser("rollback")
     rollback.add_argument("version", type=int)
@@ -685,11 +725,40 @@ def main(argv: list[str] | None = None) -> int:
                 runs_per_variant=args.runs or settings.experiments.default_runs_per_variant,
                 task_limit=args.task_limit, trace_limit=args.trace_limit,
             ))
+        elif args.evolution_command == "optimize-observe":
+            _print_json(SoftFrictionExperienceBuilder(
+                store, included_task_ids=args.task_id,
+            ).analyze(
+                task_limit=args.task_limit,
+                trace_limit_per_task=args.trace_limit,
+            ))
+        elif args.evolution_command == "optimize-run":
+            skill_manager, capsules, runner = _experiment_services(settings, store)
+            semantic = PairwiseSemanticJudge(
+                ModelSemanticJudge(settings.model)
+                if settings.experiments.semantic_judge_enabled else None
+            )
+            orchestrator = ExperimentOrchestrator(
+                store, capsules, runner, semantic_judge=semantic,
+            )
+            loop = SelfEvolutionLoop(
+                store, SoftFrictionExperienceBuilder(
+                    store, included_task_ids=args.task_id,
+                ),
+                StrategyOptimizationReasoner(LLMController(settings.model)),
+                manager, orchestrator,
+            )
+            _print_json(loop.run(
+                capsule_ids=args.capsule or None,
+                runs_per_variant=args.runs or settings.experiments.default_runs_per_variant,
+                task_limit=args.task_limit,
+                trace_limit=args.trace_limit,
+            ))
         elif args.evolution_command in {
             "runtime-observe", "runtime-propose", "runtime-list",
             "runtime-show", "runtime-evaluate", "runtime-benchmark",
             "runtime-benchmark-suite",
-            "runtime-provenance",
+            "runtime-provenance", "runtime-open", "runtime-compare",
         }:
             if args.evolution_command == "runtime-provenance":
                 provenance = RuntimeProvenanceManager(settings, store)
@@ -697,6 +766,17 @@ def main(argv: list[str] | None = None) -> int:
                     "bindings": provenance.bindings(args.task_id),
                     "eligibility": provenance.assess(args.task_id),
                 })
+                return 0
+            if args.evolution_command == "runtime-open":
+                _print_json(OpenEvolutionAgent(
+                    settings, store, ModelOpenEvolutionBackend(settings.model),
+                ).run(
+                    args.task_id, max_rounds=args.max_rounds,
+                    benchmark_role=args.benchmark_role,
+                ))
+                return 0
+            if args.evolution_command == "runtime-compare":
+                _print_json(compare_evolution_modes(store, args.task_id))
                 return 0
             runtime_candidates = RuntimeCandidateManager(
                 settings, store, ModelRuntimeMutationReasoner(LLMController(settings.model)),

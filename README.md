@@ -1,10 +1,10 @@
 # Self-Evolving AIOS
 
-Current release: **v0.8.0-alpha.6.1**. This correctness patch makes Windows sandbox
-discard robust to ReadOnly files and separates immutable model attribution, model-intended
-disposition, and effective Host disposition in Evolution records. It adds observational
-measurement for source support and unsupported Agent-action claims without changing the
-Reasoner prompt, mutation surface, production activation policy, or external fitness authority.
+Current release: **v0.9.0-alpha.2.2**. Runtime Repair remains frozen at the alpha.6.1
+experimental boundary. The new Self-Optimization path observes bounded facts from successful
+tasks, lets the model propose one Strategy/Workflow candidate, and replays baseline versus
+candidate from the same immutable Task Capsules. Correctness and security remain hard constraints;
+quality, calls, cycles, tokens, latency, and robustness remain a Pareto vector rather than one reward.
 
 ## Agent Workbench（第一版）
 
@@ -66,6 +66,17 @@ python -m aios --config config.json run
 - Evolution Run 分开保存 `model_attribution / model_intended_disposition / effective_host_disposition`，模型跨阶段改变 Runtime-defect 判断但没有显式 hypothesis revision 时，仅标记 attribution inconsistency；Host 不替模型选择真值；
 - Benchmark 只新增轻量事实测量：`source_support` 区分相关源码是否选择/投递，`unsupported_action_claim` 核对模型明确声称的 Agent 行为是否存在于 Action History；二者都不是 Reasoner 硬门禁；
 - Task 84 作为冻结 Root-of-Trust abstention regression：Runtime bug 存在但 `sandbox.py` 不可由 Evolution 修改，期望 `NO_ACTION / authority_boundary|root_of_trust / sandbox_lifecycle`，不重跑原盲测；
+- v0.9-alpha.1 的 `soft_friction_experience/v1` 只选择 `completed + verifier success` 任务，逐任务记录 Tokens、Model/Tool Calls、Cycles、重复读取/执行、重试、Context Reuse、Evidence 后续额外动作，以及失败后成功的事实序列；未知的分段 Token 成本保留为 `null`，不由 Host 猜测；
+- failed/dead-letter Strategy Adaptation Experience 不自动混入样本，只能通过 `--task-id` 显式选择，并且存在 Host-confirmed Runtime regression 的任务会被排除。此类事实记录重复命令族、退出码、TimeoutError 签名是否出现、未恢复失败数、最终 Cycle 动作数、Controller done 与 Host completion、continuation-like 文本测量信号，不提供错误根因；
+- Soft Friction Experience 不输出 `patterns`、坏行为标签、推荐策略或诊断答案。模型用开放问题自主选择 Workflow、Context、Retrieval、Tool-use、Cycle 或 Procedural Strategy，并且一次只能产生一个现有低风险 Harness mutation；
+- v0.9-alpha.2 将既有 Structured Evolution 冻结为对照组，并新增独立的 Open Evolution Agent。它在 failure-time Candidate repo 中多轮调用 `inspect_experience/read_source/search_source/run_diagnostic/edit_candidate/write_candidate_test/inspect_diff`，直到明确 `submit_candidate` 或 `NO_ACTION`；Host 不要求 Hypothesis、Failure Path 或 Patch Contract 表单；
+- Open Evolution 的诊断命令只在无网络、只读 Candidate 挂载的 Docker 中执行；源码修改必须经过白名单 edit，Root-of-Trust、凭据、外部门禁和生产激活权限均不开放。候选仍交给原 `ExternalRuntimeEvaluator`，因此 `MutableSystem != FitnessAuthority` 保持不变；
+- v0.9-alpha.2.1 将 Open Evolution 的可见世界限制为 failure-time `src/aios/ + pyproject.toml + Agent 当次创建的 candidate_tests/`；当前 README、当前 tests、外部 Evaluator、实验报告和 benchmark annotation 不再进入 Candidate world。缺少对齐快照或 Docker 环境时可以验证机制，但实验明确标记无效，不能计入能力评估；
+- 原任务作为 `original_task` 事实输入，当前目标单独绑定为 `evolution_objective=诊断/实验/修改候选 AIOS Runtime`。Tool Result 首次完整投递，之后降为带 digest 的事实投影，可用 `read_observation(Rxxxx)` 按需重载；Host 不生成诊断结论；
+- Open Evolution Run 分开记录 `model_intended_disposition`、`effective_host_disposition` 与 `terminal_decision_missing`，并给出 `mechanism_validity / experimental_validity / benchmark_role / capability_evaluation_eligible`。Run 41 因当前测试泄漏和目标错绑仅保留为机制回归，不作为能力成绩；
+- v0.9-alpha.2.2 修复 Observation reload identity：`read_observation(Rxxxx)` 只是 immutable canonical payload 的字符分页视图，不创建新引用，不保存 reload wrapper，也不把正文重复持久化进 Run transcript。重复读取只增加固定大小的访问元数据；
+- `runtime-compare` 并列投影 Structured/Open 的 Candidate、外部门禁、回归、调用、Token、耗时和主动诊断实验次数；缺失的正确诊断/正确 abstention 人工判据保留为 `null`，不会被合成为单一 reward；
+- Strategy Candidate 只在与成功轨迹 Task ID 对齐的 replayable Capsule 上进行 baseline/candidate 回放。Evaluator 将 Completion、Verifier、True Completion 和 Security 作为硬约束，再分别比较 Quality、Model Calls、Tool Calls、Cycles、Tokens、Latency 与 Completion Consistency；Pareto 冲突进入 `NEEDS_REVIEW`，不合成单一 reward；
 - DeepSeek Runtime Evolution 请求继续启用官方 `response_format={"type":"json_object"}`，并新增真实 JSON 样例及单顶层文档 framing；只允许剥离完整外层 Markdown fence，多个 JSON 文档绝不猜选。空内容、截断、双文档等失败会形成不含原文的 `protocol_failed` Evolution Run，且不自动重采样；
 - Mutation Semantic Precision 保持向量指标：`contract_valid / source_relevant / path_reachable / gate_effective / regression_safe`，不折叠成单一奖励分数；
 - Reasoner hypothesis 具有 `supported/rejected/unresolved` 最终状态；Host 确定性检查 hypothesis、runtime-defect judgment 与 final disposition，矛盾输出被安全收敛为可审计的 `NO_ACTION/attribution_consistency_failed`，不得生成 Candidate；
@@ -239,6 +250,15 @@ python -m aios --config config.json evolution runs
 python -m aios --config config.json evolution tools
 python -m aios --config config.json evolution list
 python -m aios --config config.json evolution runtime-provenance <task_id>
+
+# 查看成功任务的 bounded soft-friction facts（不调用模型）
+python -m aios --config config.json evolution optimize-observe --task-limit 10
+
+# 显式加入一个未确认 Runtime regression 的失败/死信 Strategy 样本
+python -m aios --config config.json evolution optimize-observe --task-id 85
+
+# 让模型提出一个 Strategy Candidate，并在同批 Task Capsules 上做对照
+python -m aios --config config.json evolution optimize-run --capsule <capsule_id> --runs 3
 python -m aios --config config.json status
 ```
 
@@ -437,6 +457,52 @@ python -m aios --config config.json evolution auto-run `
 ```
 
 When `--capsule` is omitted, the loop selects up to three recent replayable capsules. With the mock provider it records `NO_ACTION`; a configured remote model is required to author a real hypothesis.
+
+## v0.9.0-alpha.2.2 Observation Identity Correctness
+
+`read_observation` 现在满足 `View(R, offset, limit)`，不再发生 `Store(Read(R))`。每个原始 Tool Result 最多创建一个 immutable canonical Observation；引用、payload、SHA-256 digest 与 kind 在会话内保持一对一稳定。重载始终返回传入的同一 `Rxxxx`，按 Unicode 字符 offset 分页，并提供 `returned_characters / next_offset / total_characters / digest`；`limit=0` 可只查询元数据。
+
+当前模型轮能看到所请求的 transient chunk；下一轮上下文只保留 ref、范围、字符数和 digest。持久化 Evolution transcript 对 `read_observation` 同样只记录小型访问元数据，不保存正文。因此连续重载不会形成新 Observation、引用链、JSON envelope 嵌套或正文线性复制。该补丁没有修改 Reasoner、轮数、世界隔离、Candidate boundary 或外部门禁。
+
+修复后的 Task 77 Run 43 机制回归确认：3 次 reload 均保留原引用（`R0002/R0004/R0004`），持久记录均无 `text`，相关源码从第 4 轮开始读取。总 Token 为 93,849，与修复前 93,809 基本持平；模型仍未运行诊断实验或提交终态。这不再归因于引用递归，且 Task 77 不计入能力评估。World、Goal、Observation identity、处置分离、Candidate boundary 与外部 Evaluator 隔离全部满足后，Open Evolution instrument 在 alpha.2.2 冻结，等待新的 Future Holdout。
+
+## v0.9.0-alpha.2.1 Open Evolution World/Goal/Context Integrity
+
+alpha.2.1 不增强 Reasoner，也不增加强制诊断合同。它只修复 Run 41 暴露的实验边界：Open Agent 只能看到 failure-time Runtime 白名单世界；`original_task` 是证据，`evolution_objective` 才是当前目标；旧 Tool Result 压缩为可寻址事实引用，模型可通过 `read_observation` 重载；模型意图与 Host 有效处置分别保存。
+
+运行时必须显式声明 benchmark 角色。已知案例默认是机制回归；只有未见 holdout 且世界、来源与环境完整时，才允许进入能力评价：
+
+```powershell
+python -m aios --config config.json evolution runtime-open 77 `
+  --benchmark-role mechanism_regression --max-rounds 12
+
+python -m aios --config config.json evolution runtime-open NEW_TASK_ID `
+  --benchmark-role capability_holdout --max-rounds 12
+```
+
+`experimental_validity.state` 使用 `valid / invalid_leakage / invalid_objective_binding / invalid_provenance / invalid_environment`。机制能运行不等于实验有效；无模型终态时保存 `model_intended_disposition=missing`，Host 可以安全回退为 `effective_host_disposition=NO_ACTION`，但不能把回退伪装成模型 abstention。
+
+## v0.9.0-alpha.2 Open Evolution Agent
+
+Structured Runtime Evolution remains unchanged and is the `H_structured` baseline. Open mode changes only the interaction pattern to an iterative Agent loop:
+
+```text
+Experience → inspect/search → diagnostic experiment → edit → test
+           → revise/continue → submit candidate or NO_ACTION
+```
+
+Run one frozen regression case, evaluate a submitted candidate with the unchanged Host gate, and compare modes:
+
+```powershell
+$env:DEEPSEEK_API_KEY = (Get-Content api.key -Raw).Trim()
+python -m aios --config config.json evolution runtime-open 77 `
+  --benchmark-role mechanism_regression --max-rounds 12
+python -m aios --config config.json evolution runtime-evaluate RTC_CANDIDATE_ID
+python -m aios --config config.json evolution runtime-compare `
+  --task-id 77 --task-id 79 --task-id 80 --task-id 83 --task-id 84
+```
+
+The Open Agent cannot edit production, external evaluators, benchmark annotations, credentials, or Root-of-Trust files. Diagnostic commands receive a networkless, read-only candidate mount; persistent edits occur only through the bounded candidate tools. Candidate self-tests never replace the task-specific immutable external gate.
 
 ## v0.6.8.2 Goal-Oriented Coverage
 

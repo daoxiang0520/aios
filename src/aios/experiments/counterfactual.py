@@ -130,17 +130,25 @@ class CounterfactualEvaluator:
             )
             cost_improved = any(
                 candidate[key] < baseline[key]
-                for key in ("median_model_calls", "median_tokens", "median_latency_ms")
+                for key in (
+                    "median_model_calls", "median_tool_calls", "median_cycles",
+                    "median_tokens", "median_latency_ms",
+                )
             )
             cost_worse = any(
                 candidate[key] > baseline[key]
-                for key in ("median_model_calls", "median_tokens", "median_latency_ms")
+                for key in (
+                    "median_model_calls", "median_tool_calls", "median_cycles",
+                    "median_tokens", "median_latency_ms",
+                )
             )
             semantic_verdict = semantic.get("verdict")
             if semantic_verdict == "baseline_better":
                 state, reason = PromotionState.NEEDS_REVIEW, "Soft semantic evidence conflicts with hard metrics"
             elif quality_gain and cost_worse:
                 state, reason = PromotionState.NEEDS_REVIEW, "Quality improved at higher measured cost"
+            elif cost_improved and cost_worse:
+                state, reason = PromotionState.NEEDS_REVIEW, "Cost vector has a Pareto trade-off"
             elif quality_gain or cost_improved:
                 if fidelity == CapsuleFidelity.FULL.value:
                     state, reason = PromotionState.PROMOTABLE, "Candidate is not worse and improves measured utility"
@@ -164,7 +172,10 @@ class CounterfactualEvaluator:
             "success_rate": sum(status == "completed" for status in statuses) / len(runs),
             "verifier_pass_rate": sum(verifier) / len(runs),
             "true_completion_rate": sum(true_completion) / len(runs),
+            "completion_consistency": 1.0 if len(set(true_completion)) == 1 else 0.0,
             "median_model_calls": statistics.median(values("cost", "model_calls")),
+            "median_tool_calls": statistics.median(values("cost", "tool_calls")),
+            "median_cycles": statistics.median(values("cost", "cycles")),
             "median_tokens": statistics.median(values("cost", "tokens")),
             "median_latency_ms": statistics.median(latencies),
             "p95_latency_ms": sorted(latencies)[max(0, math.ceil(0.95 * len(latencies)) - 1)],
@@ -181,13 +192,27 @@ class CounterfactualEvaluator:
         if comparable:
             for key in (
                 "success_rate", "verifier_pass_rate", "true_completion_rate",
-                "median_model_calls", "median_tokens", "median_latency_ms", "p95_latency_ms",
+                "completion_consistency",
+                "median_model_calls", "median_tool_calls", "median_cycles",
+                "median_tokens", "median_latency_ms", "p95_latency_ms",
             ):
                 delta[key] = round(float(candidate[key]) - float(baseline[key]), 6)
         return {
             "kind": "counterfactual_report_v1", "evidence_level": "counterfactual_reexecution",
+            "selection_rule": {
+                "hard_constraints_first": ["security", "success", "verifier", "true_completion"],
+                "optimization_vector": [
+                    "quality", "model_calls", "tool_calls", "cycles", "tokens",
+                    "latency", "completion_consistency",
+                ],
+                "pareto_comparison": True,
+                "single_scalar_reward": False,
+            },
             "evidence_tiers": {
-                "tier_1_measured": ["verifier", "task_status", "model_calls", "tokens", "latency", "security"],
+                "tier_1_measured": [
+                    "verifier", "task_status", "model_calls", "tool_calls", "cycles",
+                    "tokens", "latency", "security",
+                ],
                 "tier_2_model_judged": semantic,
                 "tier_3_self_reported": "not_used_for_promotion",
             },

@@ -1,5 +1,78 @@
 # AIOS v0.6 实现与测试报告
 
+## v0.9.0-alpha.2.2 Observation Identity Correctness（2026-08-31）
+
+alpha.2.1 后的 Task 77 机制回归证明 World Isolation、Goal Binding 与 Measurement Integrity 已生效：failure-time 来源、Docker、目标绑定和无泄漏状态均有效，Token 从 Run 41 的 201,987 降至 93,809。但 7 次 `read_observation` 被再次注册为新 Observation，并对完整 Tool Result JSON envelope 反复序列化，产生 `R0003 → R0005 → ...` 引用链和大量转义文本；12 轮中没有诊断实验或模型终态。这是 Observation identity correctness bug，不是新的 Reasoner 失败证据。
+
+本补丁只修改 Open Evolution 会话内 Observation Store、`read_observation` view 和 transcript projection：
+
+- 原始 addressable Tool Result 创建唯一 canonical payload，保存稳定 `ref/kind/payload/digest/metadata`；Experience 与源码 Observation 保存完整逻辑内容，而非首次分页 chunk；
+- `read_observation` 直接分页 canonical payload，始终返回调用方传入的同一引用；使用字符 offset，默认 8,000、最大 24,000，返回 next offset、总字符数和 digest，`limit=0` 只返回 metadata；
+- reload 调用不进入 Observation 创建路径；`submit_candidate/no_action` 也不创建无意义引用；
+- 当前 Tool Response 临时携带正文供下一模型轮使用，随后压缩为事实投影；持久化 transcript 对 reload 只保存引用、kind、digest、offset、returned/total characters、truncated 和 next offset；
+- metrics 新增 `observation_objects_created` 与 `observation_store_characters`，用于确认 reload 次数与对象/内容增长解耦。
+
+专项测试 **13/13** 通过：100 次重读不增加对象、原 payload/digest 不变、字符分页精确还原、metadata-only 查询、不出现 `read_observation_result` 引用链、20 次在线重载只保留同一个引用且每条持久记录小于 1,000 字符；v0.9 专项测试 **22/22** 通过。完整回归 **221/221** 通过、0 失败，耗时 159.546 秒。没有新增 Manager、Contract、Resource 重构或 Evolution gate，也没有调整 Reasoner 和轮数。
+
+### Task 77 Run 43 机制回归与装置冻结
+
+在上述 221/221 基线上，从本地 `api.key` 临时注入 DeepSeek 密钥并执行一次 `mechanism_regression`。Run 43 的 failure-time world、provenance、Docker、Goal Binding 和无泄漏检查全部有效；它不是 capability holdout，`capability_evaluation_eligible=false`。
+
+- 12 Model Calls、20 Tool Calls、93,849 Tokens（Prompt 92,023 / Completion 1,826）、46.340 秒；与修复前 93,809 Tokens 基本持平，不能宣称成本改善；
+- reload 从 7 次降为 3 次，持久化引用依次为 `R0002 / R0004 / R0004`，全部没有 `text`；相同 `R0004` 重载没有产生 alias 或 Observation chain；
+- 创建 17 个原始 Tool Result Observation，总 canonical payload 244,335 字符；reload 次数不计入对象创建；
+- Agent 第 4 轮开始读取相关 `evaluation.py`，早于上一轮的第 11 轮，但仍进行 0 次诊断实验，并在 12 轮结束时没有 `submit_candidate/no_action`；模型意图为 `missing`，Host 有效处置为安全 `NO_ACTION`；
+- Run 43 证明 Observation identity 和 transient persistence 修复成立，但不证明诊断或自主修复能力。剩余的源码分页选择、无实验和缺少终态作为模型行为原样保留，不再针对 Task 77 修改 Harness。
+
+停止条件已经满足：failure-time world 正确、leakage=false、evolution objective 正确、reload 幂等、上下文不递归增长、Host/模型处置分离、Candidate boundary 正确、外部 Evaluator 隔离。因此 Open Evolution 实验装置冻结在 alpha.2.2；Task 77 只保留为 mechanism regression，后续等待新的 provenance-complete Future Holdout。
+
+## v0.9.0-alpha.2.1 Open Evolution Experimental Integrity（2026-08-31）
+
+Run 41 证明 Open Evolution 的多轮 Tool Calling 机制可运行，但该轮不能作为能力成绩：模型读取了当前 README/测试中的后验信息，原业务任务与 Runtime 进化目标没有形成一等边界，12 轮耗尽后模型未提交终态，而 Host 的安全 `NO_ACTION` 回退容易被误读成模型主动 abstain。本补丁只修事实世界与测量，不增强 Reasoner，也不新增 benchmark-specific 诊断规则。
+
+- World Isolation：Candidate world 由 failure-time 白名单构造，只包含 `src/aios/`、`pyproject.toml` 与 Agent 当次创建的 `candidate_tests/`。当前 README、当前 tests、`external_evaluators/`、`experiments/` 与 annotation 不再复制。来源不是对齐快照时记录 `invalid_provenance`，Docker 未就绪时记录 `invalid_environment`，不得进入能力分母；
+- Goal Binding：请求同时携带一等 `original_task` 与 `evolution_objective`，并显式指定 `current_goal=evolution_objective`。原任务只作为失败证据，不要求 Agent 完成原业务任务；
+- Context Addressability：每个 Tool Result 首次完整进入上下文并取得 `R0001...` 引用；下一模型轮后旧结果变为 digest、状态、路径、大小、exit code、匹配路径等事实投影。`read_observation` 可从 Host observation store 按 offset/limit 重载原结果；compact 层不加入诊断、归因或推荐；
+- Measurement Integrity：Run 独立保存 `model_intended_disposition`、`effective_host_disposition`、`terminal_decision_missing`，以及 `mechanism_validity`、`experimental_validity`、`benchmark_role`、`capability_evaluation_eligible`。Host round-budget fallback 仍为安全 `NO_ACTION`，但模型意图固定为 `missing`；
+- 历史 Run 41 不改写。`runtime-compare` 对缺少新版字段的旧 Open Run做只读 legacy assessment；检测到 current tests/README 后标记 `invalid_leakage`，同时记录旧版 objective misbinding，不补写正确诊断或 abstention 分数；
+- Task 77 从能力 holdout 降为 `mechanism_regression`。新 CLI 参数 `--benchmark-role mechanism_regression|capability_holdout` 默认采用前者，避免已知案例被误计为新能力证据。
+
+alpha.2.1 专项测试从 6 项扩为 **11 项**，新增覆盖 exact-world 隔离、目标绑定、Observation compact/reload、模型终态与 Host 回退分离、旧 Run 无效性识别；v0.9 两阶段专项测试 **20/20** 通过。完整回归 **219/219** 通过、0 失败，耗时 164.653 秒。该补丁没有调用 DeepSeek，没有重跑 Task 77，也没有修改其原始 Run 41 记录。
+
+## v0.9.0-alpha.2 Open Evolution Agent（2026-08-30）
+
+本版冻结既有 Structured Evolution Harness 作为 `H_structured`，新增并行的 `H_open` 实验模式，不删除或放宽任何现有安全/评价边界。`OpenEvolutionAgent` 不再要求模型填写 Hypothesis、Failure Path 或 Patch Causality 表单，而是允许最多 24 轮（CLI 默认 12）原生 Tool Calling：检查 Experience、读取/搜索 failure-time 源码、运行诊断实验、修改候选、创建候选测试、检查 diff，最终显式提交 Candidate 或 `NO_ACTION`。
+
+主动诊断命令运行在 Docker `--network none + --read-only + cap-drop ALL + no-new-privileges` 环境中，Candidate repo 只读挂载；持久修改只能经过 Host 校验的 `edit_candidate` 和 `write_candidate_test`。生产源码、凭据、Root-of-Trust、外部 Evaluator 与 benchmark annotation 不可写且不向容器挂载。提交后的 Candidate 继续使用原 `ExternalRuntimeEvaluator`，Candidate test 不能替代 Host-owned gate，生产激活始终为 false。
+
+新增 `runtime-open TASK_ID --max-rounds N` 和 `runtime-compare --task-id ...`。对照报告保留 Candidate、External Gate、Regression、Model Calls、Tokens、Wall Time 与 `diagnostic_experiments_run`；没有外部人工标签时，正确诊断和正确 abstention 保留为 null，不生成单一 reward。
+
+专项测试覆盖：主动实验后修改并复测、Root-of-Trust 拒绝、`NO_ACTION` 丢弃实验编辑、无 Host gate 的 Open Candidate 继续拒绝、Structured/Open 缺失值保真、CLI 命令，共 **6/6** 通过。完整套件 **214/214** 通过，0 失败，耗时 145.083 秒。该范式实验只扩大 Candidate 内的策略自由，不扩大 Authority；本轮未调用 DeepSeek，也未重跑冻结盲测案例。
+
+## v0.9.0-alpha.1 Soft Friction Experience + Strategy Candidate Evaluation（2026-08-30）
+
+本阶段从主动追逐 Runtime defect 切换到 Self-Optimization；v0.8 Runtime Repair Harness 保留并等待自然产生的新 Future Holdout，不增加 alpha.7 Reasoner scaffold。
+
+第一版只复用现有设施实现三件事：`SoftFrictionExperienceBuilder` 从真实 `completed + verifier success` 任务提取 bounded 逐任务事实；`StrategyOptimizationReasoner` 面对未标注轨迹自主提出一个 Workflow/Strategy 假设；现有 `SelfEvolutionLoop + ExperimentOrchestrator` 在与样本 Task ID 对齐的 immutable Capsules 中执行 baseline/candidate counterfactual。没有新增 Manager、Contract 或 Ontology。
+
+Experience 包含 Tokens、Model Calls、Tool Calls、Cycles、重复资源请求/执行、失败动作、重试、Context Reuse、首次 Evidence Ledger 证据之后的额外动作/Model Calls/Cycles，以及 failure→next success 的事实序列。Host 不把 repeated read、工具切换或高成本标记为坏行为，也不推荐 grep、symbol search 等答案。历史数据没有 per-trace Token 归因时明确记录 `null`，不做估算。
+
+候选面限定为 Strategy/Workflow；第一版通过现有低风险 Harness 设置承载 prompt/procedure、context selection 和 cycle/tool-use strategy，不开放 SecurityKernel、Sandbox、Authority、Storage/Audit、External Evaluator 或生产自动激活。模型一次只能提交一个可执行 Harness mutation。
+
+Counterfactual 向量新增 Tool Calls、Cycles 与 Completion Consistency。Selection 先执行 Security、Success、Verifier、True Completion 硬约束，再对 Quality、Model Calls、Tool Calls、Cycles、Tokens、Latency、Robustness 做 Pareto 比较；一项改善但另一项变差时进入 `NEEDS_REVIEW`，不折叠成单一 reward。
+
+新增 CLI：`evolution optimize-observe` 只生成事实、不调用模型；`evolution optimize-run` 生成一个 Strategy Candidate 并在同批 replayable Capsules 上对照。真实本地数据库的三任务观察 smoke test 成功，输出 Task 80/78/76 的 bounded facts，未执行模型提案或生产变更。
+
+验证结果：v0.9 新增专项测试 **9/9**；Task 85 扩展后的完整套件 **208/208** 通过，0 失败，耗时 157.064 秒。
+
+### Task 85 Strategy Adaptation Experience
+
+Task 85 不作为 Runtime Repair Future Holdout。Verifier 正确拒绝了带 7 个未恢复工具失败的 continuation-like 最终文本，目前不存在 Host-confirmed Runtime regression。v0.9 扩展 failed/dead-letter 输入，但只允许用户通过 `--task-id` 显式选择；自动样本仍严格限定为成功任务。缺少确认记录被表达为 `runtime_regression_confirmed=false + basis=no_host_confirmed_runtime_regression_record`，不被解释成“Runtime 一定没有缺陷”。
+
+真实 Task 85 事实投影 smoke test记录：状态 `dead_letter`、3 Attempts、5 Cycles、24 Model Calls、141,437 Tokens、43 个 Action Results（18 失败）、7 个 unresolved failures；观测到 exit 120 共 11 次、exit 1 共 4 次、exit 2/141 各 1 次，未观测到 `TimeoutError` 字符串；多个规范化命令族重复；最终 Cycle planned/executed actions 均为 0，Controller `done=true`、Host completion=false，文本命中 `let me check` continuation-like 测量信号。Experience 不包含 Broken Pipe、timeout 归因或策略建议。
+
+Task 85 当时没有 pre-task immutable Capsule，因此当前只能作为 Strategy Experience，不能产生有效 baseline/candidate counterfactual 成绩。未来同类任务必须先 `capsule capture <queued_task_id>`，再执行并用于 Strategy replay。
+
 ## v0.8.0-alpha.6.1 Runtime Correctness & Measurement Fix（2026-08-30）
 
 本补丁不增强 Reasoner、不修改提示词，也不扩大 Runtime Mutation surface。Task 84 暴露的 Windows ReadOnly 清理缺陷被归类为 human-confirmed Root-of-Trust bug：`DockerSandboxBroker` 现在在 `shutil.rmtree` 遇到 `PermissionError` 时恢复写权限并重试，确保普通文件、只读文件、嵌套只读 `.git` object、幂等 discard 与失败后重新 prepare 均满足 `SandboxDiscard(workspace) => workspace removed`；`.git` 元数据不会被发布回生产 workspace。
