@@ -100,18 +100,36 @@ class Verifier:
     def __init__(self, completion_arbiter: CompletionArbiter | None = None):
         self.completion_arbiter = completion_arbiter or CompletionArbiter()
 
-    def verify(self, actions: list[Action], results: list[ActionResult], *, planned_count: int, task_done: bool = True, request: str = "", contract: EvidenceContract | None = None, final_output: str = "", capability_assessment: dict[str, Any] | None = None, completion_metadata: dict[str, Any] | None = None, coverage_assessment: dict[str, Any] | None = None, established_evidence: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    def verify(self, actions: list[Action], results: list[ActionResult], *, planned_count: int, task_done: bool = True, request: str = "", contract: EvidenceContract | None = None, final_output: str = "", capability_assessment: dict[str, Any] | None = None, completion_metadata: dict[str, Any] | None = None, coverage_assessment: dict[str, Any] | None = None, established_evidence: list[dict[str, Any]] | None = None, established_execution_evidence: bool = False, unresolved_failures: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         contract = contract or EvidenceContract.from_request(request, self._expected_artifacts(request))
         checks: list[dict[str, Any]] = []
         self._check(checks, "execution", "all_actions_executed", len(results) == planned_count, f"executed={len(results)} planned={planned_count}")
+        current_unresolved = self._unresolved_action_failures(actions, results)
+        carried_unresolved = [
+            item for item in (unresolved_failures or []) if isinstance(item, dict)
+        ]
+        unresolved = [*carried_unresolved, *current_unresolved]
         failures = sum(not result.ok for result in results)
-        recovered = failures > 0 and task_done
+        recovered = failures > 0 and not current_unresolved
         self._check(
             checks,
             "execution",
             "tool_failures_recovered",
-            failures == 0 or recovered,
-            f"failures={failures}; recovered_by_observed_final_plan={recovered}",
+            not unresolved,
+            f"current_failures={failures}; unresolved_attempt_failures={len(unresolved)}; recovered_by_later_success={recovered}",
+        )
+        action_required = self._requires_action_evidence(request, contract)
+        observed_execution = bool(results) or bool(established_execution_evidence)
+        self._check(
+            checks,
+            "execution",
+            "required_execution_evidence_present",
+            not action_required or observed_execution,
+            (
+                "observed action result exists in this Attempt"
+                if observed_execution
+                else "action-required task has no observed execution evidence"
+            ),
         )
 
         writes = []
@@ -159,7 +177,11 @@ class Verifier:
         protocol_clean = not contains_serialized_tool_call(final_output)
         artifact_goal = bool(contract.artifacts) and not missing
         effective_done = task_done or artifact_goal
-        execution_ok = len(results) == planned_count and (failures == 0 or recovered)
+        execution_ok = (
+            len(results) == planned_count
+            and not unresolved
+            and (not action_required or observed_execution)
+        )
         decision = self.completion_arbiter.decide(
             execution_satisfied=execution_ok,
             evidence_satisfied=evidence_ok and not missing,
@@ -190,6 +212,50 @@ class Verifier:
             "checks": checks,
             "coverage_assessment": coverage,
         }
+
+    @staticmethod
+    def _action_key(action: Action) -> str:
+        return json.dumps(
+            {"tool": action.tool, "arguments": action.arguments},
+            ensure_ascii=False, sort_keys=True, default=str,
+        )
+
+    @classmethod
+    def _unresolved_action_failures(
+        cls, actions: list[Action], results: list[ActionResult],
+    ) -> list[dict[str, Any]]:
+        unresolved: dict[str, dict[str, Any]] = {}
+        for action, result in zip(actions, results, strict=False):
+            key = cls._action_key(action)
+            if result.ok:
+                unresolved.pop(key, None)
+            else:
+                unresolved[key] = {
+                    "action_key": key,
+                    "tool": action.tool,
+                    "error": result.error,
+                }
+        return list(unresolved.values())
+
+    @staticmethod
+    def _requires_action_evidence(request: str, contract: EvidenceContract) -> bool:
+        if contract.artifacts or contract.capabilities or contract.evidence:
+            return True
+        text = request.casefold()
+        direct_markers = (
+            "生成", "创建", "写入", "保存", "输出", "修改", "编辑", "替换",
+            "实现", "开发", "构建", "部署", "安装", "运行", "执行", "测试",
+            "create", "generate", "write", "save", "modify", "edit", "replace",
+            "implement", "develop", "build", "deploy", "install", "run ", "execute", "test",
+        )
+        completion_objects = (
+            "项目", "原型", "程序", "代码", "文件", "应用", "系统",
+            "project", "prototype", "program", "code", "file", "application", "system",
+        )
+        return any(marker in text for marker in direct_markers) or (
+            ("完成" in text or "complete" in text)
+            and any(marker in text for marker in completion_objects)
+        )
 
     @staticmethod
     def _is_skill_authoring_request(request: str) -> bool:

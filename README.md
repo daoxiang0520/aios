@@ -1,10 +1,10 @@
 # Self-Evolving AIOS
 
-Current release: **v0.8.0-alpha.3**. This build retains the bounded Candidate
-Runtime Mutation boundary, adds phase/attempt/cycle-bound temporal evidence, and
-adds a Host-owned attribution-consistency contract. The Autonomous Diagnosis Benchmark now scores
-final disposition, causal attribution, internal consistency, source localization,
-mutation precision, and the external gate separately. Historical answers are post-inference annotations and
+Current release: **v0.8.0-alpha.4**. This build freezes alpha.3's temporal and
+attribution measurement boundary, carries Task failures for the lifetime of an Attempt,
+and adds a lightweight Host-validated failure-path / patch-reachability contract. The
+Autonomous Diagnosis Benchmark now scores final disposition, causal attribution,
+internal consistency, source localization, Mutation Semantic Precision, and the external gate separately. Historical answers are post-inference annotations and
 are never exposed to the Runtime reasoner. Production, Root of Trust, activation,
 and external fitness remain Host-owned and immutable.
 
@@ -37,6 +37,10 @@ and external fitness remain Host-owned and immutable.
 - `NO_ACTION` 同时区分“没有强行修改”的 epistemic safety 与“符合已知最优处置”的 precision；
 - Task 77 首次 prospective holdout 已永久冻结为 Regression Case：相关源码选择与完整投递成功，但两次 Reasoner 均未识别自动重试继承旧 Attempt 预算的因果链；后续人工修复不得改写首次成绩；
 - Task 79 已冻结为 Negative Mutation Regression：`NO_ACTION` 最终处置正确，但 causal layer 与假设生命周期错误；它与 Task 77 组成 `SHOULD_NOT_MUTATE / SHOULD_MUTATE` 判别对；
+- Task 80 已冻结为 Prospective Mutation Authoring Holdout：Host-owned Attempt completion gate 区分零动作语言任务、计划文本与真实执行证据；首次盲跑和唯一一次 post-gate 结果分别保留，后者因错误归因、不可达补丁和 attribution contract 违规被 Host 安全拒绝，不宣称自主修复成功；
+- Benchmark 分开记录 `generated_by_model` 与 `admitted_by_host`，External Gate 报告显式提供 `failure_path_exercised / candidate_changes_failure_outcome` PatchReachability；
+- alpha.4 要求 Runtime Candidate 在成立前声明 `failure_path / patch_target / required_inputs / available_inputs / reachability / semantic_invariant`；Host 只检查结构和内部一致性，不建立 CodeGraph，也不替模型判断因果真伪；
+- Mutation Semantic Precision 保持向量指标：`contract_valid / source_relevant / path_reachable / gate_effective / regression_safe`，不折叠成单一奖励分数；
 - Reasoner hypothesis 具有 `supported/rejected/unresolved` 最终状态；Host 确定性检查 hypothesis、runtime-defect judgment 与 final disposition，矛盾输出被安全收敛为可审计的 `NO_ACTION/attribution_consistency_failed`，不得生成 Candidate；
 - Localization 分开记录模型 `proposed_files`、Host `admitted_files`、首个相关文件排名与源码预算裁剪，避免把检索预算问题误记为模型定位失败；
 - Historical Benchmark v2 对 Trace 事实完整性和 failure-era source fidelity 设置 eligibility gate；故障 Trace 配修复后源码的 Case 不进入有效 Diagnosis/Mutation 分母；

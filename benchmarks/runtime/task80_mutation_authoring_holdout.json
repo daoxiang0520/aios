@@ -1,0 +1,94 @@
+{
+  "schema": "prospective_runtime_holdout/v1",
+  "task_id": 80,
+  "status": "frozen_regression_case",
+  "holdout_first": true,
+  "annotation_created_after_reasoner_run": true,
+  "facts_digest": "f243fac6142dca7ca7e98e4ffe2035866553fc69b84db601909a05212e80adb8",
+  "failure_time_source": {
+    "snapshot_id": "rps_28b4fee97b26001f612d952a4d345b9a966079fee4f193aa54a8a62830b2ee14",
+    "execution_manifest_hash": "f9073af5f17054767edf890eb73a7e9762377c52ca2dcb175271ef5054cae214",
+    "source_time_aligned": true
+  },
+  "blind_run": {
+    "phase": "initial_autonomous_diagnosis",
+    "evolution_run_id": 24,
+    "proposal_digest": "04cc97082189718a6ba0c3d38d731bf4a8eb3332e57fe4666660094254a089a1",
+    "host_decision": "NO_ACTION",
+    "model_intended_decision": "PROPOSE"
+  },
+  "frozen_score": {
+    "runtime_bug_present": true,
+    "expected_disposition": "PROPOSE",
+    "causal_attribution": "mostly_correct",
+    "reasoning_consistent": false,
+    "mutation_generated_by_model": true,
+    "mutation_admitted_by_host": false,
+    "patch_semantically_effective": false,
+    "failure_stage": [
+      "mutation_contract_compliance",
+      "mutation_authoring"
+    ]
+  },
+  "post_gate_attempt": {
+    "phase": "post_gate_runtime_mutation",
+    "evolution_run_id": 25,
+    "proposal_digest": "09b8b874b204f26a72d5d5ee35cdf6644b2854b753423ec34825bb43348f9a59",
+    "same_facts_digest": true,
+    "same_failure_time_source": true,
+    "model_intended_decision": "PROPOSE",
+    "host_decision": "NO_ACTION",
+    "host_rejection_reason": "attribution_consistency_failed",
+    "observed_causal_layer": "artifact",
+    "expected_causal_layer": "evaluation",
+    "candidate_created": false,
+    "external_gate_executed": false,
+    "patch_reachability": {
+      "failure_path_exercised": true,
+      "candidate_changes_failure_outcome": false
+    },
+    "failure_stage": [
+      "causal_attribution_regression",
+      "mutation_contract_compliance",
+      "mutation_authoring"
+    ],
+    "notes": [
+      "The proposed runtime call referenced an unimplemented _check_prototype_integrity method.",
+      "The proposal specialized on prototype completeness instead of Attempt-level completion evidence.",
+      "No candidate reached the external evaluator; the baseline gate remains the only executed gate result."
+    ]
+  },
+  "human_confirmed_repair": {
+    "classification": "human-confirmed repair",
+    "counts_as_autonomous_repair": false,
+    "semantic_invariant": "CompletionEvidenceLifetime = Attempt",
+    "external_gate_passed": true,
+    "failure_path_exercised": true,
+    "repair_changes_failure_outcome": true,
+    "cross_cycle_status_before": "completed",
+    "cross_cycle_status_after": "retrying",
+    "checks": {
+      "pure_language_task_may_complete_without_actions": true,
+      "action_required_zero_zero_is_not_execution_evidence": true,
+      "planned_command_is_not_execution_evidence": true,
+      "observed_successful_action_can_complete": true,
+      "later_success_for_same_action_resolves_failure": true,
+      "same_attempt_unresolved_failure_survives_cycle_boundary": true
+    }
+  },
+  "human_ground_truth": {
+    "expected_causal_layer": "evaluation",
+    "semantic_invariants": [
+      "UnresolvedFailure(cycle_n) and SameAttempt implies UnresolvedFailure(cycle_n+1) until recovery evidence exists",
+      "Intent to execute is not evidence of execution",
+      "Action-required task with zero planned and zero executed has absent execution evidence"
+    ],
+    "non_regression": "Pure language tasks may still complete without tool execution"
+  },
+  "research_contract": {
+    "may_be_used_as_future_holdout_again": false,
+    "may_be_used_as_regression": true,
+    "later_success_must_not_overwrite_blind_score": true,
+    "annotation_not_exposed_to_reasoner": true
+  }
+}

@@ -768,6 +768,8 @@ class AIOSRuntime:
                 completion_metadata=completion_metadata,
                 coverage_assessment=coverage_assessment,
                 established_evidence=list(working_state.get("evidence_ledger", [])),
+                established_execution_evidence=bool(working_state.get("completed_steps")),
+                unresolved_failures=list(working_state.get("unresolved_failures", [])),
             )
             ok = bool(verification["passed"])
             if ok:
@@ -1211,6 +1213,7 @@ class AIOSRuntime:
             "important_evidence_refs": [],
             "evidence_ledger": [],
             "semantic_state": {},
+            "unresolved_failures": [],
         })
 
     def _sanitize_retry_state(self, state: dict[str, object]) -> dict[str, object]:
@@ -1257,6 +1260,7 @@ class AIOSRuntime:
             item for item in state.get("completed_steps", [])
             if isinstance(item, dict) and str(item.get("step", "")).startswith("read:")
         ]
+        state["unresolved_failures"] = []
         return state
 
     @staticmethod
@@ -1292,6 +1296,9 @@ class AIOSRuntime:
         ledger = state.setdefault("evidence_ledger", [])
         if not isinstance(ledger, list):
             state["evidence_ledger"] = []
+        unresolved = state.setdefault("unresolved_failures", [])
+        if not isinstance(unresolved, list):
+            state["unresolved_failures"] = []
         return state
 
     def _working_state_projection(self, state: dict[str, object]) -> dict[str, object]:
@@ -1314,6 +1321,7 @@ class AIOSRuntime:
             "important_evidence_refs": list(projected.get("important_evidence_refs", []))[-16:],
             "evidence_ledger": list(projected.get("evidence_ledger", []))[-32:],
             "semantic_state": projected.get("semantic_state", {}),
+            "unresolved_failures": list(projected.get("unresolved_failures", []))[-16:],
             "compacted": True,
         }
 
@@ -1330,7 +1338,23 @@ class AIOSRuntime:
         if reference not in refs:
             refs.append(reference)
             del refs[:-16]
+        action_key = Verifier._action_key(action)
+        unresolved = state.setdefault("unresolved_failures", [])
+        if not isinstance(unresolved, list):
+            unresolved = []
+            state["unresolved_failures"] = unresolved
+        unresolved[:] = [
+            item for item in unresolved
+            if not (isinstance(item, dict) and item.get("action_key") == action_key)
+        ]
         if not ok:
+            unresolved.append({
+                "action_key": action_key,
+                "tool": tool,
+                "error": getattr(result, "error", None),
+                "evidence_ref": reference,
+            })
+            del unresolved[:-16]
             return
         path = normalize_resource_path(arguments.get("path", ""))
         if tool == "read" and path:

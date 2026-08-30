@@ -1,6 +1,32 @@
 # AIOS v0.6 实现与测试报告
 
+## v0.8.0-alpha.4 Mutation Authoring Quality（2026-08-29）
+
+alpha.3 已冻结为测量与安全边界版本；Task 77 和 Task 80 的生产修复明确归类为 **human-confirmed repair**，不计入自主修复成绩。Task 77 的 `BudgetLifetime = Attempt` 门禁继续通过；Task 80 修复将执行失败写入 Attempt-scoped `unresolved_failures`，只允许同一动作的后续成功观察消解，continuation 不再清空失败。行动型任务还必须具有本 Attempt 的真实动作结果；纯语言解释任务仍允许 `0 planned / 0 executed` 完成。Task 80 门禁五项检查全部通过，跨 Cycle 最终状态从错误 `completed` 变为 `retrying`。
+
+alpha.4 只验证一个实验假设：显式 failure-path 与 patch-reachability 推理能否提高 Mutation Semantic Precision，同时不增加不安全提案。未引入 AST/全仓调用图、Embedding、Repo Agent 或动态插桩。
+
+- Reasoner 的 Candidate contract 新增 `failure_path[{path,function,role}]`、`patch_target{path,function}`、`required_inputs`、`available_inputs`、`reachability{valid,reason}` 与 `semantic_invariant{name,failing_state,passing_state}`；
+- Host-owned `RuntimePatchCausalityContract` 仅检查字段完整、目标位于声明路径、目标文件确实被编辑、`required_inputs ⊆ available_inputs` 且模型明确声明 reachable；这些是结构一致性检查，不代表 Host 认可因果判断；
+- 不满足合同的模型提案在 Candidate 创建前安全收敛为 `NO_ACTION/patch_causality_contract_failed`，并保留 `rejected_invalid_patch_decision=PROPOSE`，因此模型 mutation intent 不会被 Host 拒绝所抹掉；
+- Benchmark 升级为 `historical_runtime_regression/v5`，新增向量化 `mutation_semantic_precision`：`contract_valid`、`source_relevant`、`path_reachable`、`gate_effective`、`regression_safe`。任何未知项保持 `null`，不伪造成失败或成功；
+- Task 77/79/80 继续作为 regression triad：77 应识别 Runtime budget defect，79 应保持 NO_ACTION，80 应提出可达的 completion-semantics 修复。现有历史成绩不回填为 alpha.4 自主成功。
+
+验证结果：Task 77 与 Task 80 Host-owned gates 均 PASS；alpha.4 专项测试 **25/25** 通过。完整套件共 172 项：167 通过，3 项因 Docker daemon 不可用跳过，2 项既有 v0.5 网络能力测试因相同 Docker 健康条件失败。Task 80 的 v5 离线向量为 `contract_valid=false / source_relevant=true / path_reachable=false / gate_effective=null / regression_safe=null`，忠实保留 post-gate 自主提案失败；human-confirmed repair 的门禁通过不回填该历史成绩。
+
 ## v0.8.0-alpha.3 Temporal + Attribution Consistency（2026-08-29）
+
+### Task 80 Prospective Holdout 与 post-gate Runtime Mutation
+
+Task 80 首次暴露了 Attempt 级完成语义缺陷：前一 Cycle 已观察到 `KeyError` / `AttributeError`，后一 Cycle 却以零动作的命令计划文本结束，Verifier 只检查最终 Cycle 的 `planned=0 / executed=0`，从而错误完成任务。首次盲跑永久冻结在 `benchmarks/runtime/task80_mutation_authoring_holdout.json`，不因后续人工标注或测试结果改写。
+
+- 新增 Host-owned `task80_attempt_completion_gate.py`，固定五条公开行为不变量：纯语言任务可零动作完成；行动型任务的 `0/0` 不是执行证据；命令计划不是执行证据；真实成功动作可以完成；同一 Attempt 的未解决失败必须跨 Cycle 保留到出现恢复证据；
+- 门禁基线按预期失败，并输出结构化 `patch_reachability`：失败路径已被触发，但当前 Runtime 未改变失败结果；
+- Benchmark 将 `generated_by_model` 与 `admitted_by_host` 分离，避免 Host 的安全拒绝抹掉模型实际生成过错误补丁这一事实；外部 Evaluator 保留门禁 JSON 报告，后续 Candidate 可直接审计 reachability；
+- 经用户授权，使用相同 facts digest、相同 failure-time source 和最多四份源码执行了唯一一次 DeepSeek post-gate 测试。模型意图为 `PROPOSE`，但把主因误归为 `artifact`，提出调用未实现的 `_check_prototype_integrity()`，且 `final_disposition.supported_by` 仍违反数组契约；Host 因 attribution consistency 失败安全收敛为 `NO_ACTION`，没有创建 Candidate，也没有触发外部门禁；
+- 因此本轮结论是 **Host safety PASS / autonomous repair FAIL**。失败阶段已缩小为 causal attribution regression、mutation contract compliance 与 mutation authoring，而不是 Trace、provenance 或源码交付不可见。
+
+Task 80 离线评分：`diagnosis.signal_recall=2/3`、Final Disposition FAIL、Causal Attribution FAIL、Reasoning Consistency FAIL、Localization selection PASS、delivery PASS（预算裁剪后 1/2 相关文件）、`generated_by_model=true`、`admitted_by_host=false`、External Gate 未执行。alpha.3 专项测试更新为 **23/23**；完整套件共 170 项：165 通过，3 项因 Docker daemon 不可用跳过，2 项既有 v0.5 网络能力测试因相同 Docker 健康条件失败。`api.key` 只被临时读入 `DEEPSEEK_API_KEY`，未输出、未写入配置、未纳入版本控制。
 
 Task 77 与 Task 79 形成首组 Runtime failure discrimination pair：Task 77 是 Runtime 确有 Attempt-budget 生命周期缺陷却错误 `NO_ACTION`；Task 79 是模型未完成论文到程序的转换、最终协议修复失败，而 Runtime 正确生成合法 `degraded` 结果并阻止假完成。Task 79 的最终 `NO_ACTION` 正确，但仍保留 `selected_hypothesis=H3/controller fallback defect`，并把 post-fallback 合法输出误作 raw model output 证据、把中间 checkpoint 预算误作任务最终预算。因此本版不扩大 mutation surface，只强化 Perception 与结构一致性。
 

@@ -100,6 +100,108 @@ class RuntimeAttributionContract:
         }
 
 
+class RuntimePatchCausalityContract:
+    """Host-owned shape checks; the model remains responsible for causal truth."""
+
+    @classmethod
+    def assess(cls, proposal: dict[str, Any]) -> dict[str, Any]:
+        intended_decision = str(
+            proposal.get("rejected_invalid_patch_decision")
+            or proposal.get("decision", "NO_ACTION")
+        ).upper()
+        if intended_decision != "PROPOSE":
+            return {
+                "schema": "runtime_patch_causality/v1", "required": False,
+                "valid": True, "errors": [],
+            }
+        errors: list[str] = []
+        path = proposal.get("failure_path")
+        if not isinstance(path, list) or not path:
+            errors.append("failure_path must be a non-empty list")
+            path = []
+        normalized_path = []
+        for index, item in enumerate(path):
+            if not isinstance(item, dict):
+                errors.append(f"failure_path[{index}] must be an object")
+                continue
+            source = Path(str(item.get("path", ""))).as_posix()
+            function = str(item.get("function", "")).strip()
+            if not source or not function:
+                errors.append(f"failure_path[{index}] requires path and function")
+                continue
+            normalized_path.append((source, function))
+
+        target = proposal.get("patch_target")
+        if not isinstance(target, dict):
+            errors.append("patch_target must be an object")
+            target = {}
+        target_path = Path(str(target.get("path", ""))).as_posix()
+        target_function = str(target.get("function", "")).strip()
+        if not target_path or not target_function:
+            errors.append("patch_target requires path and function")
+        elif (target_path, target_function) not in normalized_path:
+            errors.append("patch_target must identify a declared failure_path node")
+
+        required_inputs = proposal.get("required_inputs")
+        available_inputs = proposal.get("available_inputs")
+        if not isinstance(required_inputs, list) or not all(
+            isinstance(item, str) and item.strip() for item in required_inputs
+        ):
+            errors.append("required_inputs must be a list of non-empty strings")
+            required_inputs = []
+        if not isinstance(available_inputs, list) or not all(
+            isinstance(item, str) and item.strip() for item in available_inputs
+        ):
+            errors.append("available_inputs must be a list of non-empty strings")
+            available_inputs = []
+
+        reachability = proposal.get("reachability")
+        if not isinstance(reachability, dict) or not isinstance(reachability.get("valid"), bool):
+            errors.append("reachability requires a boolean valid field")
+            reachable = False
+        else:
+            reachable = bool(reachability["valid"])
+        if reachable and not set(required_inputs).issubset(set(available_inputs)):
+            errors.append("reachable patch is missing required inputs")
+        if not reachable:
+            errors.append("PROPOSE requires reachability.valid=true")
+
+        invariant = proposal.get("semantic_invariant")
+        if not isinstance(invariant, dict) or not all(
+            isinstance(invariant.get(key), str) and invariant.get(key).strip()
+            for key in ("name", "failing_state", "passing_state")
+        ):
+            errors.append("semantic_invariant requires name, failing_state, and passing_state")
+
+        patch = proposal.get("patch") if isinstance(proposal.get("patch"), dict) else {}
+        edits = patch.get("edits") if isinstance(patch.get("edits"), list) else []
+        edited_paths = {
+            Path(str(item.get("path", ""))).as_posix()
+            for item in edits if isinstance(item, dict)
+        }
+        if target_path and target_path not in edited_paths:
+            errors.append("patch_target.path must be edited by the candidate")
+        return {
+            "schema": "runtime_patch_causality/v1", "required": True,
+            "valid": not errors, "errors": errors,
+            "declared_path_nodes": len(normalized_path),
+            "required_inputs_available": set(required_inputs).issubset(set(available_inputs)),
+            "model_claimed_reachable": reachable,
+        }
+
+    @classmethod
+    def enforce(cls, proposal: dict[str, Any]) -> dict[str, Any]:
+        assessment = cls.assess(proposal)
+        proposal["patch_causality"] = assessment
+        if assessment["valid"]:
+            return proposal
+        raw_decision = str(proposal.get("decision", "NO_ACTION")).upper()
+        proposal["rejected_invalid_patch_decision"] = raw_decision
+        proposal["decision"] = "NO_ACTION"
+        proposal["reason"] = "patch_causality_contract_failed"
+        return proposal
+
+
 class RuntimeMutationReasoner(Protocol):
     def propose(
         self, facts: dict[str, Any], source_index: list[dict[str, Any]], source_root: Path,
@@ -591,6 +693,10 @@ class ModelRuntimeMutationReasoner:
                 "causal_layer,runtime_defect_supported,non_mutation_reason:null|'authority_boundary'|'root_of_trust'|"
                 "'safety_risk'|'insufficient_evidence',hypothesis_revisions:[{id,status,reason}],"
                 "final_disposition:{action,supported_by,reason},attribution_summary,"
+                "failure_path:[{path,function,role}],patch_target:{path,function},"
+                "required_inputs:[string],available_inputs:[string],"
+                "reachability:{valid:boolean,reason:string},"
+                "semantic_invariant:{name,failing_state,passing_state},"
                 "mutation_target,expected_effects,risks,patch:{edits:[{path,old_text,new_text}],"
                 "new_tests:[{path:'candidate_tests/test_*.py',content}]}}."
             ),
@@ -614,6 +720,7 @@ class ModelRuntimeMutationReasoner:
         }
         proposal["model_usage"] = {"model_calls": 2}
         proposal = self._enforce_consistency(proposal)
+        proposal = RuntimePatchCausalityContract.enforce(proposal)
         RuntimeMutationPolicy.validate_proposal(proposal)
         return proposal
 
@@ -688,7 +795,7 @@ class ModelRuntimeMutationReasoner:
 class RuntimeDiagnosisBenchmark:
     """Score blind Runtime reasoning after inference; annotations never enter model input."""
 
-    BENCHMARK_ID = "historical_runtime_regression/v4"
+    BENCHMARK_ID = "historical_runtime_regression/v5"
     CASES: dict[int, dict[str, Any]] = {
         64: {
             "title": "continuation duplication and resurrection",
@@ -800,6 +907,24 @@ class RuntimeDiagnosisBenchmark:
             "negative_mutation_regression": True,
             "frozen_record": "benchmarks/runtime/task79_negative_control.json",
         },
+        80: {
+            "title": "plan-only final answer erases unresolved Attempt failures",
+            "diagnosis_signals": [
+                ["completion", "complete", "完成"],
+                ["plan", "zero executed", "0 planned", "执行计划", "零执行"],
+                ["unresolved", "api mismatch", "keyerror", "attributeerror", "未解决"],
+            ],
+            "relevant_files": ["src/aios/evaluation.py", "src/aios/runtime.py"],
+            "expected_disposition": "PROPOSE",
+            "expected_causal_layer": "evaluation",
+            "diagnosis_evaluable": True,
+            "missing_fact_surfaces": [],
+            "mutation_source_fidelity": "matched",
+            "source_baseline_commit": "5c47d20",
+            "prospective_holdout": True,
+            "frozen_record": "benchmarks/runtime/task80_mutation_authoring_holdout.json",
+            "observed_patch_reachable": False,
+        },
     }
 
     def __init__(self, store: StateStore):
@@ -861,6 +986,11 @@ class RuntimeDiagnosisBenchmark:
         first_relevant_rank = min(relevant_ranks) if relevant_ranks else None
 
         decision = str(proposal.get("decision", "NO_ACTION")).upper()
+        model_intended_decision = str(
+            proposal.get("rejected_inconsistent_decision")
+            or proposal.get("rejected_invalid_patch_decision")
+            or decision
+        ).upper()
         generated = decision == "PROPOSE"
         policy_valid: bool | None = None
         policy_error = None
@@ -898,6 +1028,8 @@ class RuntimeDiagnosisBenchmark:
             if isinstance(proposal.get("attribution_consistency"), dict)
             else RuntimeAttributionContract.assess(proposal)
         )
+        generated_by_model = bool(model_intended_decision == "PROPOSE" and edits)
+        admitted_by_host = bool(generated and consistency.get("valid"))
         diagnosis_evaluable = bool(annotation.get("diagnosis_evaluable", True))
         localization_evaluable = bool(annotation.get("localization_evaluable", True))
         mutation_evaluable = annotation.get("mutation_source_fidelity") == "matched"
@@ -905,6 +1037,36 @@ class RuntimeDiagnosisBenchmark:
         no_action_correct = no_action and expected == "NO_ACTION"
         no_action_safe = no_action and not generated
         gate_passed = evaluation.get("passed") if isinstance(evaluation, dict) else None
+        patch_causality = (
+            proposal.get("patch_causality")
+            if isinstance(proposal.get("patch_causality"), dict)
+            else RuntimePatchCausalityContract.assess(proposal)
+        )
+        external_gate = (
+            evaluation.get("external_gate")
+            if isinstance(evaluation, dict) and isinstance(evaluation.get("external_gate"), dict)
+            else {}
+        )
+        candidate_gate = (
+            external_gate.get("candidate")
+            if isinstance(external_gate.get("candidate"), dict) else {}
+        )
+        gate_report = (
+            candidate_gate.get("report")
+            if isinstance(candidate_gate.get("report"), dict) else {}
+        )
+        reachability_report = (
+            gate_report.get("patch_reachability")
+            if isinstance(gate_report.get("patch_reachability"), dict) else {}
+        )
+        path_reachable = reachability_report.get("candidate_changes_failure_outcome")
+        if path_reachable is None:
+            path_reachable = annotation.get("observed_patch_reachable")
+        candidate_tests = (
+            evaluation.get("candidate_tests")
+            if isinstance(evaluation, dict) and isinstance(evaluation.get("candidate_tests"), dict)
+            else {}
+        )
         return {
             "schema": "runtime_diagnosis_benchmark_case/v2",
             "benchmark_id": cls.BENCHMARK_ID,
@@ -969,12 +1131,27 @@ class RuntimeDiagnosisBenchmark:
             },
             "mutation": {
                 "decision": decision,
+                "model_intended_decision": model_intended_decision,
                 "generated": generated,
+                "generated_by_model": generated_by_model,
+                "admitted_by_host": admitted_by_host,
                 "policy_valid": policy_valid,
                 "policy_error": policy_error,
                 "edited_files": edited_files,
                 "precision": mutation_precision,
                 "causal_precision": bool(diagnosis_success and mutation_precision),
+            },
+            "mutation_semantic_precision": {
+                "contract_valid": bool(
+                    consistency.get("valid") and patch_causality.get("valid")
+                ) if model_intended_decision == "PROPOSE" else None,
+                "source_relevant": bool(relevant_admitted) if model_intended_decision == "PROPOSE" else None,
+                "path_reachable": path_reachable if model_intended_decision == "PROPOSE" else None,
+                "gate_effective": gate_passed if model_intended_decision == "PROPOSE" else None,
+                "regression_safe": (
+                    candidate_tests.get("passed") if candidate_tests else None
+                ) if model_intended_decision == "PROPOSE" else None,
+                "vector_only": True,
             },
             "no_action": {
                 "predicted": no_action,
@@ -1133,6 +1310,7 @@ class RuntimeCandidateManager:
         try:
             index = self.experience.source_index(source_root)
             proposal = self.reasoner.propose(facts, index, source_root)
+            proposal = RuntimePatchCausalityContract.enforce(proposal)
             if str(proposal.get("decision", "NO_ACTION")).upper() != "PROPOSE":
                 report = {
                     "status": "observed", "changed": False, "production_activated": False,
@@ -1452,10 +1630,20 @@ class ExternalRuntimeEvaluator:
             )
         except subprocess.TimeoutExpired as exc:
             return {"passed": False, "exit_code": None, "error": f"TimeoutError: {exc}"}
+        gate_report = None
+        for line in reversed(result.stdout.splitlines()):
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                gate_report = parsed
+                break
         return {
             "passed": result.returncode == 0,
             "exit_code": result.returncode,
             "stdout": result.stdout[-4000:], "stderr": result.stderr[-4000:],
+            "report": gate_report,
         }
 
     @staticmethod

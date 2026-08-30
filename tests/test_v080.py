@@ -12,6 +12,7 @@ from aios.runtime_evolution import (
     ExternalRuntimeEvaluator,
     ModelRuntimeMutationReasoner,
     RuntimeAttributionContract,
+    RuntimePatchCausalityContract,
     RuntimeCandidateManager,
     RuntimeDiagnosisBenchmark,
     RuntimeExperienceBuilder,
@@ -32,6 +33,19 @@ class StubRuntimeReasoner:
                 "evidence_refs": ["trace:2", "trace:4"],
             },
             "mutation_target": "Verifier.verify",
+            "failure_path": [
+                {"path": "src/aios/runtime.py", "function": "AIOSRuntime.run_once", "role": "collect"},
+                {"path": "src/aios/evaluation.py", "function": "Verifier.verify", "role": "decide"},
+            ],
+            "patch_target": {"path": "src/aios/evaluation.py", "function": "Verifier.verify"},
+            "required_inputs": ["actions", "results"],
+            "available_inputs": ["actions", "results", "task_done"],
+            "reachability": {"valid": True, "reason": "Verifier receives action results"},
+            "semantic_invariant": {
+                "name": "unresolved failure blocks completion",
+                "failing_state": "failed action accepted",
+                "passing_state": "failed action rejected",
+            },
             "expected_effects": ["unresolved tool failure is rejected"],
             "risks": ["may reject genuinely recovered work"],
             "patch": {
@@ -287,6 +301,82 @@ class V080CandidateRuntimeMutationTests(unittest.TestCase):
         self.assertFalse(result["reasoning_consistency"]["valid"])
         self.assertTrue(result["no_action"]["causally_correct"])
         self.assertFalse(result["no_action"]["diagnostically_supported"])
+
+    def test_task80_preserves_model_mutation_intent_after_host_contract_rejection(self):
+        proposal = {
+            "decision": "NO_ACTION",
+            "rejected_inconsistent_decision": "PROPOSE",
+            "causal_layer": "evaluation",
+            "runtime_defect_supported": False,
+            "reason": "attribution_consistency_failed",
+            "attribution_summary": (
+                "Completion accepted a plan with zero executed actions despite unresolved API mismatch"
+            ),
+            "attribution": {
+                "selected_hypothesis": "H1",
+                "hypotheses": [{
+                    "id": "H1", "claim": "plan accepted as completion with unresolved KeyError",
+                    "causal_layer": "evaluation", "runtime_defect": True, "status": "supported",
+                }],
+                "inspect_files": ["src/aios/evaluation.py", "src/aios/runtime.py"],
+            },
+            "patch": {"edits": [{
+                "path": "src/aios/evaluation.py", "old_text": "old", "new_text": "new",
+            }]},
+            "attribution_consistency": {
+                "schema": "runtime_attribution_consistency/v1", "valid": False,
+                "errors": ["final_disposition.action disagrees with decision"],
+            },
+        }
+        result = RuntimeDiagnosisBenchmark.score(80, proposal)
+        self.assertFalse(result["final_disposition"]["correct"])
+        self.assertTrue(result["causal_attribution"]["correct"])
+        self.assertTrue(result["mutation"]["generated_by_model"])
+        self.assertFalse(result["mutation"]["admitted_by_host"])
+        self.assertFalse(result["reasoning_consistency"]["valid"])
+
+    def test_external_gate_output_exposes_structured_patch_reachability(self):
+        manager = RuntimeCandidateManager(self.settings, self.store, StubRuntimeReasoner())
+        evaluator = ExternalRuntimeEvaluator(self.settings, manager)
+        completed = __import__("subprocess").CompletedProcess(
+            [], 1,
+            stdout=(
+                'noise\n{"passed":false,"patch_reachability":'
+                '{"failure_path_exercised":true,"candidate_changes_failure_outcome":false}}\n'
+            ),
+            stderr="",
+        )
+        with patch("aios.runtime_evolution.subprocess.run", return_value=completed):
+            result = evaluator._docker_python(self.root, ["python", "gate.py"], mount_external=False)
+        self.assertFalse(result["passed"])
+        self.assertTrue(result["report"]["patch_reachability"]["failure_path_exercised"])
+
+    def test_patch_causality_contract_rejects_unreachable_concept_patch(self):
+        proposal = StubRuntimeReasoner().propose(None, None, None)
+        proposal["required_inputs"] = ["actions", "results", "missing_attempt_state"]
+        assessment = RuntimePatchCausalityContract.assess(proposal)
+        self.assertFalse(assessment["valid"])
+        self.assertIn("reachable patch is missing required inputs", assessment["errors"])
+
+    def test_task80_reports_mutation_semantic_precision_as_a_vector(self):
+        proposal = StubRuntimeReasoner().propose(None, None, None)
+        proposal.update({
+            "causal_layer": "evaluation",
+            "rejected_invalid_patch_decision": "PROPOSE",
+            "decision": "NO_ACTION",
+            "patch_causality": {
+                "schema": "runtime_patch_causality/v1", "required": True,
+                "valid": False, "errors": ["unreachable"],
+            },
+            "source_delivery": {"admitted_files": ["src/aios/evaluation.py"]},
+        })
+        result = RuntimeDiagnosisBenchmark.score(80, proposal)
+        semantic = result["mutation_semantic_precision"]
+        self.assertFalse(semantic["contract_valid"])
+        self.assertTrue(semantic["source_relevant"])
+        self.assertFalse(semantic["path_reachable"])
+        self.assertIsNone(semantic["gate_effective"])
+        self.assertTrue(semantic["vector_only"])
 
     def test_host_safely_rejects_inconsistent_runtime_no_action(self):
         proposal = {

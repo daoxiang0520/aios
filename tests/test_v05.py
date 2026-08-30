@@ -243,7 +243,12 @@ class V05Tests(unittest.TestCase):
         runtime = AIOSRuntime(self.settings)
         runtime.controller.plan = Mock(side_effect=[
             Plan("try inspection", [Action("read", {"path": "missing.txt"}, call_id="failed_read")], done=False),
+            Plan("retry inspection", [Action("read", {"path": "missing.txt"}, call_id="recovered_read")], done=False),
             Plan("No matching user files were found.", [], done=True),
+        ])
+        runtime.executor.execute = Mock(side_effect=[
+            ActionResult("read", False, error="FileNotFoundError: missing.txt"),
+            ActionResult("read", True, output="No matching content"),
         ])
         runtime.store.add_event(Event("USER_REQUEST", {"message": "count matches in user files"}))
         runtime.run_once()
