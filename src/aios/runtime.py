@@ -354,7 +354,8 @@ class AIOSRuntime:
                     ),
                 }
                 context["_protocol_messages"] = protocol_messages
-                plan = self.controller.plan(intent, active_goals, context)
+                model_context = self._harness_context_projection(context, harness_settings)
+                plan = self.controller.plan(intent, active_goals, model_context)
                 model_usage = plan.model_usage or {}
                 model_calls_used += int(model_usage.get("model_calls", 1))
                 model_tokens_total += int(model_usage.get("total_tokens", 0))
@@ -662,6 +663,16 @@ class AIOSRuntime:
             task_budget.used_model_calls += model_calls_used
             task_budget.used_tool_calls += len(all_results)
             task_budget.used_tokens += model_tokens_total
+            task_metrics["failed_tool_calls"] = int(
+                task_metrics.get("failed_tool_calls", 0)
+            ) + sum(not result.ok for result in all_results)
+            task_metrics["post_failure_tool_changes"] = int(
+                task_metrics.get("post_failure_tool_changes", 0)
+            ) + sum(
+                not result.ok and all_actions[index].tool != all_actions[index + 1].tool
+                for index, result in enumerate(all_results[:-1])
+                if index + 1 < len(all_actions)
+            )
             task_metrics["sandbox_health_probes"] = int(
                 task_metrics.get("sandbox_health_probes", 0)
             ) + max(0, self.sandbox.health_probe_count - cycle_health_probe_start)
@@ -802,6 +813,7 @@ class AIOSRuntime:
                 "model_rounds": len(rounds),
                 "model_api_calls": task_budget.used_model_calls,
                 "model_tokens": task_budget.used_tokens,
+                "task_tool_calls": task_budget.used_tool_calls,
                 "cycle_model_api_calls": model_calls_used,
                 "cycle_model_tokens": model_tokens_total,
                 "task_cycles": task_budget.used_cycles,
@@ -818,6 +830,8 @@ class AIOSRuntime:
                 "adapter_transient_recoveries": task_metrics["adapter_transient_recoveries"],
                 "protocol_repair_calls": task_metrics["protocol_repair_calls"],
                 "protocol_repair_tokens": task_metrics["protocol_repair_tokens"],
+                "failed_tool_calls": task_metrics["failed_tool_calls"],
+                "post_failure_tool_changes": task_metrics["post_failure_tool_changes"],
                 "prompt_token_attribution": attribution_totals,
                 "context_reuse_ratio": (
                     attribution_totals["repeated_tokens"] / attribution_totals["prompt_tokens"]
@@ -1180,6 +1194,8 @@ class AIOSRuntime:
             "adapter_transient_recoveries": 0,
             "protocol_repair_calls": 0,
             "protocol_repair_tokens": 0,
+            "failed_tool_calls": 0,
+            "post_failure_tool_changes": 0,
         }
         for checkpoint in reversed(self.store.task_checkpoints(task_id)):
             if checkpoint["phase"] == "retry_reset":
@@ -1300,6 +1316,37 @@ class AIOSRuntime:
         if not isinstance(unresolved, list):
             state["unresolved_failures"] = []
         return state
+
+    @staticmethod
+    def _harness_context_projection(
+        context: dict[str, object], harness_settings: dict[str, object],
+    ) -> dict[str, object]:
+        profile = str(harness_settings.get("harness_profile", "structured"))
+        if profile == "structured":
+            return context
+        common = {
+            key: context[key] for key in (
+                "workspace_inventory", "harness", "harness_version", "budget",
+                "observations", "round", "_protocol_messages",
+            ) if key in context
+        }
+        if profile == "reduced":
+            for key in (
+                "evidence_contract", "continuation", "task_working_state", "environment",
+            ):
+                if key in context:
+                    common[key] = context[key]
+            return common
+        if profile == "minimal_open":
+            state = context.get("task_working_state")
+            if isinstance(state, dict):
+                common["task_working_state"] = {
+                    key: state[key] for key in (
+                        "completed_steps", "pending", "unresolved_failures",
+                    ) if key in state
+                }
+            return common
+        return context
 
     def _working_state_projection(self, state: dict[str, object]) -> dict[str, object]:
         projected = {key: value for key, value in state.items() if not key.startswith("_")}

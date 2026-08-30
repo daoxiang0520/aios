@@ -163,6 +163,12 @@ def _parser() -> argparse.ArgumentParser:
         "--task-id", action="append", type=int, default=[],
         help="Explicit failed/dead-letter Strategy Adaptation sample",
     )
+    harness_sensitivity = evolution_commands.add_parser(
+        "harness-sensitivity",
+        help="Measure H0 structured, H1 reduced, and H2 minimal-open on immutable capsules",
+    )
+    harness_sensitivity.add_argument("--capsule", action="append", required=True)
+    harness_sensitivity.add_argument("--runs", type=int)
     runtime_observe = evolution_commands.add_parser(
         "runtime-observe", help="Build a fact-only cross-layer Runtime experience capsule",
     )
@@ -754,6 +760,31 @@ def main(argv: list[str] | None = None) -> int:
                 task_limit=args.task_limit,
                 trace_limit=args.trace_limit,
             ))
+        elif args.evolution_command == "harness-sensitivity":
+            skill_manager, capsules, runner = _experiment_services(settings, store)
+            semantic = PairwiseSemanticJudge(
+                ModelSemanticJudge(settings.model)
+                if settings.experiments.semantic_judge_enabled else None
+            )
+            orchestrator = ExperimentOrchestrator(
+                store, capsules, runner, semantic_judge=semantic,
+            )
+            cases = [
+                orchestrator.run_harness_sensitivity(
+                    capsule_id,
+                    runs_per_profile=(
+                        args.runs or settings.experiments.default_runs_per_variant
+                    ),
+                    keep_worlds=settings.experiments.keep_worlds,
+                )
+                for capsule_id in args.capsule
+            ]
+            _print_json({
+                "schema": "harness_sensitivity_suite/v1",
+                "cases": cases,
+                "cross_task_summary": orchestrator.summarize_harness_sensitivity(cases),
+                "selection": "none_measurement_only",
+            })
         elif args.evolution_command in {
             "runtime-observe", "runtime-propose", "runtime-list",
             "runtime-show", "runtime-evaluate", "runtime-benchmark",

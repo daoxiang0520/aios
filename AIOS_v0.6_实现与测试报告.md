@@ -1,5 +1,32 @@
 # AIOS v0.6 实现与测试报告
 
+## v0.9.0-alpha.3 Harness Sensitivity Experiment（2026-08-31）
+
+本阶段不继续增强 Runtime Repair、Open Evolution Reasoner、Agent Graph 或 Reward System，而是先验证 Harness 本身是否是稳定、可测的实验变量。实现固定三档 Profile：`H0_structured` 使用当前完整 AIOS scaffold；`H1_reduced` 去掉 Situation、Memory、Skill Authoring 和完整认知提示，只保留持久任务状态、资源寻址、工具、环境与基础完成观察；`H2_minimal_open` 只向模型提供目标、工作区、通用工具、预算和小型持久状态。Authority、工具 Schema、Sandbox、Verifier 和预算没有放宽。
+
+实验必须绑定 immutable Task Capsule。每个 Profile/replicate 从相同 `initial_state_hash` fork，并继承 Capsule 捕获时的 Harness 配置，唯一覆盖字段为 `harness_profile`。输出分别保留任务状态、True Completion、Verifier、语义质量（可选外部 judge）、Tokens、Model/Tool Calls、Cycles、Latency、重复资源动作、失败工具调用、恢复率与失败后的工具切换。跨任务汇总只给出各维度中位数及相对 H0 的负/零/正效应次数，不计算单一 reward，不命名 winner，不自动推广。
+
+```powershell
+# 单 Capsule 低成本烟雾实验（共 3 次任务执行）
+python -m aios --config config.json evolution harness-sensitivity `
+  --capsule cap_2d040dfa15924dc9a64cc59aae9e47f9 --runs 1
+
+# 三个 full/pre_task Capsule、每档 3 次重复（共 27 次任务执行）
+python -m aios --config config.json evolution harness-sensitivity `
+  --capsule cap_2d040dfa15924dc9a64cc59aae9e47f9 `
+  --capsule cap_c9163e5f5b79422bb66fa00fd58ac693 `
+  --capsule cap_7d022cdf7e7e445c967beb14f6e06538 `
+  --runs 3
+```
+
+本版只建立 Phase 1 测量装置。任何 `H2 > H1 > H0`、`H1` 最优或 `H0` 最优的结论，都必须来自真实 Capsule 矩阵，不能由实现代码预设；Harness Self-Evolution 留到 Phase 2。
+
+真实矩阵已经执行：Task 88/89/90 三个 full/pre-task Capsule × H0/H1/H2 × 3 repeats，共 27 runs。三档 Completion、Verifier Pass 与 True Completion 均为 0/9，全部进入 `dead_letter`；没有 Security Violation。跨任务中位 Tokens 为 H0 185,464、H1 86,949、H2 53,654；删减 Harness 显著降低成本，但没有提高正确完成，因此 `promotion_state=MEASUREMENT_ONLY`，不选择 winner。完整结果见 `AIOS_v0.9_alpha3_Harness_Sensitivity_实验报告.md`。
+
+真实运行同时发现并修复三个测量正确性问题：Counterfactual world 清理现在支持 Windows ReadOnly `.git/objects`；Runner 不再用 `max_attempts+1` 截断仍有 continuation 的任务，而是等待真正终态并设置安全上限；measurement-only report 使用显式 `MEASUREMENT_ONLY` 兼容持久化 Schema。Task 90 的 9 条 runs 在首次汇总兼容错误前已完整持久化，后续从原始 runs 确定性恢复，没有重复调用模型。
+
+专项测试 **6/6** 通过，覆盖 Profile 提示密度、确定性 Context Projection、Profile 白名单、同世界三档矩阵、Windows ReadOnly world cleanup 及 CLI；最终完整回归 **227/227** 通过、0 失败，耗时 134.309 秒。
+
 ## v0.9.0-alpha.2.2 Observation Identity Correctness（2026-08-31）
 
 alpha.2.1 后的 Task 77 机制回归证明 World Isolation、Goal Binding 与 Measurement Integrity 已生效：failure-time 来源、Docker、目标绑定和无泄漏状态均有效，Token 从 Run 41 的 201,987 降至 93,809。但 7 次 `read_observation` 被再次注册为新 Observation，并对完整 Tool Result JSON envelope 反复序列化，产生 `R0003 → R0005 → ...` 引用链和大量转义文本；12 轮中没有诊断实验或模型终态。这是 Observation identity correctness bug，不是新的 Reasoner 失败证据。

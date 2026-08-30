@@ -9,7 +9,11 @@ from .storage import StateStore
 from .types import Task
 
 
-ALLOWED_MUTATIONS = {"prompt_append", "max_actions_per_cycle", "memory_context_characters"}
+HARNESS_PROFILES = {"structured", "reduced", "minimal_open"}
+ALLOWED_MUTATIONS = {
+    "prompt_append", "max_actions_per_cycle", "memory_context_characters",
+    "harness_profile",
+}
 
 
 class EvolutionPolicyError(RuntimeError):
@@ -125,6 +129,11 @@ class EvolutionManager:
             not isinstance(memory_chars, int) or not 500 <= memory_chars <= 20000
         ):
             raise EvolutionPolicyError("memory_context_characters must be between 500 and 20000")
+        profile = mutation.get("harness_profile")
+        if profile is not None and profile not in HARNESS_PROFILES:
+            raise EvolutionPolicyError(
+                f"harness_profile must be one of {sorted(HARNESS_PROFILES)}"
+            )
 
 
 class AutonomousEvolutionEngine:

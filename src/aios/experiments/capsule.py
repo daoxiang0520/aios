@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import platform
 import shutil
+import stat
 import subprocess
 import uuid
 from pathlib import Path
@@ -179,7 +181,19 @@ class CapsuleManager:
         if self.worlds not in root.parents or not root.name.startswith("world_"):
             raise CapsuleError("Refusing to delete a path outside managed experiment worlds")
         if root.exists():
-            shutil.rmtree(root)
+            self._remove_world_tree(root)
+
+    @staticmethod
+    def _remove_world_tree(root: Path) -> None:
+        """Delete a managed replay world containing Windows read-only snapshot files."""
+        def make_writable_and_retry(function: Any, target: str, exc_info: Any) -> None:
+            error = exc_info[1]
+            if not isinstance(error, PermissionError):
+                raise error
+            os.chmod(target, stat.S_IWRITE | stat.S_IREAD)
+            function(target)
+
+        shutil.rmtree(root, onerror=make_writable_and_retry)
 
     def archive(self, capsule_id: str) -> dict[str, Any]:
         self.show(capsule_id)

@@ -69,6 +69,20 @@ packages for novel formats may use `python -m pip install --target /deps PACKAGE
 available. `/deps` persists across continuation cycles and is discarded only at a true task end.
 """
 
+REDUCED_TOOL_SYSTEM_PROMPT = """You are an agent operating in a permission-gated workspace.
+Use the provided tools to complete the user's goal. The Host supplies a workspace inventory,
+bounded working state, observations, and budget. Reuse established facts and completed steps;
+when an action fails, inspect the evidence and change course when appropriate. File paths are
+workspace-relative or under /workspace. Do not request ungranted permissions or host access.
+Reading and listing are observation, not completion. If an artifact is requested, create and
+verify it before finishing. Return a concise final answer only when the goal is fulfilled.
+"""
+
+MINIMAL_OPEN_TOOL_SYSTEM_PROMPT = """Complete the user's goal with the provided workspace tools.
+Work within the stated permissions and budget. Paths are workspace-relative or under /workspace.
+Use tool results as evidence, preserve successful work, and return a final answer when finished.
+"""
+
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -229,7 +243,7 @@ class LLMController:
         messages: list[dict[str, Any]] = [
             {
                 "role": "system",
-                "content": (TOOL_SYSTEM_PROMPT if use_tool_calling else JSON_SYSTEM_PROMPT)
+                "content": (self._tool_system_prompt(context or {}) if use_tool_calling else JSON_SYSTEM_PROMPT)
                 + self._prompt_append(context or {}),
             },
             {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
@@ -541,11 +555,25 @@ class LLMController:
         return actions
 
     @staticmethod
+    def _tool_system_prompt(context: dict[str, Any]) -> str:
+        harness = context.get("harness", {})
+        profile = harness.get("harness_profile") if isinstance(harness, dict) else None
+        if profile == "reduced":
+            return REDUCED_TOOL_SYSTEM_PROMPT
+        if profile == "minimal_open":
+            return MINIMAL_OPEN_TOOL_SYSTEM_PROMPT
+        return TOOL_SYSTEM_PROMPT
+
+    @staticmethod
     def _prompt_append(context: dict[str, Any]) -> str:
         harness = context.get("harness", {})
         sections: list[str] = []
         if isinstance(harness, dict):
-            value = harness.get("prompt_append", "")
+            value = (
+                harness.get("prompt_append", "")
+                if harness.get("harness_profile", "structured") == "structured"
+                else ""
+            )
             if isinstance(value, str) and value.strip():
                 sections.append("Additional approved policy:\n" + value.strip())
         authoring = context.get("skill_authoring")

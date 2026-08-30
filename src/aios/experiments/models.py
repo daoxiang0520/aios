@@ -21,6 +21,7 @@ class CapsuleFidelity(StrEnum):
 
 
 class PromotionState(StrEnum):
+    MEASUREMENT_ONLY = "MEASUREMENT_ONLY"
     REJECTED = "REJECTED"
     INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
     NEEDS_REVIEW = "NEEDS_REVIEW"
@@ -85,6 +86,7 @@ class RunEvidence:
     artifacts: dict[str, Any]
     trace_id: str | None = None
     final_output: str = ""
+    adaptation: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)

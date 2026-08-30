@@ -73,6 +73,9 @@ class V0661RuntimeHardeningTests(unittest.TestCase):
         completed = runtime.store.list_tasks()[0]
         self.assertEqual(completed.status, TaskStatus.COMPLETED)
         self.assertEqual(completed.attempts, 1)
+        self.assertEqual(completed.result["evidence"]["task_tool_calls"], 1)
+        self.assertEqual(completed.result["evidence"]["executed_actions"], 0)
+        self.assertEqual(completed.result["evidence"]["failed_tool_calls"], 0)
         phases = [item["phase"] for item in runtime.store.task_checkpoints(int(completed.id))]
         self.assertIn("budget_deferred", phases)
         self.assertIn("continued", phases)

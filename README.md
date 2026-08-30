@@ -1,10 +1,11 @@
 # Self-Evolving AIOS
 
-Current release: **v0.9.0-alpha.2.2**. Runtime Repair remains frozen at the alpha.6.1
-experimental boundary. The new Self-Optimization path observes bounded facts from successful
-tasks, lets the model propose one Strategy/Workflow candidate, and replays baseline versus
-candidate from the same immutable Task Capsules. Correctness and security remain hard constraints;
-quality, calls, cycles, tokens, latency, and robustness remain a Pareto vector rather than one reward.
+Current release: **v0.9.0-alpha.3**. Runtime Repair and Open Evolution remain frozen at their
+existing experimental boundaries. Phase 1 now measures Harness sensitivity under immutable Task
+Capsules: H0 Structured, H1 Reduced, and H2 Minimal Open run with the same model, task, initial
+workspace, authority, tools, budget, temperature, sandbox, and verifier. Reports preserve outcome,
+quality, cost, repetition, recovery, and strategy-change dimensions without selecting a winner,
+collapsing them into one reward, or promoting a Harness.
 
 ## Agent Workbench（第一版）
 
@@ -75,6 +76,9 @@ python -m aios --config config.json run
 - 原任务作为 `original_task` 事实输入，当前目标单独绑定为 `evolution_objective=诊断/实验/修改候选 AIOS Runtime`。Tool Result 首次完整投递，之后降为带 digest 的事实投影，可用 `read_observation(Rxxxx)` 按需重载；Host 不生成诊断结论；
 - Open Evolution Run 分开记录 `model_intended_disposition`、`effective_host_disposition` 与 `terminal_decision_missing`，并给出 `mechanism_validity / experimental_validity / benchmark_role / capability_evaluation_eligible`。Run 41 因当前测试泄漏和目标错绑仅保留为机制回归，不作为能力成绩；
 - v0.9-alpha.2.2 修复 Observation reload identity：`read_observation(Rxxxx)` 只是 immutable canonical payload 的字符分页视图，不创建新引用，不保存 reload wrapper，也不把正文重复持久化进 Run transcript。重复读取只增加固定大小的访问元数据；
+- v0.9-alpha.3 新增 Capsule-bound Harness Sensitivity：H0 保留完整上下文与认知 scaffold，H1 只保留持久任务状态、资源寻址、工具和基础完成观察，H2 仅保留目标、工作区、通用工具与小型持久状态；三档继承 Capsule 捕获时的 Harness 基线，唯一实验变量是 `harness_profile`；
+- `harness-sensitivity` 按 Profile 和 replicate 从同一个 immutable world fork，分别报告完成、Verifier、Tokens、Model/Tool Calls、Cycles、Latency、重复资源动作、失败恢复与失败后工具切换；跨任务只统计中位数和相对 H0 的效应符号，不生成 winner、单一 reward 或 promotion；
+- 首轮 27-run 真实矩阵中 H0/H1/H2 均为 0 completion；H1/H2 显著降低 Tokens 和耗时但只是更快失败，因此结果固定为 `MEASUREMENT_ONLY`。详见 `AIOS_v0.9_alpha3_Harness_Sensitivity_实验报告.md`；
 - `runtime-compare` 并列投影 Structured/Open 的 Candidate、外部门禁、回归、调用、Token、耗时和主动诊断实验次数；缺失的正确诊断/正确 abstention 人工判据保留为 `null`，不会被合成为单一 reward；
 - Strategy Candidate 只在与成功轨迹 Task ID 对齐的 replayable Capsule 上进行 baseline/candidate 回放。Evaluator 将 Completion、Verifier、True Completion 和 Security 作为硬约束，再分别比较 Quality、Model Calls、Tool Calls、Cycles、Tokens、Latency 与 Completion Consistency；Pareto 冲突进入 `NEEDS_REVIEW`，不合成单一 reward；
 - DeepSeek Runtime Evolution 请求继续启用官方 `response_format={"type":"json_object"}`，并新增真实 JSON 样例及单顶层文档 framing；只允许剥离完整外层 Markdown fence，多个 JSON 文档绝不猜选。空内容、截断、双文档等失败会形成不含原文的 `protocol_failed` Evolution Run，且不自动重采样；
