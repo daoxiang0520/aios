@@ -91,6 +91,11 @@ class ExperimentConfig:
 
 
 @dataclass(slots=True)
+class RuntimePolicyConfig:
+    completion_mode: str = "verified"
+
+
+@dataclass(slots=True)
 class Settings:
     root: Path
     database: Path
@@ -105,6 +110,7 @@ class Settings:
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     skills: SkillConfig = field(default_factory=SkillConfig)
     experiments: ExperimentConfig = field(default_factory=ExperimentConfig)
+    runtime: RuntimePolicyConfig = field(default_factory=RuntimePolicyConfig)
 
     @classmethod
     def load(cls, path: str | Path) -> "Settings":
@@ -122,6 +128,10 @@ class Settings:
             if old in permissions.allowed_tools and new not in permissions.allowed_tools:
                 permissions.allowed_tools.append(new)
 
+        runtime = RuntimePolicyConfig(**raw.get("runtime", {}))
+        if runtime.completion_mode not in {"verified", "free"}:
+            raise ValueError("runtime.completion_mode must be 'verified' or 'free'")
+
         return cls(
             root=root,
             database=resolved(raw.get("database", "./data/aios.db")),
@@ -136,6 +146,7 @@ class Settings:
             sandbox=SandboxConfig(**cls._sandbox_values(raw.get("sandbox", {}))),
             skills=SkillConfig(**raw.get("skills", {})),
             experiments=ExperimentConfig(**raw.get("experiments", {})),
+            runtime=runtime,
         )
 
     @staticmethod

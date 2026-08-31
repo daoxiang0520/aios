@@ -880,3 +880,16 @@ v0.6.0–v0.6.5 只进化 Skill 层；v0.6.6 新增的 Resource Adapter 是不�
 - PDF/XLSX Adapter 依赖 Docker；依赖尚未安装且网络关闭时会明确失败。已安装依赖后的解析过程固定断网。
 - Resource Adapter 特化数据接入，不特化任务思考；数模分析、文献综述、仓库分析等仍属于 Model/Skill/Workflow 层。
 - Python `compile()` 只是静态语法门，不代表安全证明；真实行为安全仍由 Docker 边界和 Capability 检查保证。
+
+## v0.9-alpha.4 Free Runtime
+
+- 在线运行新增 `runtime.completion_mode=free`。该模式不调用 Verifier、不计算 Coverage
+  completion gate、不因验证失败重试，也不把 Agent 声明转换为 Host 的真实完成判断。
+- 状态语义改为 `stopped / yielded / abandoned`：分别表示 Agent 声明停止、Agent 未声明完成而
+  让出，以及执行或协议失败耗尽。`evidence.success` 和 `host_observed_completion` 均保持 `null`。
+- 世界修改仍通过事务 Sandbox commit；Authority、SecurityKernel、资源限制、不可变 Trace、版本历史
+  和回退能力不变。Free 不等于越权。
+- Verifier 源码保留为 Research Instrument。`result shadow-verify ID` 对已记录结果执行只读离线测量，
+  明确输出 `affects_task_state=false`，不反写状态或污染 Agent 后续 Experience。
+- 未显式配置 Runtime policy 的旧配置仍默认 `verified`，保证既有实验和回归测试语义不被静默改写；
+  当前部署配置与示例配置显式启用 `free`。

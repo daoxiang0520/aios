@@ -20,7 +20,8 @@ class RuntimeProvenanceManager:
         TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.DEAD_LETTER,
         TaskStatus.DEGRADED, TaskStatus.BLOCKED_CAPABILITY,
         TaskStatus.NEEDS_AUTHORITY, TaskStatus.TERMINAL_FAILURE,
-        TaskStatus.NEEDS_REVIEW,
+        TaskStatus.NEEDS_REVIEW, TaskStatus.STOPPED,
+        TaskStatus.YIELDED, TaskStatus.ABANDONED,
     }
 
     def __init__(self, settings: Settings, store: StateStore):

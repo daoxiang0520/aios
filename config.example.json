@@ -3,6 +3,9 @@
   "workspace": "./workspace",
   "poll_interval_seconds": 2.0,
   "max_actions_per_cycle": 8,
+  "runtime": {
+    "completion_mode": "free"
+  },
   "budget": {
     "max_model_calls_per_cycle": 6,
     "max_tool_calls_per_cycle": 8,

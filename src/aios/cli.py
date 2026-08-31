@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import re
 import shutil
 import sys
 from dataclasses import asdict
@@ -15,6 +17,7 @@ from .capabilities import CapabilityRegistry, EvidenceContract
 from .controller import LLMController
 from .diagnostics import Diagnoser
 from .evolution import EvolutionManager
+from .lineage import AutonomousLineageController, LineageManager, ModelLineageReasoner
 from .evaluation import Verifier
 from .experiments import (
     CapsuleManager, ExperimentOrchestrator, ExperimentVariant, ModelSemanticJudge,
@@ -84,6 +87,7 @@ def _parser() -> argparse.ArgumentParser:
     submit.add_argument("--title")
     submit.add_argument("--priority", type=int, default=50)
     submit.add_argument("--max-attempts", type=int, default=3)
+    submit.add_argument("--lineage", help="Bind the task to an experimental lineage")
     task_list = task_commands.add_parser("list")
     task_list.add_argument("--status", choices=[item.value for item in TaskStatus])
     task_list.add_argument("--limit", type=int, default=50)
@@ -102,6 +106,10 @@ def _parser() -> argparse.ArgumentParser:
     result_show.add_argument("id", type=int)
     result_answer = result_commands.add_parser("answer")
     result_answer.add_argument("id", type=int)
+    result_shadow = result_commands.add_parser(
+        "shadow-verify", help="Measure a recorded result without changing task state"
+    )
+    result_shadow.add_argument("id", type=int)
 
     memory = commands.add_parser("memory", help="Manage persistent memories")
     memory_commands = memory.add_subparsers(dest="memory_command", required=True)
@@ -136,6 +144,14 @@ def _parser() -> argparse.ArgumentParser:
     evolution_commands.add_parser("versions")
     evolution_runs = evolution_commands.add_parser("runs")
     evolution_runs.add_argument("--limit", type=int, default=50)
+    evolution_commands.add_parser("lineage-list", help="List autonomous experimental lineages")
+    lineage_show = evolution_commands.add_parser("lineage-show", help="Inspect one lineage")
+    lineage_show.add_argument("lineage_id")
+    lineage_run = evolution_commands.add_parser(
+        "lineage-run", help="Let the Agent autonomously continue, fork, adopt, or return",
+    )
+    lineage_run.add_argument("lineage_id", nargs="?", help="Defaults to experimental head")
+    lineage_run.add_argument("--task-limit", type=int, default=20)
     evolution_auto = evolution_commands.add_parser(
         "auto-run", help="Run the slow self-evolution loop without production activation",
     )
@@ -286,10 +302,25 @@ def _parser() -> argparse.ArgumentParser:
 
 def _load(path: str) -> tuple[Settings, StateStore]:
     settings = Settings.load(path)
+    _load_local_api_key(settings)
     settings.ensure_directories()
     store = StateStore(settings.database)
     store.initialize()
     return settings, store
+
+
+def _load_local_api_key(settings: Settings) -> None:
+    """Load an ignored, local one-line api.key only when the configured env is absent."""
+    env_name = settings.model.api_key_env
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name) or os.environ.get(env_name):
+        return
+    path = settings.root / "api.key"
+    if not path.is_file() or path.is_symlink():
+        return
+    key = path.read_text(encoding="utf-8").strip()
+    if not key or "\n" in key or "\r" in key or len(key) > 4096:
+        return
+    os.environ[env_name] = key
 
 
 def _print_json(value: Any) -> None:
@@ -465,11 +496,28 @@ def main(argv: list[str] | None = None) -> int:
                 priority=args.priority,
                 max_attempts=max(1, args.max_attempts),
             )
+            bound_lineage = None
+            lineage_id = None
+            if args.lineage:
+                lineage_manager = LineageManager(store)
+                lineage_manager.ensure_root()
+                lineage_id = (
+                    lineage_manager.current()["lineage_id"]
+                    if args.lineage == "current" else args.lineage
+                )
+                bound_lineage = store.get_lineage(lineage_id)
+                if bound_lineage is None:
+                    raise SystemExit(f"Unknown lineage: {lineage_id}")
             task_id = store.create_task(task)
+            if lineage_id:
+                store.bind_task_lineage(task_id, lineage_id)
             event_id = store.add_event(
                 Event("TASK_REQUEST", {"task_id": task_id, "message": task.request}, task.priority)
             )
-            _print_json({"task_id": task_id, "event_id": event_id, "status": "queued"})
+            _print_json({
+                "task_id": task_id, "event_id": event_id, "status": "queued",
+                "lineage": bound_lineage,
+            })
         elif args.task_command == "list":
             status = TaskStatus(args.status) if args.status else None
             _print_json([_task_dict(task) for task in store.list_tasks(args.limit, status)])
@@ -479,6 +527,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise SystemExit(f"Unknown task: {args.id}")
             data = _task_dict(task)
             data["checkpoints"] = store.task_checkpoints(args.id)
+            data["lineage"] = store.task_lineage(args.id)
             _print_json(data)
         elif args.task_command == "retry":
             event_id = store.retry_task(args.id)
@@ -631,6 +680,62 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Task {task.id} {task.status.value}: {task.error}")
             else:
                 print(f"Task {task.id} has no final answer yet (status={task.status.value})")
+        elif args.result_command == "shadow-verify":
+            task = store.get_task(args.id)
+            if task is None:
+                raise SystemExit(f"Unknown task: {args.id}")
+            if not task.result:
+                raise SystemExit(f"Task {args.id} has no recorded result to measure")
+            actions = [Action(**item) for item in task.result.get("actions", [])]
+            results = [ActionResult(**item) for item in task.result.get("action_results", [])]
+            workspace_root = settings.workspace.resolve()
+            for action, action_result in zip(actions, results, strict=False):
+                if action.tool not in {"write", "write_file"} or not action_result.ok:
+                    continue
+                relative = normalize_resource_path(action.arguments.get("path", ""))
+                target = (workspace_root / relative).resolve() if relative else None
+                if target is not None and target.is_file() and isinstance(action_result.output, dict):
+                    action_result.output["path"] = str(target)
+            contract = EvidenceContract.from_request(
+                task.request, Verifier._expected_artifacts(task.request),
+            )
+            canonical = CanonicalAnswer.bind(
+                str(task.result.get("summary") or task.result.get("user_message") or ""),
+                actions, results, contract,
+            )
+            evidence = task.result.get("evidence", {})
+            working_state = task.result.get("task_working_state") or {}
+            coverage = SituationResolver.assess_coverage(
+                task.result.get("situation_map", {}), canonical.body,
+            )
+            verification = Verifier().verify(
+                actions,
+                results,
+                planned_count=int(evidence.get("planned_actions", len(actions))),
+                task_done=bool(evidence.get("agent_declared_stop")),
+                request=task.request,
+                contract=contract,
+                final_output=canonical.body,
+                completion_metadata=evidence.get("completion_metadata"),
+                coverage_assessment=coverage,
+                established_evidence=_historical_contract_evidence(
+                    store, int(task.id), contract,
+                ),
+                established_execution_evidence=bool(
+                    working_state.get("completed_steps")
+                ),
+                unresolved_failures=list(
+                    working_state.get("unresolved_failures", [])
+                ),
+            )
+            _print_json({
+                "task_id": task.id,
+                "task_status": task.status.value,
+                "measurement_mode": "offline_shadow",
+                "affects_task_state": False,
+                "verification": verification,
+                "coverage_assessment": coverage,
+            })
         return 0
     if args.command == "memory":
         if args.memory_command == "add":
@@ -712,6 +817,18 @@ def main(argv: list[str] | None = None) -> int:
             _print_json(store.list_harness_versions())
         elif args.evolution_command == "runs":
             _print_json(store.list_evolution_runs(args.limit))
+        elif args.evolution_command == "lineage-list":
+            lineage_manager = LineageManager(store)
+            lineage_manager.ensure_root()
+            _print_json(store.list_lineages())
+        elif args.evolution_command == "lineage-show":
+            lineage_manager = LineageManager(store)
+            lineage_manager.ensure_root()
+            _print_json(lineage_manager.describe(args.lineage_id))
+        elif args.evolution_command == "lineage-run":
+            _print_json(AutonomousLineageController(
+                store, ModelLineageReasoner(LLMController(settings.model)),
+            ).decide(args.lineage_id, task_limit=args.task_limit))
         elif args.evolution_command == "auto-run":
             skill_manager, capsules, runner = _experiment_services(settings, store)
             semantic = PairwiseSemanticJudge(

@@ -392,6 +392,7 @@ class RuntimeVariantRunner:
             TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.DEAD_LETTER,
             TaskStatus.DEGRADED, TaskStatus.BLOCKED_CAPABILITY,
             TaskStatus.NEEDS_AUTHORITY, TaskStatus.TERMINAL_FAILURE,
+            TaskStatus.STOPPED, TaskStatus.YIELDED, TaskStatus.ABANDONED,
         }
         run_call_limit = task.max_attempts * (
             int(self.settings.budget.max_cycles_per_task) + 2
@@ -443,8 +444,8 @@ class RuntimeVariantRunner:
         return {
             "outcome": {
                 "task_status": finished.status.value,
-                "verifier_pass": bool(verification.get("passed")),
-                "true_completion": bool(measured.get("success")),
+                "verifier_pass": verification.get("passed"),
+                "true_completion": measured.get("success"),
             },
             "cost": {
                 "model_calls": int(measured.get("model_api_calls", 0) or 0),

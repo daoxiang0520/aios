@@ -149,6 +149,47 @@ CREATE TABLE IF NOT EXISTS evolution_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_evolution_runs_status ON evolution_runs(status, id DESC);
 
+CREATE TABLE IF NOT EXISTS evolution_lineages (
+    lineage_id TEXT PRIMARY KEY,
+    parent_lineage_id TEXT,
+    generation INTEGER NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'harness',
+    status TEXT NOT NULL DEFAULT 'living',
+    settings TEXT NOT NULL DEFAULT '{}',
+    mutation TEXT NOT NULL DEFAULT '{}',
+    source_candidate_id INTEGER,
+    created_by TEXT NOT NULL,
+    decision TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(parent_lineage_id) REFERENCES evolution_lineages(lineage_id),
+    FOREIGN KEY(source_candidate_id) REFERENCES evolution_candidates(id)
+);
+CREATE INDEX IF NOT EXISTS idx_evolution_lineages_parent
+    ON evolution_lineages(parent_lineage_id, generation, created_at);
+
+CREATE TABLE IF NOT EXISTS task_lineage_bindings (
+    task_id INTEGER PRIMARY KEY,
+    lineage_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(task_id) REFERENCES tasks(id),
+    FOREIGN KEY(lineage_id) REFERENCES evolution_lineages(lineage_id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_lineage_bindings_lineage
+    ON task_lineage_bindings(lineage_id, task_id DESC);
+
+CREATE TABLE IF NOT EXISTS lineage_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lineage_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    data TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(lineage_id) REFERENCES evolution_lineages(lineage_id)
+);
+CREATE INDEX IF NOT EXISTS idx_lineage_events_lineage
+    ON lineage_events(lineage_id, id DESC);
+
 CREATE TABLE IF NOT EXISTS skill_usage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     invocation_id TEXT NOT NULL UNIQUE,
@@ -346,6 +387,25 @@ class StateStore:
                     "INSERT INTO harness_versions(version,settings,status) VALUES(1,'{}','active')"
                 )
 
+    def set_state(self, key: str, value: Any) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT INTO state(key,value) VALUES(?,?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value,
+                   updated_at=CURRENT_TIMESTAMP""",
+                (key, json.dumps(value, ensure_ascii=False, default=str)),
+            )
+
+    def get_state(self, key: str, default: Any = None) -> Any:
+        with self.connect() as connection:
+            row = connection.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
+        if row is None:
+            return default
+        try:
+            return json.loads(row["value"])
+        except (TypeError, json.JSONDecodeError):
+            return default
+
     @staticmethod
     def _migrate_runtime_correctness(connection: sqlite3.Connection) -> None:
         event_columns = {
@@ -448,6 +508,8 @@ class StateStore:
             TaskStatus.DEAD_LETTER.value, TaskStatus.DEGRADED.value,
             TaskStatus.BLOCKED_CAPABILITY.value, TaskStatus.NEEDS_AUTHORITY.value,
             TaskStatus.TERMINAL_FAILURE.value, TaskStatus.NEEDS_REVIEW.value,
+            TaskStatus.STOPPED.value, TaskStatus.YIELDED.value,
+            TaskStatus.ABANDONED.value,
         }
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -505,6 +567,8 @@ class StateStore:
             TaskStatus.DEAD_LETTER.value, TaskStatus.DEGRADED.value,
             TaskStatus.BLOCKED_CAPABILITY.value, TaskStatus.NEEDS_AUTHORITY.value,
             TaskStatus.TERMINAL_FAILURE.value, TaskStatus.NEEDS_REVIEW.value,
+            TaskStatus.STOPPED.value, TaskStatus.YIELDED.value,
+            TaskStatus.ABANDONED.value,
         }
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1154,7 +1218,8 @@ class StateStore:
             TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.DEAD_LETTER,
             TaskStatus.DEGRADED, TaskStatus.BLOCKED_CAPABILITY,
             TaskStatus.NEEDS_AUTHORITY, TaskStatus.TERMINAL_FAILURE,
-            TaskStatus.NEEDS_REVIEW,
+            TaskStatus.NEEDS_REVIEW, TaskStatus.STOPPED,
+            TaskStatus.YIELDED, TaskStatus.ABANDONED,
         }
         with self.connect() as connection:
             connection.execute(
@@ -1298,6 +1363,91 @@ class StateStore:
             "parent_id": row["parent_id"],
             "created_at": str(row["created_at"]),
         }
+
+    def create_lineage(self, lineage: dict[str, Any]) -> str:
+        lineage_id = str(lineage["lineage_id"])
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT INTO evolution_lineages(
+                       lineage_id,parent_lineage_id,generation,kind,status,settings,
+                       mutation,source_candidate_id,created_by,decision
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    lineage_id, lineage.get("parent_lineage_id"), int(lineage["generation"]),
+                    str(lineage.get("kind", "harness")), str(lineage.get("status", "living")),
+                    json.dumps(lineage.get("settings", {}), ensure_ascii=False),
+                    json.dumps(lineage.get("mutation", {}), ensure_ascii=False),
+                    lineage.get("source_candidate_id"), str(lineage.get("created_by", "agent")),
+                    json.dumps(lineage.get("decision", {}), ensure_ascii=False, default=str),
+                ),
+            )
+        return lineage_id
+
+    def get_lineage(self, lineage_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM evolution_lineages WHERE lineage_id=?", (lineage_id,)
+            ).fetchone()
+        return self._lineage_from_row(row) if row else None
+
+    def list_lineages(self) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM evolution_lineages ORDER BY generation,created_at,lineage_id"
+            ).fetchall()
+        return [self._lineage_from_row(row) for row in rows]
+
+    def add_lineage_event(
+        self, lineage_id: str, action: str, actor: str, data: dict[str, Any] | None = None,
+    ) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO lineage_events(lineage_id,action,actor,data) VALUES(?,?,?,?)",
+                (lineage_id, action, actor, json.dumps(data or {}, ensure_ascii=False, default=str)),
+            )
+            return int(cursor.lastrowid)
+
+    def list_lineage_events(self, lineage_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM lineage_events WHERE lineage_id=? ORDER BY id DESC LIMIT ?",
+                (lineage_id, max(1, min(limit, 1000))),
+            ).fetchall()
+        return [{
+            "id": int(row["id"]), "lineage_id": str(row["lineage_id"]),
+            "action": str(row["action"]), "actor": str(row["actor"]),
+            "data": json.loads(row["data"]), "created_at": str(row["created_at"]),
+        } for row in rows]
+
+    def bind_task_lineage(self, task_id: int, lineage_id: str) -> None:
+        if self.get_task(task_id) is None:
+            raise KeyError(f"Unknown task: {task_id}")
+        if self.get_lineage(lineage_id) is None:
+            raise KeyError(f"Unknown lineage: {lineage_id}")
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO task_lineage_bindings(task_id,lineage_id) VALUES(?,?)",
+                (task_id, lineage_id),
+            )
+
+    def task_lineage(self, task_id: int) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT l.* FROM evolution_lineages l
+                   JOIN task_lineage_bindings b ON b.lineage_id=l.lineage_id
+                   WHERE b.task_id=?""",
+                (task_id,),
+            ).fetchone()
+        return self._lineage_from_row(row) if row else None
+
+    def lineage_tasks(self, lineage_id: str, limit: int = 50) -> list[Task]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT t.* FROM tasks t JOIN task_lineage_bindings b ON b.task_id=t.id
+                   WHERE b.lineage_id=? ORDER BY t.id DESC LIMIT ?""",
+                (lineage_id, max(1, min(limit, 500))),
+            ).fetchall()
+        return [self._task_from_row(row) for row in rows]
 
     def list_harness_versions(self) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -1484,6 +1634,21 @@ class StateStore:
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
         )
+
+    @staticmethod
+    def _lineage_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "lineage_id": str(row["lineage_id"]),
+            "parent_lineage_id": (
+                str(row["parent_lineage_id"]) if row["parent_lineage_id"] else None
+            ),
+            "generation": int(row["generation"]), "kind": str(row["kind"]),
+            "status": str(row["status"]), "settings": json.loads(row["settings"]),
+            "mutation": json.loads(row["mutation"]),
+            "source_candidate_id": row["source_candidate_id"],
+            "created_by": str(row["created_by"]), "decision": json.loads(row["decision"]),
+            "created_at": str(row["created_at"]), "updated_at": str(row["updated_at"]),
+        }
 
     @staticmethod
     def _memory_from_row(row: sqlite3.Row) -> Memory:

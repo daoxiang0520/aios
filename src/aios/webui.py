@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .config import Settings
+from .lineage import LineageManager
 from .storage import StateStore
 from .types import Event, Task, TaskStatus
 
@@ -19,7 +20,8 @@ TERMINAL = {
     TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.DEAD_LETTER.value,
     TaskStatus.DEGRADED.value, TaskStatus.BLOCKED_CAPABILITY.value,
     TaskStatus.NEEDS_AUTHORITY.value, TaskStatus.TERMINAL_FAILURE.value,
-    TaskStatus.NEEDS_REVIEW.value,
+    TaskStatus.NEEDS_REVIEW.value, TaskStatus.STOPPED.value,
+    TaskStatus.YIELDED.value, TaskStatus.ABANDONED.value,
 }
 
 
@@ -39,15 +41,20 @@ class AIOSWebApplication:
         self.assets = Path(__file__).with_name("web")
 
     def bootstrap(self) -> dict[str, Any]:
+        lineage_manager = LineageManager(self.store)
+        lineage_manager.ensure_root()
         tasks = self.tasks()
         return {
-            "app": "AIOS Agent Workbench", "version": "0.1",
+            "app": "AIOS Agent Workbench", "version": "0.2",
             "workspace": self.settings.workspace.name,
             "workspace_path": str(self.settings.workspace),
             "model": self.settings.model.model,
             "provider": self.settings.model.provider,
             "pending_events": self.store.count_pending_events(),
             "runtime_state": self._runtime_state(tasks),
+            "runtime_policy": self._runtime_policy(),
+            "lineages": self.store.list_lineages(),
+            "experimental_lineage_head": lineage_manager.current()["lineage_id"],
             "csrf_token": self.csrf_token,
             "tasks": tasks,
         }
@@ -66,6 +73,7 @@ class AIOSWebApplication:
         ]
         traces = self.store.traces_for_cycles(list(dict.fromkeys(cycle_ids)))
         result = task.result or {}
+        completion = self._completion_projection(task, result)
         return {
             "task": self._task_summary(task, include_request=True),
             "chat": self._chat(task.request, result, task.error),
@@ -73,6 +81,8 @@ class AIOSWebApplication:
             "budget": self._budget(result, checkpoints),
             "artifacts": self._artifacts(result),
             "evidence": self._evidence(result, traces, checkpoints),
+            "completion": completion,
+            "lineage": self.store.task_lineage(task_id),
             "evolution": self.evolution_runs(task_id),
         }
 
@@ -85,12 +95,22 @@ class AIOSWebApplication:
         title = str(payload.get("title") or request[:120]).strip()
         priority = max(0, min(100, int(payload.get("priority", 50))))
         max_attempts = max(1, min(10, int(payload.get("max_attempts", 3))))
+        lineage_id = str(payload.get("lineage_id", "")).strip()
+        if lineage_id == "current":
+            lineage_id = str(LineageManager(self.store).current()["lineage_id"])
+        if lineage_id and self.store.get_lineage(lineage_id) is None:
+            raise WebUIError(400, f"Unknown lineage: {lineage_id}")
         task = Task(title=title, request=request, priority=priority, max_attempts=max_attempts)
         task_id = self.store.create_task(task)
+        if lineage_id:
+            self.store.bind_task_lineage(task_id, lineage_id)
         event_id = self.store.add_event(
             Event("TASK_REQUEST", {"task_id": task_id, "message": request}, priority)
         )
-        return {"task_id": task_id, "event_id": event_id, "status": "queued"}
+        return {
+            "task_id": task_id, "event_id": event_id, "status": "queued",
+            "lineage": self.store.task_lineage(task_id),
+        }
 
     def retry_task(self, task_id: int) -> dict[str, Any]:
         task = self.store.get_task(task_id)
@@ -201,6 +221,55 @@ class AIOSWebApplication:
         if any(item["status"] in {"queued", "retrying", "budget_deferred"} for item in tasks):
             return "waiting"
         return "idle"
+
+    def _runtime_policy(self) -> dict[str, Any]:
+        free = self.settings.runtime.completion_mode == "free"
+        return {
+            "mode": self.settings.runtime.completion_mode,
+            "label": "FREE LOOP" if free else "VERIFIED LOOP",
+            "online_verifier": not free,
+            "description": (
+                "Agent stop/yield is recorded without a Host completion judgment"
+                if free else
+                "Host Verifier decides completed, degraded, or rejected"
+            ),
+        }
+
+    def _completion_projection(self, task: Task, result: dict[str, Any]) -> dict[str, Any]:
+        evidence = result.get("evidence") if isinstance(result.get("evidence"), dict) else {}
+        verification = (
+            evidence.get("verification")
+            if isinstance(evidence.get("verification"), dict) else {}
+        )
+        recorded_free = (
+            evidence.get("online_verifier_enabled") is False
+            or verification.get("mode") == "disabled"
+            or task.status in {TaskStatus.STOPPED, TaskStatus.YIELDED, TaskStatus.ABANDONED}
+        )
+        recorded_verified = (
+            isinstance(verification.get("passed"), bool)
+            or task.status in {TaskStatus.COMPLETED, TaskStatus.DEGRADED, TaskStatus.DEAD_LETTER}
+        )
+        mode = "free" if recorded_free else "verified" if recorded_verified else self.settings.runtime.completion_mode
+        status_meanings = {
+            TaskStatus.STOPPED: "Agent declared stop; true completion was not judged",
+            TaskStatus.YIELDED: "Agent yielded without declaring completion",
+            TaskStatus.ABANDONED: "Runtime stopped investing after execution or protocol exhaustion",
+            TaskStatus.COMPLETED: "Host Verifier accepted completion",
+            TaskStatus.DEGRADED: "Host Verifier observed only partial or substitute satisfaction",
+            TaskStatus.DEAD_LETTER: "Verified Runtime exhausted retries after rejection or failure",
+        }
+        return {
+            "mode": mode,
+            "label": "FREE LOOP" if mode == "free" else "VERIFIED LOOP",
+            "online_verifier": mode == "verified",
+            "task_status": task.status.value,
+            "status_meaning": status_meanings.get(task.status, "Task is not at a terminal boundary"),
+            "agent_declared_stop": evidence.get("agent_declared_stop"),
+            "host_observed_completion": evidence.get("host_observed_completion"),
+            "verifier_pass": verification.get("passed"),
+            "true_completion_known": isinstance(evidence.get("success"), bool),
+        }
 
     @staticmethod
     def _chat(request: str, result: dict[str, Any], error: str | None) -> list[dict[str, Any]]:

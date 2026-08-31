@@ -132,7 +132,8 @@ class AIOSRuntime:
                 TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.DEAD_LETTER,
                 TaskStatus.DEGRADED, TaskStatus.BLOCKED_CAPABILITY,
                 TaskStatus.NEEDS_AUTHORITY, TaskStatus.TERMINAL_FAILURE,
-                TaskStatus.NEEDS_REVIEW,
+                TaskStatus.NEEDS_REVIEW, TaskStatus.STOPPED,
+                TaskStatus.YIELDED, TaskStatus.ABANDONED,
             }
             if not continuation and task.status in terminal_statuses:
                 self.store.discard_event(event, "terminal_task")
@@ -188,7 +189,11 @@ class AIOSRuntime:
             self.store.trace(cycle_id, "intent_selected", asdict(intent))
             self.store.add_checkpoint(int(task.id), "intent", asdict(intent))
 
-            expected_artifacts = self.verifier._expected_artifacts(task.request)
+            expected_artifacts = (
+                self.verifier._expected_artifacts(task.request)
+                if self.settings.runtime.completion_mode == "verified"
+                else []
+            )
             contract = EvidenceContract.from_request(task.request, expected_artifacts)
             preflight_assessment = self.capabilities.assess(contract)
             preflight = {"contract": contract.as_dict(), "assessment": preflight_assessment}
@@ -234,7 +239,14 @@ class AIOSRuntime:
             })
             self.security.workspace = snapshot.resolve()
 
-            harness = self.store.active_harness()
+            lineage = self.store.task_lineage(int(task.id)) if task.id is not None else None
+            harness = (
+                {
+                    "version": f"lineage:{lineage['lineage_id']}",
+                    "settings": lineage.get("settings", {}),
+                }
+                if lineage is not None else self.store.active_harness()
+            )
             harness_settings = harness.get("settings", {})
             memory_limit = harness_settings.get("memory_context_characters")
             if isinstance(memory_limit, int):
@@ -252,6 +264,14 @@ class AIOSRuntime:
                 context["skill_authoring"] = skill_authoring
             context["harness"] = harness_settings
             context["harness_version"] = harness.get("version")
+            context["lineage"] = lineage
+            if lineage is not None:
+                self.store.trace(cycle_id, "lineage_bound", {
+                    "task_id": task.id, "lineage_id": lineage["lineage_id"],
+                    "parent_lineage_id": lineage.get("parent_lineage_id"),
+                    "generation": lineage.get("generation"),
+                    "production_default_changed": False,
+                })
             context["continuation"] = self._continuation_context(int(task.id)) if continuation else None
             context["task_working_state"] = self._working_state_projection(working_state)
             if environment_observation is not None:
@@ -621,7 +641,7 @@ class AIOSRuntime:
                 )
                 has_final_action = any(action.tool in {"write", "edit", "echo", "write_file", "append_file"} for action in actions)
                 task_done = bool(plan.done and (has_final_action or not actions))
-                if task_done:
+                if task_done and self.settings.runtime.completion_mode == "verified":
                     provisional_situation = self.situations.resolve(
                         task.request, full_workspace_inventory, contract, working_state, full_skills,
                         context.get("environment") if isinstance(context.get("environment"), dict) else None,
@@ -764,6 +784,120 @@ class AIOSRuntime:
                 task.request, full_workspace_inventory, contract, working_state, full_skills,
                 context.get("environment") if isinstance(context.get("environment"), dict) else None,
             )
+            if self.settings.runtime.completion_mode == "free":
+                status = TaskStatus.STOPPED if task_done else TaskStatus.YIELDED
+                outcome = "agent_declared_stop" if task_done else "agent_yielded"
+                measurement = {
+                    "mode": "disabled", "passed": None,
+                    "outcome": "not_evaluated", "checks": [],
+                }
+                self.store.finalize_skill_usage(
+                    cycle_id, verifier_passed=None, task_outcome=outcome,
+                    model_calls_after=model_calls_used, tokens_after=model_tokens_total,
+                )
+                evidence = {
+                    "success": None,
+                    "online_verifier_enabled": False,
+                    "agent_declared_stop": bool(task_done),
+                    "host_observed_completion": None,
+                    "model_rounds": len(rounds),
+                    "model_api_calls": task_budget.used_model_calls,
+                    "model_tokens": task_budget.used_tokens,
+                    "task_tool_calls": task_budget.used_tool_calls,
+                    "cycle_model_api_calls": model_calls_used,
+                    "cycle_model_tokens": model_tokens_total,
+                    "task_cycles": task_budget.used_cycles,
+                    "rounds_to_first_computation": task_metrics["rounds_to_first_computation"],
+                    "dependency_provision_latency_ms": task_metrics["dependency_provision_latency_ms"],
+                    "repeated_resource_reads": task_metrics["repeated_resource_reads"],
+                    "repeated_resource_executions": task_metrics["repeated_resource_executions"],
+                    "observation_reuse_hits": task_metrics["observation_reuse_hits"],
+                    "redundant_resource_bypasses": task_metrics["redundant_resource_bypasses"],
+                    "environment_probe_calls": task_metrics["environment_probe_calls"],
+                    "sandbox_sessions": task_metrics["sandbox_sessions"],
+                    "sandbox_health_probes": task_metrics["sandbox_health_probes"],
+                    "adapter_retries": task_metrics["adapter_retries"],
+                    "adapter_transient_recoveries": task_metrics["adapter_transient_recoveries"],
+                    "protocol_repair_calls": task_metrics["protocol_repair_calls"],
+                    "protocol_repair_tokens": task_metrics["protocol_repair_tokens"],
+                    "failed_tool_calls": task_metrics["failed_tool_calls"],
+                    "post_failure_tool_changes": task_metrics["post_failure_tool_changes"],
+                    "prompt_token_attribution": attribution_totals,
+                    "context_reuse_ratio": (
+                        attribution_totals["repeated_tokens"] / attribution_totals["prompt_tokens"]
+                        if attribution_totals["prompt_tokens"] else 0.0
+                    ),
+                    "planned_actions": planned_count,
+                    "executed_actions": len(all_results),
+                    "failed_actions": sum(not result.ok for result in all_results),
+                    "budget_truncated": budget_truncated,
+                    "budget_deferred_actions": budget_deferred,
+                    "verification": measurement,
+                    "completion_metadata": completion_metadata,
+                    "result_vector": None,
+                    "coverage_assessment": {
+                        "mode": "not_evaluated", "required": None, "passed": None,
+                    },
+                    "established_evidence": list(working_state.get("evidence_ledger", [])),
+                }
+                self.store.trace(cycle_id, "agent_stop_observation", evidence)
+                task_result = {
+                    "cycle_id": cycle_id, "summary": final_summary,
+                    "user_message": canonical_answer.user_message,
+                    "artifacts": [asdict(item) for item in canonical_answer.artifacts],
+                    "canonical_answer": canonical_answer.as_dict(),
+                    "final_output": final_output, "rounds": rounds,
+                    "actions": [asdict(action) for action in all_actions],
+                    "action_results": [asdict(result) for result in all_results],
+                    "task_working_state": self._working_state_projection(working_state),
+                    "situation_map": final_situation, "evidence": evidence,
+                    "lineage": lineage,
+                }
+                committed = self.sandbox.commit(self.settings.workspace)
+                canonical_answer.mark_committed()
+                task_result["committed_files"] = committed
+                task_result["artifacts"] = [asdict(item) for item in canonical_answer.artifacts]
+                task_result["canonical_answer"] = canonical_answer.as_dict()
+                task_result["final_output"] = self._published_output(final_output, snapshot)
+                current_task_authored_candidate = bool(
+                    skill_authoring is not None
+                    and (
+                        self._skill_candidate_written(all_actions, all_results)
+                        or self._working_state_skill_candidate(working_state)
+                    )
+                )
+                skill_candidates = (
+                    self.skills.ingest_workspace_candidates(
+                        self.settings.workspace,
+                        self.sandbox,
+                        source_task_id=int(task.id),
+                        source_trace_ids=[
+                            item["id"] for item in self.store.recent_traces(limit=500)
+                            if item["cycle_id"] == cycle_id
+                        ],
+                    )
+                    if self.settings.skills.enabled and current_task_authored_candidate
+                    else []
+                )
+                if skill_candidates:
+                    task_result["skill_candidates"] = skill_candidates
+                    self.store.trace(
+                        cycle_id, "skill_candidates_ingested", {"candidates": skill_candidates}
+                    )
+                self.store.trace(cycle_id, "task_terminal_decision", {
+                    "task_id": int(task.id), "status": status.value,
+                    "reason": outcome, "decision_input_ref": "agent_declaration",
+                    "true_completion": None,
+                })
+                self.store.finish_events(event_ids)
+                self.store.update_task(int(task.id), status, result=task_result)
+                self.store.add_checkpoint(int(task.id), status.value, task_result)
+                self.sandbox.purge_task_dependencies(int(task.id))
+                LOGGER.info(
+                    "Task %s %s without online verification: %s",
+                    task.id, status.value, final_summary,
+                )
+                return True
             coverage_assessment = self.situations.assess_coverage(
                 final_situation, canonical_answer.body,
             )
@@ -860,6 +994,7 @@ class AIOSRuntime:
                 "actions": [asdict(action) for action in all_actions],
                 "action_results": [asdict(result) for result in all_results],
                 "task_working_state": self._working_state_projection(working_state),
+                "lineage": lineage,
                 "situation_map": final_situation,
                 "evidence": evidence,
             }
@@ -1326,7 +1461,7 @@ class AIOSRuntime:
             return context
         common = {
             key: context[key] for key in (
-                "workspace_inventory", "harness", "harness_version", "budget",
+                "workspace_inventory", "harness", "harness_version", "lineage", "budget",
                 "observations", "round", "_protocol_messages",
             ) if key in context
         }
@@ -1636,13 +1771,23 @@ class AIOSRuntime:
         task_id = int(task.id)
         self.store.finalize_skill_usage(
             cycle_id,
-            verifier_passed=False,
+            verifier_passed=(
+                None if self.settings.runtime.completion_mode == "free" else False
+            ),
             task_outcome="failed_attempt",
             model_calls_after=model_calls_after,
             tokens_after=tokens_after,
         )
         self.store.finish_events(event_ids, error=error)
-        failure_class = "missing_executable" if "MissingExecutable:" in error else "execution_or_verification"
+        failure_class = (
+            "missing_executable"
+            if "MissingExecutable:" in error
+            else (
+                "execution_or_runtime"
+                if self.settings.runtime.completion_mode == "free"
+                else "execution_or_verification"
+            )
+        )
         working_state = result.get("task_working_state") if isinstance(result, dict) else None
         self.store.add_checkpoint(task_id, "failed_attempt", {
             "error": error,
@@ -1743,18 +1888,29 @@ class AIOSRuntime:
                     retry_id,
                 )
                 return
+            final_status = (
+                TaskStatus.ABANDONED
+                if self.settings.runtime.completion_mode == "free"
+                else TaskStatus.DEAD_LETTER
+            )
             self.store.trace(cycle_id, "task_terminal_decision", {
-                "task_id": task_id, "status": TaskStatus.DEAD_LETTER.value,
+                "task_id": task_id, "status": final_status.value,
                 "reason": error, "decision_input_ref": "failed_attempt",
             })
-            self.store.update_task(task_id, TaskStatus.DEAD_LETTER, result=result, error=error)
+            self.store.update_task(task_id, final_status, result=result, error=error)
             self.sandbox.purge_task_dependencies(task_id)
-            dead_id = self.store.add_dead_letter(task_id, event, error)
-            self.store.trace(cycle_id, "dead_lettered", {"task_id": task_id, "dead_letter_id": dead_id})
-            if terminal_protocol_failure and task.attempts < task.max_attempts:
-                LOGGER.error("Task %s entered dead letter %s after terminal protocol repair failure", task_id, dead_id)
+            dead_id = None
+            if final_status == TaskStatus.DEAD_LETTER:
+                dead_id = self.store.add_dead_letter(task_id, event, error)
+                self.store.trace(cycle_id, "dead_lettered", {"task_id": task_id, "dead_letter_id": dead_id})
             else:
-                LOGGER.error("Task %s exhausted retries and entered dead letter %s", task_id, dead_id)
+                self.store.trace(cycle_id, "task_abandoned", {
+                    "task_id": task_id, "reason": error, "true_completion": None,
+                })
+            if terminal_protocol_failure and task.attempts < task.max_attempts:
+                LOGGER.error("Task %s entered %s after terminal protocol repair failure", task_id, final_status.value)
+            else:
+                LOGGER.error("Task %s exhausted retries and entered %s", task_id, final_status.value)
 
     def _reload_generated_tools(self) -> None:
         registry = ToolRegistry(self.settings.permissions, self.plugins, self.sandbox)

@@ -40,6 +40,9 @@ class TaskStatus(StrEnum):
     RETRYABLE_FAILURE = "retryable_failure"
     TERMINAL_FAILURE = "terminal_failure"
     NEEDS_REVIEW = "needs_review"
+    STOPPED = "stopped"
+    YIELDED = "yielded"
+    ABANDONED = "abandoned"
 
 
 class MemoryType(StrEnum):

@@ -1,11 +1,31 @@
 # Self-Evolving AIOS
 
-Current release: **v0.9.0-alpha.3**. Runtime Repair and Open Evolution remain frozen at their
-existing experimental boundaries. Phase 1 now measures Harness sensitivity under immutable Task
-Capsules: H0 Structured, H1 Reduced, and H2 Minimal Open run with the same model, task, initial
-workspace, authority, tools, budget, temperature, sandbox, and verifier. Reports preserve outcome,
-quality, cost, repetition, recovery, and strategy-change dimensions without selecting a winner,
-collapsing them into one reward, or promoting a Harness.
+Current release: **v0.9.0-alpha.5**. The production/evolution loop now supports Free Runtime and
+Autonomous Lineage. An Agent may continue its current experimental Harness lineage, adopt an
+existing candidate into a child, author one bounded child mutation, or return to an ancestor.
+Each child inherits its parent's settings and can run ordinary durable tasks, while production
+`active_harness` remains unchanged. The Host records heredity, authority and resource facts; it does
+not select which lineage is better.
+
+The Free Runtime semantics introduced in alpha.4 remain unchanged: the online Verifier is disabled,
+Agent stop/yield declarations are recorded without turning them into true-completion claims, and
+world changes remain versioned and auditable. Authority, sandbox, immutable history, resource limits,
+and rollback remain Host-owned. The former Verifier is retained only as the explicit, read-only
+`result shadow-verify` research instrument. Legacy configurations without
+`runtime.completion_mode` remain in verified mode for compatibility.
+
+```powershell
+python -m aios --config config.json evolution lineage-list
+python -m aios --config config.json evolution lineage-run lin_root
+python -m aios --config config.json evolution lineage-run
+python -m aios --config config.json task submit "完成一个真实任务" --lineage current
+python -m aios --config config.json run
+python -m aios --config config.json evolution lineage-show lin_xxxxxxxxxxxxxxxx
+```
+
+`lineage-run` never promotes to production. Alpha.5 executes Harness lineages only; Runtime,
+Sandbox, Authority, Storage/Audit and external evaluators remain outside the autonomous mutation
+surface.
 
 ## Agent Workbench（第一版）
 
@@ -13,6 +33,11 @@ collapsing them into one reward, or promoting a Harness.
 `Inspect` 模式额外展示 Evidence、Evolution、模型意图与 Host 处置，并可查看
 Runtime Candidate 的修改内容。UI 仅投影现有 SQLite/Trace/Evolution 状态，不复制
 Runtime、安全或评估决策。
+
+v0.9-alpha.4 的 UI 将 Runtime policy 与显示模式明确分离：顶部蓝色 `FREE LOOP` / 绿色
+`VERIFIED LOOP` 表示在线终止语义，`Normal / Inspect` 只控制信息密度。历史任务按自身证据显示
+执行时模式；`agent stopped / agent yielded / runtime abandoned` 不再使用完成态的绿色表达，
+Chat 与 Evidence 页都会说明 Agent 声明是否经过 Host Verifier。
 
 ```powershell
 # 终端 1：打开 UI
@@ -40,6 +65,11 @@ python -m aios --config config.json run
 - `resource.http.read` 的有效可用性同时要求 Provider 存在、Docker 可运行且 `network.external` Authority 已授予；
 - CapabilityRegistry 与执行前能力检查；
 - EvidenceContract 与执行/产物/证据/目标四层 Verifier；
+- Free Runtime 可通过 `runtime.completion_mode=free` 将 Verifier 完全移出在线闭环；Agent 的
+  `done=true` 记录为 `stopped`，无完成声明的主动退出记录为 `yielded`，执行/协议预算耗尽记录为
+  `abandoned`，三者均不等价于 `completed`；
+- `python -m aios --config config.json result shadow-verify <task_id>` 可离线测量记录结果，
+  但不会写 Task、Checkpoint、Trace、Memory 或工作区；
 - `completed`、`degraded`、`blocked_capability`、`needs_authority` 等任务语义；
 - Docker-only SandboxBroker：事务工作区、资源限制、禁用宿主 Shell 回退；
 - `aiosctl` 只读状态接口与沙盒内状态快照；
