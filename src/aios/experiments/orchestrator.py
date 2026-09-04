@@ -71,13 +71,43 @@ class ExperimentOrchestrator:
             "allowed_difference": f"{baseline.mutation_type} mutation only",
             "mutation_schema": "component_mutation/v1",
         }
-        self.store.create_experiment(spec)
+        resumable = self.store.find_resumable_experiment(spec)
+        if resumable is not None:
+            experiment_id = resumable["experiment_id"]
+            spec = resumable["spec"]
+            self.store.update_experiment(experiment_id, "running", {
+                "status": "resuming",
+                "reused_run_count": len(resumable["runs"]),
+            })
+        else:
+            self.store.create_experiment(spec)
         all_runs: dict[str, list[dict[str, Any]]] = {baseline.name: [], candidate.name: []}
         initial_hashes: set[str] = set()
+        existing_variants = {
+            item.get("name") for item in (resumable or {}).get("variants", [])
+        }
+        existing_runs: dict[tuple[str, int], dict[str, Any]] = {}
+        for evidence in (resumable or {}).get("runs", []):
+            key = (str(evidence.get("variant")), int(evidence.get("replicate", 0)))
+            if key in existing_runs:
+                raise RuntimeError(f"Duplicate persisted experiment run: {key[0]} replicate {key[1]}")
+            existing_runs[key] = evidence
+        reused_run_count = 0
         try:
             for variant in (baseline, candidate):
-                self.store.add_experiment_variant(experiment_id, variant.as_dict())
+                if variant.name not in existing_variants:
+                    self.store.add_experiment_variant(experiment_id, variant.as_dict())
                 for replicate in range(1, runs_per_variant + 1):
+                    persisted = existing_runs.get((variant.name, replicate))
+                    if persisted is not None:
+                        if persisted.get("initial_state_hash") != capsule["initial_state_hash"]:
+                            raise RuntimeError(
+                                f"Persisted run state mismatch: {variant.name} replicate {replicate}"
+                            )
+                        all_runs[variant.name].append(persisted)
+                        initial_hashes.add(str(persisted["initial_state_hash"]))
+                        reused_run_count += 1
+                        continue
                     world = self.capsules.fork(
                         capsule_id, f"world_{experiment_id[4:16]}_{variant.name}_{replicate}"
                     )
@@ -96,9 +126,16 @@ class ExperimentOrchestrator:
                 raise RuntimeError("Experiment variants did not start from the same workspace state")
             baseline_output = self._representative_output(all_runs[baseline.name])
             candidate_output = self._representative_output(all_runs[candidate.name])
-            semantic = self.semantic_judge.evaluate(
-                capsule["task"]["request"], baseline_output, candidate_output
+            semantic = (
+                self.store.latest_semantic_judgement(experiment_id)
+                if resumable is not None else None
             )
+            reused_semantic_judgement = semantic is not None
+            if semantic is None:
+                semantic = self.semantic_judge.evaluate(
+                    capsule["task"]["request"], baseline_output, candidate_output
+                )
+                self.store.add_semantic_judgement(experiment_id, semantic)
             report = self.evaluator.evaluate(
                 all_runs[baseline.name], all_runs[candidate.name],
                 fidelity=capsule["fidelity"], semantic=semantic,
@@ -108,14 +145,19 @@ class ExperimentOrchestrator:
                 "candidate_id": candidate.mutation.get("candidate_id"),
                 "same_initial_state": len(initial_hashes) == 1,
                 "variants": {baseline.name: all_runs[baseline.name], candidate.name: all_runs[candidate.name]},
+                "resumed_from_persisted_runs": resumable is not None,
+                "reused_run_count": reused_run_count,
+                "reused_semantic_judgement": reused_semantic_judgement,
             })
-            self.store.add_semantic_judgement(experiment_id, semantic)
             self.store.add_counterfactual_report(experiment_id, report)
             self.store.update_experiment(experiment_id, "completed", report)
             return report
         except Exception as exc:
             self.store.update_experiment(
-                experiment_id, "failed", {"error": f"{type(exc).__name__}: {exc}"}
+                experiment_id, "failed", {
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "reused_run_count": reused_run_count,
+                }
             )
             raise
 

@@ -1,5 +1,87 @@
 # Self-Evolving AIOS
 
+> **Research prototype frozen — 2026-09-05**
+>
+> 本仓库现定位为：**支持 Free Runtime、Component/Capability、Task Capsule、Autonomous Lineage 与 Counterfactual Experiment 的 Agent Runtime 实验平台**。
+>
+> 当前版本保留用于研究、复现和展示；不再以“可靠递归自进化 AI”作为继续扩展目标，也不建议作为无人监管的生产执行器。
+
+## 最终研究报告
+
+### 项目结论
+
+AIOS 并非“没有做出来”。截至冻结点，它已经真实实现并运行了下面这条链：
+
+```text
+Task / Experience
+        ↓
+Harness 或 Component Candidate
+        ↓
+Isolated Experimental Lineage
+        ↓
+Immutable Capsule Replay
+        ↓
+Parent / Candidate Counterfactual Measurement
+```
+
+项目最重要的实验结论是：
+
+> 自修改、候选生成、版本谱系、隔离执行和反事实实验都可以工程化；真正困难的是，在开放任务中可靠判断哪一种修改“确实更好”，并避免错误归因、无效测量、负迁移和高昂实验成本。
+
+因此，项目在“演化基础设施可运行、自主演化有效性尚未证明”的位置冻结。这个停点保留了已完成工作的研究价值，也避免继续进入高成本、低反馈、不断补实验脚手架的循环。
+
+### 已证明
+
+- Durable Task/Event Queue、Result Inbox、Trace、Memory 和 Dead Letter 可运行。
+- DeepSeek 原生 Tool Calling、协议恢复与多轮 Agent Runtime 可运行。
+- `read/write/edit/bash` 最小工具面、Docker Sandbox、权限和工作区隔离可运行。
+- PDF、XLSX、CSV、HTTP Resource Adapter 与 Capability Preflight 可运行。
+- Component/Capability 模型可以统一登记 Primitive、Skill、Workflow、Plugin、Resource Adapter、Environment Provider 与 Kernel Component。
+- Task Capsule 能冻结初始世界，Experiment 能从相同状态重放父/子版本。
+- Free Runtime 能把 `Agent 声明停止` 与 `Host 证明完成` 分开。
+- Autonomous Lineage 能创建 Harness 后代、继承 Component Set、绑定任务、创作隔离 Skill 候选并请求反事实测量。
+- Counterfactual Evaluation 不会自动晋升生产；失败实验可以复用已持久化 replicate 和语义判断后续跑。
+- 冻结前完整测试套件共 **306 项，全部通过**。
+
+### 未证明
+
+- AIOS 能稳定自主诊断并修复新的 Runtime 缺陷。
+- 模型能稳定生成最小、可达且语义安全的代码 Patch。
+- Agent 能稳定从 Experience 创作并保留有用 Skill。
+- Agent 能可靠选择出跨任务更优的 Harness/Component 后代。
+- Workflow、Plugin、Adapter、Provider 和 Kernel 已形成自主创作闭环。
+- Free Runtime 中的 `stopped` 能代表任务真实完成。
+- 谱系机制相对于更轻量的 Memory/Skill 学习能稳定产生额外收益。
+
+### 最后一次关键实验
+
+Run 93 比较了父谱系 `lin_30779d600a014ba9` 与 read-ledger 子谱系 `lin_bf4054b853224d09`：
+
+| Capsule | 观察结果 |
+|---|---|
+| Task 90 资源复现 | 重复资源动作从 3 降到 0，但中位 Tokens 增加 25,029 |
+| Task 89 数据集分析 | 重复动作从 4 增到 5，Tokens 增加约 135 万，Model Calls 增加 78 |
+| Task 88 PDF+XLSX | 父子四次运行全部 abandoned，且缺少可追溯终止错误，不能作为有效对照 |
+
+这次实验没有选出赢家，也没有激活生产版本。它真实测出了负迁移，同时暴露了实验错误证据丢失、无效 replicate 仍被聚合、Free 模式缺少在线质量结论以及无预算实验成本过高等问题。
+
+### 为什么停止继续扩展
+
+1. 主要瓶颈已经从工程基础设施转移到模型的因果归因与开放任务评价。
+2. 每增加一层合同或特例，都更容易针对既有 Benchmark 过拟合，而不是获得可泛化的自进化能力。
+3. 真实 Counterfactual Replay 成本已达到单轮数百万 Tokens，反馈密度不足以支持继续快速迭代。
+4. 当前成果已经形成完整且可展示的研究原型，继续扩大目标会降低项目边界和结论的清晰度。
+
+### 冻结后的维护边界
+
+- 接受：安全修复、依赖兼容、文档、可复现性和明确的测量正确性修复。
+- 默认不再增加：新的 Reasoner scaffold、针对冻结案例的提示规则、新的自动变异面或无人监管生产晋升。
+- 如果未来恢复研究，应先获得新的 provenance-complete Future Holdout，并为 Experiment 设置独立 Token、调用和墙钟预算。
+- 在线 Verifier 保持可关闭；原 Verifier 作为 shadow/offline research instrument 保留。
+
+完整的模块、配置、谱系、实验和已知问题清单见：
+[AIOS 当前工作总览（2026-09-05）](AIOS_当前工作总览_2026-09-05.md)。
+
 Current release: **v0.9.0-alpha.6**. Autonomous Lineage now versions both Harness settings and a
 unified Component Set. Every lineage snapshots registered primitives, Skills, Plugins, resource
 adapters and environment providers; Workflow and kernel kinds share the same manifest/policy model.
@@ -426,6 +508,8 @@ v0.6 已开始 Skill Evolution：Trace 或重复任务可以被沉淀为候选 S
 谱系决策的 `current_execution_config` 将保存值与有效限制分开：预算开关、有效周期/任务配额、失效的 Harness 参数、完成模式，以及仍保留的模型输出/命令超时/沙盒/上下文边界。Runtime 与谱系决策共用解析函数，运行时另记录 `execution_config_resolved` Trace。它仅描述本次加载的配置，不声称其他正在运行的进程已热更新；历史任务的 `execution_policy` 来自当时结果，缺失即未知。事实采用白名单，不发送 API 密钥、服务地址或宿主路径。缺少 Settings 的离线调用明确返回配置未知。已有 Run 不改写，也不因本功能触发模型调用。
 
 谱系原生动作 `REQUEST_COUNTERFACTUAL_EVALUATION` 可以从模型可见的执行前 Full Capsule 中选择 1–3 个，并让直接父 Harness 与当前 Harness 各从同一个不可变世界重放 1–3 次。它复用 ExperimentOrchestrator，保存每个实验 ID、父/子测量向量、差值和双序语义测量；事件只保存有界摘要，完整运行证据留在 Experiment 表。该动作不改变实验谱系头、不采用候选、不晋升生产，也不把 Host 指标聚合成适应度裁决。只有带直接 Harness 父节点的谱系可以使用；Root、Component mutation、Partial/Post-hoc Capsule 会在执行前被拒绝。实验失败作为 `lineage_evaluation_failed` 记录，不伪装成谱系选择。下一轮模型可以基于测量自行 `CONTINUE`、`RETURN` 或继续变异。
+
+相同 Capsule、父/子变体和重复次数的失败实验可以断点恢复。已落库的 `(variant, replicate)` 运行证据及语义判断会直接复用，仅执行缺失的 replicate；恢复报告通过 `resumed_from_persisted_runs`、`reused_run_count` 和 `reused_semantic_judgement` 明示来源。正在运行或实验定义不同的记录不会被复用，避免并发附着或跨实验污染。
 
 在运行配置中设置 `budget.enabled=false`，取消普通任务的周期/任务级 Model Calls、Tool Calls、累计 Tokens、Cycles 和谱系 `max_actions_per_cycle` 配额；同时关闭预算预留、soft pressure 和预算强制收尾。旧配置及示例默认仍为 `true`。关闭时模型收到 `enabled=false`，剩余额度为 `null`（无限制），费用和调用计数仍记录，Web UI 显示“无限制”。这不改变任务的权限或完成模式。
 

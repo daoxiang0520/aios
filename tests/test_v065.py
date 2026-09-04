@@ -99,6 +99,60 @@ class V065CounterfactualTests(unittest.TestCase):
         )
         self.assertFalse((self.settings.workspace / "baseline.txt").exists())
 
+    def test_failed_report_persistence_resumes_without_reexecuting_runs(self) -> None:
+        calls: list[tuple[str, int]] = []
+
+        class CountingJudge:
+            def __init__(self):
+                self.calls = 0
+
+            def evaluate(self, task, baseline, candidate):
+                self.calls += 1
+                return {"verdict": "equivalent", "confidence": 1.0, "tier": "test"}
+
+        def runner(capsule, world, variant, replicate):
+            calls.append((variant.name, replicate))
+            return self.evidence(calls=2 if variant.name == "candidate" else 3)
+
+        judge = CountingJudge()
+        orchestrator = ExperimentOrchestrator(
+            self.store, self.capsules, runner, semantic_judge=judge,
+        )
+        baseline = ExperimentVariant("baseline", mutation={})
+        candidate = ExperimentVariant(
+            "candidate", mutation={"candidate_id": "resume_fixture"},
+        )
+        persist = self.store.add_counterfactual_report
+        failed_once = False
+
+        def fail_once(experiment_id, report):
+            nonlocal failed_once
+            if not failed_once:
+                failed_once = True
+                raise RuntimeError("simulated report persistence failure")
+            return persist(experiment_id, report)
+
+        self.store.add_counterfactual_report = fail_once  # type: ignore[method-assign]
+        with self.assertRaisesRegex(RuntimeError, "simulated report persistence failure"):
+            orchestrator.run(
+                self.capsule["capsule_id"], baseline, candidate, runs_per_variant=2,
+            )
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(judge.calls, 1)
+
+        report = orchestrator.run(
+            self.capsule["capsule_id"], baseline, candidate, runs_per_variant=2,
+        )
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(judge.calls, 1)
+        self.assertTrue(report["resumed_from_persisted_runs"])
+        self.assertEqual(report["reused_run_count"], 4)
+        self.assertTrue(report["reused_semantic_judgement"])
+        self.assertEqual(len(report["variants"]["baseline"]), 2)
+        self.assertEqual(len(report["variants"]["candidate"]), 2)
+        experiment = self.store.get_experiment(report["experiment_id"])
+        self.assertEqual(experiment["status"], "completed")
+
     def test_stochastic_aggregation_uses_median_p95_and_success_rate(self) -> None:
         runs = [
             self.evidence(success=True, latency=10),

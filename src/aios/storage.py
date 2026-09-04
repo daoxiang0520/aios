@@ -1129,6 +1129,29 @@ class StateStore:
             )
         return str(spec["experiment_id"])
 
+    def find_resumable_experiment(self, spec: dict[str, Any]) -> dict[str, Any] | None:
+        """Return the newest failed experiment with the same controlled specification.
+
+        The experiment id is deliberately excluded from comparison: it identifies
+        an execution record, not an experimental variable.  Only failed records
+        are eligible so a second process cannot attach to a live experiment.
+        """
+        expected = dict(spec)
+        expected.pop("experiment_id", None)
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT experiment_id,spec FROM experiments
+                   WHERE capsule_id=? AND status='failed'
+                   ORDER BY updated_at DESC,created_at DESC""",
+                (spec["capsule_id"],),
+            ).fetchall()
+        for row in rows:
+            recorded = json.loads(row["spec"])
+            recorded.pop("experiment_id", None)
+            if recorded == expected:
+                return self.get_experiment(str(row["experiment_id"]))
+        return None
+
     def add_experiment_variant(self, experiment_id: str, variant: dict[str, Any]) -> int:
         with self.connect() as connection:
             cursor = connection.execute(
@@ -1161,11 +1184,23 @@ class StateStore:
             )
             return int(cursor.lastrowid)
 
+    def latest_semantic_judgement(self, experiment_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT judgement FROM semantic_judgements
+                   WHERE experiment_id=? ORDER BY id DESC LIMIT 1""",
+                (experiment_id,),
+            ).fetchone()
+        return json.loads(row["judgement"]) if row is not None else None
+
     def add_counterfactual_report(self, experiment_id: str, report: dict[str, Any]) -> int:
         with self.connect() as connection:
             cursor = connection.execute(
                 """INSERT INTO counterfactual_reports(experiment_id,promotion_state,report)
-                   VALUES(?,?,?)""",
+                   VALUES(?,?,?)
+                   ON CONFLICT(experiment_id) DO UPDATE SET
+                       promotion_state=excluded.promotion_state,
+                       report=excluded.report""",
                 (
                     experiment_id, report["promotion_state"],
                     json.dumps(report, ensure_ascii=False, default=str),
