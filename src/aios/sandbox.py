@@ -145,12 +145,13 @@ class DockerSandboxBroker:
 
     def __init__(
         self, root: Path, config: SandboxConfig, skills_root: Path | None = None,
-        *, network_enabled: bool = False,
+        *, network_enabled: bool = False, self_versions: Any = None,
     ):
         self.root = root.resolve()
         self.config = config
         self.skills_root = skills_root.resolve() if skills_root is not None else None
         self.network_enabled = bool(network_enabled)
+        self.self_versions = self_versions
         self.session: SandboxSession | None = None
         self.dependencies_root = (self.root / "task_dependencies").resolve()
         self.scientific_environment = (self.root / "environments" / "scientific-py312-v1").resolve()
@@ -267,6 +268,10 @@ class DockerSandboxBroker:
         if not self.available():
             raise SandboxUnavailable("Docker sandbox is unavailable; host execution is forbidden")
         before = self._manifest(self.session.path)
+        self_before = (
+            self._manifest(self.self_versions.current_path)
+            if self.self_versions is not None and self.self_versions.exposed else {}
+        )
         timeout = self._effective_timeout(timeout_seconds)
         args = [
             "docker", "run", "--rm", "--network", self.network_mode, "--read-only",
@@ -283,6 +288,14 @@ class DockerSandboxBroker:
             args.extend(["--mount", f"type=bind,src={self.scientific_environment},dst=/opt/aios-scientific,readonly"])
         if self.skills_root is not None and self.skills_root.exists():
             args.extend(["--mount", f"type=bind,src={self.skills_root},dst=/skills,readonly"])
+        if self.self_versions is not None and self.self_versions.exposed:
+            self_mount = f"type=bind,src={self.self_versions.current_path},dst=/self"
+            if not self.self_versions.writable:
+                self_mount += ",readonly"
+            args.extend([
+                "--mount", self_mount,
+                "--mount", f"type=bind,src={self.self_versions.versions},dst=/self-history,readonly",
+            ])
         args.extend(["--workdir", "/workspace", self.config.image, "bash", "-o", "pipefail", "-lc", command])
         try:
             result = subprocess.run(
@@ -298,6 +311,12 @@ class DockerSandboxBroker:
             raise TimeoutError(f"Sandbox command exceeded {timeout}s") from exc
         after = self._manifest(self.session.path)
         changes = sorted(name for name in set(before) | set(after) if before.get(name) != after.get(name))
+        if self.self_versions is not None and self.self_versions.exposed:
+            self_after = self._manifest(self.self_versions.current_path)
+            changes.extend(
+                f"self:{name}" for name in sorted(set(self_before) | set(self_after))
+                if self_before.get(name) != self_after.get(name)
+            )
         return {
             "exit_code": result.returncode,
             "stdout": result.stdout,
@@ -546,7 +565,7 @@ class DockerSandboxBroker:
         )
         if any(re.search(pattern, command) for pattern in broad_root_patterns):
             raise SandboxPolicyError(
-                "Broad container-root access is forbidden; inspect /workspace or /aios-state only"
+                "Broad container-root access is forbidden; inspect only documented mounts"
             )
 
     def expose_read_only_state(self, state: dict[str, Any]) -> None:

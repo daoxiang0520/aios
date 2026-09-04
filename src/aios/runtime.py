@@ -21,6 +21,7 @@ from .memory import ContextComposer, MemoryManager
 from .plugins import PluginManager
 from .runtime_provenance import RuntimeProvenanceManager
 from .security import SecurityKernel
+from .self_versioning import SelfVersionManager
 from .situation import SituationResolver, coverage_labels, normalize_resource_path
 from .sandbox import DockerSandboxBroker, SandboxPolicyError
 from .skills import SkillManager
@@ -72,13 +73,21 @@ class AIOSRuntime:
         self.memories = MemoryManager(self.store)
         self.context = ContextComposer(self.memories)
         self.verifier = Verifier()
+        self.self_versions = (
+            SelfVersionManager(settings.self_root, settings.self_modification)
+            if settings.self_modification.enabled else None
+        )
+        if self.self_versions is not None:
+            self.self_versions.initialize()
         self.plugins = PluginManager(settings.extensions, self.store, settings.workspace)
         self.skills = SkillManager(settings.skills_root, settings.skills)
         if settings.skills.enabled and settings.skills.bootstrap_builtins:
             self.skills.bootstrap_builtins()
         self.sandbox = DockerSandboxBroker(
-            settings.sandbox_root, settings.sandbox, self.skills.runtime,
+            settings.sandbox_root, settings.sandbox,
+            None if self.self_versions is not None else self.skills.runtime,
             network_enabled=settings.capabilities.network_enabled,
+            self_versions=self.self_versions,
         )
         self.capabilities = CapabilityRegistry.default(
             sandbox_available=self.sandbox.available(),
@@ -96,9 +105,16 @@ class AIOSRuntime:
         self.lineages = LineageManager(self.store, self.components, self.skills)
         self.lineages.ensure_root()
         self.situations = SituationResolver(self.components)
-        registry = ToolRegistry(settings.permissions, self.plugins, self.sandbox)
+        registry = ToolRegistry(
+            settings.permissions,
+            None if self.self_versions is not None else self.plugins,
+            self.sandbox,
+            self.self_versions,
+        )
         self.controller.set_tool_schemas(registry.schemas())
-        self.security = SecurityKernel(settings.workspace, settings.permissions)
+        self.security = SecurityKernel(
+            settings.workspace, settings.permissions, self.self_versions,
+        )
         self.executor = ToolExecutor(registry, self.security)
         self.evolution = AutonomousEvolutionEngine(
             self.store, self.plugins, settings.evolution
@@ -220,7 +236,10 @@ class AIOSRuntime:
                 LOGGER.warning("Task %s stopped at preflight: %s", task.id, status.value)
                 return True
 
-            lineage = self.store.task_lineage(int(task.id)) if task.id is not None else None
+            lineage = (
+                None if self.self_versions is not None
+                else self.store.task_lineage(int(task.id)) if task.id is not None else None
+            )
             if lineage is not None:
                 lineage = self.lineages._lineage(str(lineage["lineage_id"]))
                 lineage_component_set = dict(lineage.get("component_set") or {})
@@ -231,13 +250,18 @@ class AIOSRuntime:
                     lineage_component_set, self.capabilities,
                 ) if self.settings.skills.enabled else []
             else:
-                self.sandbox.skills_root = self.skills.runtime
+                self.sandbox.skills_root = (
+                    None if self.self_versions is not None else self.skills.runtime
+                )
                 lineage_skills = (
-                    self.skills.catalog(self.capabilities) if self.settings.skills.enabled else []
+                    self.skills.catalog(self.capabilities)
+                    if self.settings.skills.enabled and self.self_versions is None else []
                 )
 
             cycle_health_probe_start = self.sandbox.health_probe_count
             snapshot = self.sandbox.prepare(int(task.id), self.settings.workspace)
+            if self.self_versions is not None:
+                self.self_versions.begin_task(int(task.id))
             task_metrics["sandbox_sessions"] = int(task_metrics.get("sandbox_sessions", 0)) + 1
             environment_observation = None
             if any(item.name == "execution.python.scientific" for item in contract.capabilities):
@@ -269,7 +293,9 @@ class AIOSRuntime:
                 }
                 if lineage is not None else self.store.active_harness()
             )
-            harness_settings = harness.get("settings", {})
+            harness_settings = dict(harness.get("settings", {}))
+            if self.self_versions is not None:
+                harness_settings = {"harness_profile": "minimal_self"}
             memory_limit = harness_settings.get("memory_context_characters")
             if isinstance(memory_limit, int):
                 self.context.max_characters = memory_limit
@@ -280,13 +306,25 @@ class AIOSRuntime:
             context["workspace_inventory"] = full_workspace_inventory
             context["evidence_contract"] = contract.as_dict()
             skill_authoring = (
-                self.skills.authoring_context(task.request) if self.settings.skills.enabled else None
+                self.skills.authoring_context(task.request)
+                if self.settings.skills.enabled and self.self_versions is None else None
             )
             if skill_authoring is not None:
                 context["skill_authoring"] = skill_authoring
             context["harness"] = harness_settings
             context["harness_version"] = harness.get("version")
             context["lineage"] = lineage
+            if self.self_versions is not None:
+                context["self_system_prompt"] = self.self_versions.system_prompt()
+                context["self_experiment_condition"] = (
+                    self.settings.self_modification.experiment_condition
+                )
+                context["self_state"] = {
+                    "current_version": self.self_versions.current_version(),
+                    "mutable_root": "/self",
+                    "exposed_after_evolve": True,
+                    "transaction_open": self.self_versions.writable,
+                }
             if lineage is not None:
                 self.store.trace(cycle_id, "lineage_bound", {
                     "task_id": task.id, "lineage_id": lineage["lineage_id"],
@@ -343,6 +381,14 @@ class AIOSRuntime:
                     if environment_observation is not None:
                         context["environment"] = {"scientific_python": "ready"}
                 context["task_working_state"] = self._working_state_projection(working_state)
+                if self.self_versions is not None:
+                    context["self_system_prompt"] = self.self_versions.system_prompt()
+                    context["self_state"] = {
+                        "current_version": self.self_versions.current_version(),
+                        "mutable_root": "/self",
+                        "exposed_after_evolve": True,
+                        "transaction_open": self.self_versions.writable,
+                    }
                 context["situation_map"] = self.situations.resolve(
                     task.request, full_workspace_inventory, contract, working_state, full_skills,
                     context.get("environment") if isinstance(context.get("environment"), dict) else None,
@@ -549,6 +595,16 @@ class AIOSRuntime:
                     round_results.append(result)
                     result_data = {"round": round_number, **asdict(result)}
                     result_trace_id = self.store.trace(cycle_id, "action_result", result_data)
+                    if action.tool == "evolve" and result.ok:
+                        self.store.trace(cycle_id, "self_version_opened", {
+                            "task_id": int(task.id), "round": round_number,
+                            "result_ref": f"trace:{result_trace_id}",
+                            "version": result.output.get("version")
+                            if isinstance(result.output, dict) else None,
+                            "parent_version": result.output.get("parent_version")
+                            if isinstance(result.output, dict) else None,
+                            "host_evaluation_started": False,
+                        })
                     cache_metadata = (
                         result.output.get("observation_cache")
                         if result.ok and isinstance(result.output, dict) else None
@@ -905,6 +961,12 @@ class AIOSRuntime:
                     "situation_map": final_situation, "evidence": evidence,
                     "lineage": lineage,
                 }
+                if self.self_versions is not None:
+                    task_result["self_modification"] = {
+                        "current_version": self.self_versions.current_version(),
+                        "transaction_opened": self.self_versions.writable,
+                        "experiment_condition": self.settings.self_modification.experiment_condition,
+                    }
                 committed = self.sandbox.commit(self.settings.workspace)
                 canonical_answer.mark_committed()
                 task_result["committed_files"] = committed
@@ -1537,6 +1599,23 @@ class AIOSRuntime:
                     ) if key in state
                 }
             return common
+        if profile == "minimal_self":
+            projected = {
+                key: context[key] for key in (
+                    "workspace_inventory", "retrieved_memories", "harness", "budget", "observations",
+                    "round", "_protocol_messages", "self_system_prompt",
+                    "self_experiment_condition", "self_state",
+                ) if key in context
+            }
+            state = context.get("task_working_state")
+            if isinstance(state, dict):
+                projected["task_working_state"] = {
+                    key: state[key] for key in (
+                        "completed_steps", "pending", "unresolved_failures",
+                        "available_artifacts", "established_facts",
+                    ) if key in state
+                }
+            return projected
         return context
 
     def _working_state_projection(self, state: dict[str, object]) -> dict[str, object]:

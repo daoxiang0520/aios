@@ -16,6 +16,7 @@ from .components import build_component_registry
 from .lineage import LineageManager
 from .plugins import PluginManager
 from .skills import SkillManager
+from .self_versioning import SelfVersionManager
 from .storage import StateStore
 from .types import Event, Task, TaskStatus
 
@@ -43,6 +44,12 @@ class AIOSWebApplication:
         self.store = store
         self.csrf_token = secrets.token_urlsafe(24)
         self.assets = Path(__file__).with_name("web")
+        self.self_versions = None
+        if settings.self_modification.enabled:
+            self.self_versions = SelfVersionManager(
+                settings.self_root, settings.self_modification,
+            )
+            self.self_versions.initialize()
         skills = SkillManager(settings.skills_root, settings.skills)
         if settings.skills.enabled and settings.skills.bootstrap_builtins:
             skills.bootstrap_builtins()
@@ -73,6 +80,12 @@ class AIOSWebApplication:
             "pending_events": self.store.count_pending_events(),
             "runtime_state": self._runtime_state(tasks),
             "runtime_policy": self._runtime_policy(),
+            "self_modification": {
+                "enabled": self.settings.self_modification.enabled,
+                "experiment_condition": self.settings.self_modification.experiment_condition,
+                "current_version": self.self_versions.current_version()
+                    if self.self_versions is not None else None,
+            },
             "lineages": self.store.list_lineages(),
             "experimental_lineage_head": lineage_manager.current()["lineage_id"],
             "csrf_token": self.csrf_token,
@@ -116,6 +129,10 @@ class AIOSWebApplication:
         priority = max(0, min(100, int(payload.get("priority", 50))))
         max_attempts = max(1, min(10, int(payload.get("max_attempts", 3))))
         lineage_id = str(payload.get("lineage_id", "")).strip()
+        if lineage_id and self.settings.self_modification.enabled:
+            raise WebUIError(
+                400, "Experimental lineage binding is offline in minimal self-modification mode"
+            )
         if lineage_id == "current":
             lineage_id = str(self.lineages.current()["lineage_id"])
         if lineage_id and self.store.get_lineage(lineage_id) is None:

@@ -43,6 +43,7 @@ from .open_evolution import (
     ModelOpenEvolutionBackend, OpenEvolutionAgent, compare_evolution_modes,
 )
 from .runtime_provenance import RuntimeProvenanceManager
+from .self_versioning import SelfVersionManager
 from .situation import SituationResolver, normalize_resource_path
 from .storage import StateStore
 from .types import Action, ActionResult, Event, Goal, GoalStatus, GoalType, Memory, MemoryType, Task, TaskStatus
@@ -86,7 +87,7 @@ class _LineageMeasurementEvaluator:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="aios", description="Self-Evolving AIOS MVP")
+    parser = argparse.ArgumentParser(prog="aios", description="AIOS minimal self-modification experiment")
     parser.add_argument("--config", default="config.json", help="Path to config.json")
     parser.add_argument("--verbose", action="store_true")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -119,6 +120,12 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("status", help="Show queue and goals")
     trace = commands.add_parser("trace", help="Show recent traces")
     trace.add_argument("--limit", type=int, default=20)
+
+    self_command = commands.add_parser("self", help="Inspect Host-preserved Self versions")
+    self_commands = self_command.add_subparsers(dest="self_command", required=True)
+    self_commands.add_parser("versions")
+    self_show = self_commands.add_parser("show")
+    self_show.add_argument("version", nargs="?", help="Defaults to CURRENT")
 
     task = commands.add_parser("task", help="Submit and inspect durable tasks")
     task_commands = task.add_subparsers(dest="task_command", required=True)
@@ -520,6 +527,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "status":
         skill_manager, _, skill_capabilities = _skill_services(settings)
+        self_manager = None
+        if settings.self_modification.enabled:
+            self_manager = SelfVersionManager(settings.self_root, settings.self_modification)
+            self_manager.initialize()
         _print_json(
             {
                 "pending_events": store.count_pending_events(),
@@ -527,20 +538,61 @@ def main(argv: list[str] | None = None) -> int:
                 "database": str(settings.database),
                 "workspace": str(settings.workspace),
                 "autonomous_evolution": settings.evolution.enabled,
+                "self_modification": {
+                    "enabled": settings.self_modification.enabled,
+                    "experiment_condition": settings.self_modification.experiment_condition,
+                    "current_version": self_manager.current_version() if self_manager else None,
+                },
+                "model_visible_tools": [
+                    name for name in ["read", "write", "edit", "bash", "evolve"]
+                    if name in settings.permissions.allowed_tools
+                    and (name != "evolve" or settings.self_modification.enabled)
+                ],
                 "active_generated_tools": [
                     plugin.name
                     for plugin in PluginManager(settings.extensions, store, settings.workspace).active_plugins()
-                ],
+                ] if not settings.self_modification.enabled else [],
+                "legacy_generated_tools_retained_offline": [
+                    plugin.name
+                    for plugin in PluginManager(settings.extensions, store, settings.workspace).active_plugins()
+                ] if settings.self_modification.enabled else [],
                 "active_skills": [
                     item["name"]
                     for item in skill_manager.catalog(skill_capabilities)
-                ],
+                ] if not settings.self_modification.enabled else [],
             }
         )
         return 0
 
     if args.command == "trace":
         _print_json(store.recent_traces(args.limit))
+        return 0
+    if args.command == "self":
+        manager = SelfVersionManager(settings.self_root, settings.self_modification)
+        manager.initialize()
+        if args.self_command == "versions":
+            _print_json({
+                "enabled": settings.self_modification.enabled,
+                "experiment_condition": settings.self_modification.experiment_condition,
+                "current_version": manager.current_version(),
+                "versions": manager.versions_summary(),
+            })
+        else:
+            version = args.version or manager.current_version()
+            if manager.VERSION_PATTERN.fullmatch(version) is None:
+                raise SystemExit("Invalid self version")
+            root = (manager.versions / version).resolve()
+            if root.parent != manager.versions.resolve() or not root.is_dir():
+                raise SystemExit(f"Unknown self version: {version}")
+            _print_json({
+                "version": version,
+                "current": version == manager.current_version(),
+                "system": (root / "SYSTEM.md").read_text(encoding="utf-8", errors="replace")
+                    if (root / "SYSTEM.md").is_file() else "",
+                "files": sorted(
+                    item.relative_to(root).as_posix() for item in root.rglob("*") if item.is_file()
+                ),
+            })
         return 0
     if args.command == "task":
         if args.task_command == "submit":
@@ -553,6 +605,10 @@ def main(argv: list[str] | None = None) -> int:
             bound_lineage = None
             lineage_id = None
             if args.lineage:
+                if settings.self_modification.enabled:
+                    raise SystemExit(
+                        "Experimental lineage binding is offline while minimal self modification is enabled"
+                    )
                 lineage_manager = LineageManager(store)
                 lineage_manager.ensure_root()
                 lineage_id = (
@@ -1166,9 +1222,15 @@ def _default_config() -> dict[str, Any]:
         "database": "./data/aios.db",
         "workspace": "./workspace",
         "model": {"provider": "mock"},
-        "permissions": {"allowed_tools": ["read", "write", "edit", "bash"]},
-        "skills": {
+        "runtime": {"completion_mode": "free"},
+        "self_modification": {
             "enabled": True,
+            "root": "./self",
+            "experiment_condition": "natural",
+        },
+        "permissions": {"allowed_tools": ["read", "write", "edit", "bash", "evolve"]},
+        "skills": {
+            "enabled": False,
             "root": "./skills",
             "require_human_promotion": True,
         },

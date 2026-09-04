@@ -1,12 +1,75 @@
-# Self-Evolving AIOS
+# AIOS Minimal Self-Modification Experiment
 
-> **Research prototype frozen — 2026-09-05**
+> **v0.9 research platform frozen; v0.10-alpha.1 minimal experiment active — 2026-09-05**
 >
-> 本仓库现定位为：**支持 Free Runtime、Component/Capability、Task Capsule、Autonomous Lineage 与 Counterfactual Experiment 的 Agent Runtime 实验平台**。
+> v0.9 的 Lineage/Reasoner/Candidate/Counterfactual 路线作为可复现历史保留，但已退出普通任务的在线认知路径。当前唯一研究问题是：**一个正在完成普通任务的 Agent，在拥有可回退的自修改能力后，会不会自行选择改变自身？**
 >
-> 当前版本保留用于研究、复现和展示；不再以“可靠递归自进化 AI”作为继续扩展目标，也不建议作为无人监管的生产执行器。
+> 本项目仍是研究原型，不建议作为无人监管的生产执行器。
 
-## 最终研究报告
+## v0.10-alpha.1：极简、连续的 Self Modification
+
+当前在线工具面只有：
+
+```text
+read / write / edit / bash / evolve
+```
+
+`evolve(reason?, base_version?)` 不是 Evolution Agent，也不是“开始自动进化”的命令。它只执行一项 Host 机械操作：
+
+```text
+expose CURRENT self read-only during an ordinary task
+→ snapshot CURRENT self when evolve is called
+→ 从指定父版本复制出一个新版本
+→ 原子切换 CURRENT
+→ 把新版本以 /self 暴露给当前任务
+→ 同一个 Agent、同一任务继续运行
+```
+
+它不会启动额外模型调用，不会诊断应该改什么，不会生成 Candidate，不会 Benchmark、Verifier、Selector 或自动生产晋升。普通任务可以读取并使用当前 `/self`，但不能修改；调用后仍使用原来的 `read/write/edit/bash` 修改新版本。旧版本只读挂载于 `/self-history`，Agent 无权删除；Host 的 Sandbox、Authority、Credentials、Audit、Version History、Rollback Source、硬资源上限和 `evolve` 本身不在可修改面中。
+
+第一版真实可遗传的 Self 表面包括：
+
+- `/self/SYSTEM.md`：每个后续模型轮次与未来任务都会重新载入；
+- `/self/tools/`：Agent 可创建并通过 `bash` 使用的持久辅助程序；
+- `/self/components/`：不预设 Skill/Workflow ontology 的持久复用代码目录；
+- `/self/HISTORY.md`：当前版本的简要版本地图；完整旧版本由 Host 保存在 `/self-history`。
+
+默认使用 Natural 实验条件。System Prompt 只声明 `evolve` 的真实能力，不鼓励、要求或给出何时进化的规则：
+
+```json
+"self_modification": {
+  "enabled": true,
+  "root": "./self",
+  "experiment_condition": "natural",
+  "max_system_prompt_characters": 8000
+}
+```
+
+正对照实验可将 `experiment_condition` 改为 `positive_control`；这是唯一会明确提示“可以修改自身以改善后续行为”的条件。Natural 和 Positive Control 必须分开运行、分开解释。
+正式对照时应为两组使用不同的 `self_modification.root`、数据库与工作区，避免 Natural 组继承正对照产生的 Self 版本。
+
+运行普通任务：
+
+```powershell
+python -m aios --config config.json task submit "完成一个普通真实任务"
+python -m aios --config config.json run
+```
+
+查看 Host 保存的 Self 版本，不触发任何进化：
+
+```powershell
+python -m aios --config config.json self versions
+python -m aios --config config.json self show
+python -m aios --config config.json self show v000001
+```
+
+判断最低层级涌现时，应分别观察：普通任务中是否自发调用 `evolve`（E0）、是否作出与自身行为相关的修改（E1）、修改是否影响未来任务（E2）、以及后果是否驱动再次修改（E3）。Host 不把“不调用”“频繁调用”或“坏修改”预先判为错误；只保证后果真实、记录存在且旧版本可恢复。
+
+启用本模式时，Skill/Plugin 注入和实验谱系绑定会退出在线 Agent 路径。旧的 `evolution ...` 命令及源码仍保留用于 v0.9 复现，但普通任务不会被 Lineage Reasoner、Soft Friction Optimizer、Skill Need Detector 或在线 Verifier 驱动。
+
+实现验证：完整回归套件共 **314 项，全部通过**；其中新增 8 项覆盖无额外模型调用的版本分叉、旧版本不可变、`/self` 路径隔离、Docker 读写/只读挂载、Natural/Positive-control 分离，以及修改后的 `SYSTEM.md` 在同一任务下一轮立即生效。
+
+## v0.9 最终研究报告（冻结基线）
 
 ### 项目结论
 
@@ -82,7 +145,7 @@ Run 93 比较了父谱系 `lin_30779d600a014ba9` 与 read-ledger 子谱系 `lin_
 完整的模块、配置、谱系、实验和已知问题清单见：
 [AIOS 当前工作总览（2026-09-05）](AIOS_当前工作总览_2026-09-05.md)。
 
-Current release: **v0.9.0-alpha.6**. Autonomous Lineage now versions both Harness settings and a
+Frozen legacy release: **v0.9.0-alpha.6**. Autonomous Lineage versions both Harness settings and a
 unified Component Set. Every lineage snapshots registered primitives, Skills, Plugins, resource
 adapters and environment providers; Workflow and kernel kinds share the same manifest/policy model.
 The first executable Component mutation surface is deliberately limited to Skills. A lineage may

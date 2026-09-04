@@ -6,6 +6,12 @@
   "runtime": {
     "completion_mode": "free"
   },
+  "self_modification": {
+    "enabled": true,
+    "root": "./self",
+    "experiment_condition": "natural",
+    "max_system_prompt_characters": 8000
+  },
   "budget": {
     "enabled": true,
     "max_model_calls_per_cycle": 6,
@@ -44,7 +50,7 @@
     "root": "./sandbox"
   },
   "skills": {
-    "enabled": true,
+    "enabled": false,
     "bootstrap_builtins": true,
     "root": "./skills",
     "require_human_promotion": true,
@@ -69,7 +75,7 @@
     "protocol": "tool_calling"
   },
   "permissions": {
-    "allowed_tools": ["read", "write", "edit", "bash"],
+    "allowed_tools": ["read", "write", "edit", "bash", "evolve"],
     "allow_writes": true,
     "max_read_bytes": 1048576,
     "max_write_bytes": 1048576

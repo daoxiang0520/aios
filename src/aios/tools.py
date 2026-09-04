@@ -21,15 +21,31 @@ CORE_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {"type": "function", "function": {"name": "bash", "description": "Run a command inside the configured strong sandbox with /workspace as its working directory. Never runs on the host and must not scan container root.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "timeout_seconds": {"type": "integer"}}, "required": ["command"], "additionalProperties": False}}},
 ]
 
+EVOLVE_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "evolve",
+        "description": "Open a reversible, versioned modification transaction for your own mutable system. This starts no model, diagnosis, benchmark, or adoption process. After it returns, use read/write/edit/bash on /self; prior versions remain read-only at /self-history.",
+        "parameters": {
+            "type": "object",
+            "properties": {"reason": {"type": "string"}, "base_version": {"type": "string"}},
+            "additionalProperties": False,
+        },
+    },
+}
+
 
 class ToolRegistry:
-    def __init__(self, permissions: PermissionConfig, plugins: PluginManager | None = None, sandbox: DockerSandboxBroker | None = None):
+    def __init__(self, permissions: PermissionConfig, plugins: PluginManager | None = None, sandbox: DockerSandboxBroker | None = None, self_versions: Any = None):
         self.permissions = permissions
         self.sandbox = sandbox
         self.resources = ResourceAdapter(permissions, sandbox)
+        self.self_versions = self_versions
         self._tools: dict[str, Tool] = {}
         self._schemas = {item["function"]["name"]: item for item in CORE_TOOL_SCHEMAS}
-        for name, tool in (("read", self.read), ("write", self.write), ("edit", self.edit), ("bash", self.bash), ("echo", self.echo), ("list_files", self.list_files), ("read_file", self.read_file), ("write_file", self.write_file), ("append_file", self.append_file)):
+        if self_versions is not None:
+            self._schemas["evolve"] = EVOLVE_TOOL_SCHEMA
+        for name, tool in (("read", self.read), ("write", self.write), ("edit", self.edit), ("bash", self.bash), ("evolve", self.evolve), ("echo", self.echo), ("list_files", self.list_files), ("read_file", self.read_file), ("write_file", self.write_file), ("append_file", self.append_file)):
             self.register(name, tool)
         if plugins is not None:
             self.load_plugins(plugins)
@@ -43,7 +59,10 @@ class ToolRegistry:
             self.register(plugin.name, manager.bind(plugin))
 
     def schemas(self) -> list[dict[str, Any]]:
-        return [self._schemas[name] for name in ("read", "write", "edit", "bash") if name in self.permissions.allowed_tools]
+        visible = ["read", "write", "edit", "bash"]
+        if self.self_versions is not None:
+            visible.append("evolve")
+        return [self._schemas[name] for name in visible if name in self.permissions.allowed_tools]
 
     def get(self, name: str) -> Tool:
         if name not in self._tools:
@@ -80,6 +99,11 @@ class ToolRegistry:
         if self.sandbox is None:
             raise RuntimeError("Sandbox broker is not configured")
         return self.sandbox.run(command, timeout_seconds)
+
+    def evolve(self, reason: str | None = None, base_version: str | None = None) -> dict[str, Any]:
+        if self.self_versions is None:
+            raise RuntimeError("Self modification is not configured")
+        return self.self_versions.open(reason=reason, base_version=base_version)
 
     def list_files(self, path: str = ".") -> Any:
         return self.resources.legacy_list(path)

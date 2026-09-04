@@ -102,6 +102,14 @@ class RuntimePolicyConfig:
 
 
 @dataclass(slots=True)
+class SelfModificationConfig:
+    enabled: bool = False
+    root: str = "./self"
+    experiment_condition: str = "natural"
+    max_system_prompt_characters: int = 8_000
+
+
+@dataclass(slots=True)
 class Settings:
     root: Path
     database: Path
@@ -117,6 +125,7 @@ class Settings:
     skills: SkillConfig = field(default_factory=SkillConfig)
     experiments: ExperimentConfig = field(default_factory=ExperimentConfig)
     runtime: RuntimePolicyConfig = field(default_factory=RuntimePolicyConfig)
+    self_modification: SelfModificationConfig = field(default_factory=SelfModificationConfig)
 
     @classmethod
     def load(cls, path: str | Path) -> "Settings":
@@ -137,6 +146,13 @@ class Settings:
         runtime = RuntimePolicyConfig(**raw.get("runtime", {}))
         if runtime.completion_mode not in {"verified", "free"}:
             raise ValueError("runtime.completion_mode must be 'verified' or 'free'")
+        self_modification = SelfModificationConfig(**raw.get("self_modification", {}))
+        if self_modification.experiment_condition not in {"natural", "positive_control"}:
+            raise ValueError(
+                "self_modification.experiment_condition must be 'natural' or 'positive_control'"
+            )
+        if self_modification.enabled and runtime.completion_mode != "free":
+            raise ValueError("self modification requires runtime.completion_mode='free'")
 
         return cls(
             root=root,
@@ -153,6 +169,7 @@ class Settings:
             skills=SkillConfig(**raw.get("skills", {})),
             experiments=ExperimentConfig(**raw.get("experiments", {})),
             runtime=runtime,
+            self_modification=self_modification,
         )
 
     @staticmethod
@@ -185,6 +202,11 @@ class Settings:
         candidate = Path(self.experiments.root)
         return (self.root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
 
+    @property
+    def self_root(self) -> Path:
+        candidate = Path(self.self_modification.root)
+        return (self.root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+
     def ensure_directories(self) -> None:
         self.database.parent.mkdir(parents=True, exist_ok=True)
         self.workspace.mkdir(parents=True, exist_ok=True)
@@ -192,6 +214,7 @@ class Settings:
         self.sandbox_root.mkdir(parents=True, exist_ok=True)
         self.skills_root.mkdir(parents=True, exist_ok=True)
         self.experiments_root.mkdir(parents=True, exist_ok=True)
+        self.self_root.mkdir(parents=True, exist_ok=True)
 
     def execution_config_facts(self, harness: dict[str, Any]) -> dict[str, Any]:
         """Resolve a credential/path-free policy projection, also consumed by Runtime.
@@ -269,5 +292,11 @@ class Settings:
                 "max_write_bytes": self.permissions.max_write_bytes,
                 "network_enabled": self.capabilities.network_enabled,
                 "note": "configured permissions do not establish environment availability",
+            },
+            "self_modification": {
+                "enabled": self.self_modification.enabled,
+                "experiment_condition": self.self_modification.experiment_condition,
+                "mutable_root": "/self" if self.self_modification.enabled else None,
+                "host_evolution_reasoner_enabled": False,
             },
         }

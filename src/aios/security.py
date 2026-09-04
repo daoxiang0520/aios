@@ -23,9 +23,10 @@ class SecurityKernel:
         "list_files": "path",
     }
 
-    def __init__(self, workspace: Path, config: PermissionConfig):
+    def __init__(self, workspace: Path, config: PermissionConfig, self_versions: Any = None):
         self.workspace = workspace.resolve()
         self.config = config
+        self.self_versions = self_versions
 
     def authorize(self, action: Action) -> dict[str, Any]:
         if action.tool not in self.config.allowed_tools:
@@ -40,7 +41,18 @@ class SecurityKernel:
             if action.tool == "read" and self._is_http_url(raw_path):
                 arguments[path_key] = raw_path
             else:
-                arguments[path_key] = str(self.resolve_workspace_path(raw_path))
+                if raw_path.replace("\\", "/").startswith("/self"):
+                    if self.self_versions is None:
+                        raise PermissionDenied("Mutable self is unavailable")
+                    try:
+                        arguments[path_key] = str(self.self_versions.resolve(
+                            raw_path,
+                            write=action.tool in {"write", "edit", "write_file", "append_file"},
+                        ))
+                    except RuntimeError as exc:
+                        raise PermissionDenied(str(exc)) from exc
+                else:
+                    arguments[path_key] = str(self.resolve_workspace_path(raw_path))
 
         if action.tool in {"write", "edit", "write_file", "append_file"}:
             size = len(str(arguments.get("content", "")).encode("utf-8"))
