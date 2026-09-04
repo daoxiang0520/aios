@@ -11,7 +11,11 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .config import Settings
+from .capabilities import CapabilityRegistry
+from .components import build_component_registry
 from .lineage import LineageManager
+from .plugins import PluginManager
+from .skills import SkillManager
 from .storage import StateStore
 from .types import Event, Task, TaskStatus
 
@@ -39,9 +43,25 @@ class AIOSWebApplication:
         self.store = store
         self.csrf_token = secrets.token_urlsafe(24)
         self.assets = Path(__file__).with_name("web")
+        skills = SkillManager(settings.skills_root, settings.skills)
+        if settings.skills.enabled and settings.skills.bootstrap_builtins:
+            skills.bootstrap_builtins()
+        capabilities = CapabilityRegistry.default(
+            sandbox_available=False,
+            network_enabled=settings.capabilities.network_enabled,
+            allowed_domains=settings.capabilities.allowed_domains,
+        )
+        components = build_component_registry(
+            capabilities, store=store,
+            skill_manifests=skills.component_manifests() if settings.skills.enabled else (),
+            plugin_manifests=PluginManager(
+                settings.extensions, store, settings.workspace,
+            ).component_manifests(),
+        )
+        self.lineages = LineageManager(store, components, skills)
 
     def bootstrap(self) -> dict[str, Any]:
-        lineage_manager = LineageManager(self.store)
+        lineage_manager = self.lineages
         lineage_manager.ensure_root()
         tasks = self.tasks()
         return {
@@ -97,7 +117,7 @@ class AIOSWebApplication:
         max_attempts = max(1, min(10, int(payload.get("max_attempts", 3))))
         lineage_id = str(payload.get("lineage_id", "")).strip()
         if lineage_id == "current":
-            lineage_id = str(LineageManager(self.store).current()["lineage_id"])
+            lineage_id = str(self.lineages.current()["lineage_id"])
         if lineage_id and self.store.get_lineage(lineage_id) is None:
             raise WebUIError(400, f"Unknown lineage: {lineage_id}")
         task = Task(title=title, request=request, priority=priority, max_attempts=max_attempts)
@@ -311,21 +331,27 @@ class AIOSWebApplication:
         return values
 
     def _budget(self, result: dict[str, Any], checkpoints: list[dict[str, Any]]) -> dict[str, Any]:
-        budget = result.get("budget") if isinstance(result.get("budget"), dict) else {}
+        budget = result.get("task_budget", result.get("budget", {}))
+        budget = budget if isinstance(budget, dict) else {}
         for checkpoint in reversed(checkpoints):
             candidate = checkpoint.get("data", {}).get("budget")
             if isinstance(candidate, dict):
                 budget = {**candidate, **budget}
                 break
+        evidence = result.get("evidence", {})
+        enabled = evidence.get("budget_limits_enabled", budget.get(
+            "enabled", True if result else self.settings.budget.enabled,
+        ))
         return {
-            "tokens": budget.get("tokens_used") or budget.get("total_tokens") or 0,
-            "token_limit": self.settings.budget.max_tokens_per_task,
-            "model_calls": budget.get("model_calls_used") or budget.get("model_calls") or 0,
-            "model_call_limit": self.settings.budget.max_model_calls_per_task,
-            "tool_calls": budget.get("tool_calls_used") or budget.get("tool_calls") or 0,
-            "tool_call_limit": self.settings.budget.max_tool_calls_per_task,
+            "enabled": enabled,
+            "tokens": evidence.get("model_tokens", budget.get("used_tokens", budget.get("tokens_used") or budget.get("total_tokens") or 0)),
+            "token_limit": budget.get("max_tokens", self.settings.budget.max_tokens_per_task) if enabled else None,
+            "model_calls": evidence.get("model_api_calls", budget.get("used_model_calls", budget.get("model_calls_used") or budget.get("model_calls") or 0)),
+            "model_call_limit": budget.get("max_model_calls", self.settings.budget.max_model_calls_per_task) if enabled else None,
+            "tool_calls": evidence.get("task_tool_calls", budget.get("used_tool_calls", budget.get("tool_calls_used") or budget.get("tool_calls") or 0)),
+            "tool_call_limit": budget.get("max_tool_calls", self.settings.budget.max_tool_calls_per_task) if enabled else None,
             "cycles": len({c.get("data", {}).get("cycle_id") for c in checkpoints if c.get("data", {}).get("cycle_id")}),
-            "cycle_limit": self.settings.budget.max_cycles_per_task,
+            "cycle_limit": budget.get("max_cycles", self.settings.budget.max_cycles_per_task) if enabled else None,
         }
 
     @staticmethod

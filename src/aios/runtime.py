@@ -16,6 +16,7 @@ from .controller import ControllerError, LLMController
 from .evolution import AutonomousEvolutionEngine
 from .evaluation import Verifier
 from .goals import GoalManager, IntentArbiter
+from .lineage import LineageManager
 from .memory import ContextComposer, MemoryManager
 from .plugins import PluginManager
 from .runtime_provenance import RuntimeProvenanceManager
@@ -46,8 +47,11 @@ class TaskBudget:
     used_tool_calls: int = 0
     used_tokens: int = 0
     used_cycles: int = 0
+    enabled: bool = True
 
-    def remaining(self) -> dict[str, int]:
+    def remaining(self) -> dict[str, int | None]:
+        if not self.enabled:
+            return dict.fromkeys(("model_calls", "tool_calls", "tokens", "cycles"))
         return {
             "model_calls": max(0, self.max_model_calls - self.used_model_calls),
             "tool_calls": max(0, self.max_tool_calls - self.used_tool_calls),
@@ -70,7 +74,7 @@ class AIOSRuntime:
         self.verifier = Verifier()
         self.plugins = PluginManager(settings.extensions, self.store, settings.workspace)
         self.skills = SkillManager(settings.skills_root, settings.skills)
-        if settings.skills.enabled:
+        if settings.skills.enabled and settings.skills.bootstrap_builtins:
             self.skills.bootstrap_builtins()
         self.sandbox = DockerSandboxBroker(
             settings.sandbox_root, settings.sandbox, self.skills.runtime,
@@ -87,7 +91,10 @@ class AIOSRuntime:
             self.capabilities,
             store=self.store,
             skill_manifests=self.skills.component_manifests() if settings.skills.enabled else (),
+            plugin_manifests=self.plugins.component_manifests(),
         )
+        self.lineages = LineageManager(self.store, self.components, self.skills)
+        self.lineages.ensure_root()
         self.situations = SituationResolver(self.components)
         registry = ToolRegistry(settings.permissions, self.plugins, self.sandbox)
         self.controller.set_tool_schemas(registry.schemas())
@@ -213,6 +220,22 @@ class AIOSRuntime:
                 LOGGER.warning("Task %s stopped at preflight: %s", task.id, status.value)
                 return True
 
+            lineage = self.store.task_lineage(int(task.id)) if task.id is not None else None
+            if lineage is not None:
+                lineage = self.lineages._lineage(str(lineage["lineage_id"]))
+                lineage_component_set = dict(lineage.get("component_set") or {})
+                self.sandbox.skills_root = self.skills.materialize_lineage_runtime(
+                    str(lineage["lineage_id"]), lineage_component_set,
+                )
+                lineage_skills = self.skills.catalog_for_component_set(
+                    lineage_component_set, self.capabilities,
+                ) if self.settings.skills.enabled else []
+            else:
+                self.sandbox.skills_root = self.skills.runtime
+                lineage_skills = (
+                    self.skills.catalog(self.capabilities) if self.settings.skills.enabled else []
+                )
+
             cycle_health_probe_start = self.sandbox.health_probe_count
             snapshot = self.sandbox.prepare(int(task.id), self.settings.workspace)
             task_metrics["sandbox_sessions"] = int(task_metrics.get("sandbox_sessions", 0)) + 1
@@ -235,11 +258,10 @@ class AIOSRuntime:
                 "memory": [asdict(item) for item in self.store.list_memories(limit=100)],
                 "skill-usage": self.store.list_skill_usage(limit=100),
                 "capabilities": self.capabilities.as_dict(),
-                "skills": self.skills.catalog(self.capabilities) if self.settings.skills.enabled else [],
+                "skills": lineage_skills,
             })
             self.security.workspace = snapshot.resolve()
 
-            lineage = self.store.task_lineage(int(task.id)) if task.id is not None else None
             harness = (
                 {
                     "version": f"lineage:{lineage['lineage_id']}",
@@ -254,7 +276,7 @@ class AIOSRuntime:
             context = self.context.compose(task.request)
             full_workspace_inventory = self._workspace_inventory(snapshot)
             full_capabilities = self.capabilities.as_dict()
-            full_skills = self.skills.catalog(self.capabilities) if self.settings.skills.enabled else []
+            full_skills = lineage_skills
             context["workspace_inventory"] = full_workspace_inventory
             context["evidence_contract"] = contract.as_dict()
             skill_authoring = (
@@ -270,6 +292,7 @@ class AIOSRuntime:
                     "task_id": task.id, "lineage_id": lineage["lineage_id"],
                     "parent_lineage_id": lineage.get("parent_lineage_id"),
                     "generation": lineage.get("generation"),
+                    "component_set_hash": lineage.get("component_set", {}).get("active_set_hash"),
                     "production_default_changed": False,
                 })
             context["continuation"] = self._continuation_context(int(task.id)) if continuation else None
@@ -281,21 +304,19 @@ class AIOSRuntime:
                 context.get("environment") if isinstance(context.get("environment"), dict) else None,
             )
             self.store.trace(cycle_id, "context_composed", context)
-            harness_action_cap = harness_settings.get(
-                "max_actions_per_cycle", self.settings.max_actions_per_cycle
-            )
-            cycle_budget = CycleBudget(
-                model_calls=max(1, self.settings.budget.max_model_calls_per_cycle),
-                tool_calls=max(1, self.settings.budget.max_tool_calls_per_cycle),
-            )
+            execution_config = self.settings.execution_config_facts(harness_settings)
+            self.store.trace(cycle_id, "execution_config_resolved", execution_config)
+            effective_limits = execution_config["budget"]["effective"]
             task_remaining = task_budget.remaining()
             action_cap = min(
-                int(harness_action_cap),
-                cycle_budget.tool_calls,
+                effective_limits["max_actions_per_cycle"],
                 task_remaining["tool_calls"],
+            ) if task_budget.enabled else None
+            model_round_cap = (
+                min(effective_limits["max_model_calls_per_cycle"], task_remaining["model_calls"])
+                if task_budget.enabled else None
             )
-            model_round_cap = min(cycle_budget.model_calls, task_remaining["model_calls"])
-            if model_round_cap <= 0:
+            if model_round_cap is not None and model_round_cap <= 0:
                 raise RuntimeError("TaskBudget exhausted before a terminal answer")
             all_actions = []
             all_results = []
@@ -309,7 +330,11 @@ class AIOSRuntime:
             completion_metadata = None
             budget_truncated = False
             budget_deferred = 0
-            for round_number in range(1, model_round_cap + 1):
+            round_number = 0
+            while not self.shutdown_requested and (
+                model_round_cap is None or model_calls_used < model_round_cap
+            ):
+                round_number += 1
                 first_task_call = task_budget.used_model_calls == 0 and round_number == 1
                 if not first_task_call:
                     context["workspace_inventory"] = self._relevant_workspace_map(full_workspace_inventory, working_state)
@@ -322,7 +347,9 @@ class AIOSRuntime:
                     task.request, full_workspace_inventory, contract, working_state, full_skills,
                     context.get("environment") if isinstance(context.get("environment"), dict) else None,
                 )
-                remaining_before_round = max(0, action_cap - len(all_actions))
+                remaining_before_round = (
+                    max(0, action_cap - len(all_actions)) if action_cap is not None else None
+                )
                 artifact_written = any(
                     action.tool in {"write", "write_file"} and result.ok
                     for action, result in zip(all_actions, all_results, strict=False)
@@ -336,17 +363,22 @@ class AIOSRuntime:
                         ),
                         remaining_before_round,
                     )
-                    if (expected_artifacts and not artifact_written)
-                    or (skill_authoring is not None and not skill_candidate_written)
+                    if task_budget.enabled and (
+                        (expected_artifacts and not artifact_written)
+                        or (skill_authoring is not None and not skill_candidate_written)
+                    )
                     else 0
                 )
                 context["observations"] = observations
                 context["round"] = round_number
                 context["budget"] = {
+                    "enabled": task_budget.enabled,
                     "scope": "cycle_and_task",
                     "model_call": round_number,
                     "max_model_calls_this_cycle": model_round_cap,
-                    "remaining_model_calls_after_this": model_round_cap - round_number,
+                    "remaining_model_calls_after_this": (
+                        max(0, model_round_cap - model_calls_used - 1) if model_round_cap is not None else None
+                    ),
                     "used_tool_calls": len(all_actions),
                     "remaining_tool_calls": remaining_before_round,
                     "task": {
@@ -356,12 +388,12 @@ class AIOSRuntime:
                         "cycle": task_budget.used_cycles,
                         "remaining_before_cycle": task_remaining,
                     },
-                    "force_final": (
+                    "force_final": task_budget.enabled and (
                         task_budget.used_model_calls + model_calls_used + 1 >= task_budget.max_model_calls
                         or task_budget.used_tokens + model_tokens_total >= task_budget.max_tokens
                         or task_budget.used_cycles >= task_budget.max_cycles
                     ),
-                    "soft_pressure": (
+                    "soft_pressure": task_budget.enabled and (
                         task_budget.used_model_calls + model_calls_used >= self.settings.budget.soft_model_calls_per_task
                         or task_budget.used_tokens + model_tokens_total >= self.settings.budget.soft_tokens_per_task
                     ),
@@ -371,6 +403,11 @@ class AIOSRuntime:
                     "instruction": (
                         "Stop broad inspection before the reserved count and create the requested artifact. "
                         "A cycle boundary will checkpoint and continue; only force_final marks a real task terminal budget."
+                    ) if task_budget.enabled else (
+                        "Execution budgets are disabled. Null remaining values mean unlimited, not zero. "
+                        "No cycle, task, tool-call or token quota requires you to stop. "
+                        "Usage is still recorded. Finish when appropriate; permissions, command timeouts "
+                        "and context/output size limits still apply."
                     ),
                 }
                 context["_protocol_messages"] = protocol_messages
@@ -654,7 +691,7 @@ class AIOSRuntime:
                     if (
                         provisional_coverage.get("required")
                         and not provisional_coverage.get("passed")
-                        and round_number < model_round_cap
+                        and (model_round_cap is None or model_calls_used < model_round_cap)
                     ):
                         task_done = False
                         context["coverage_feedback"] = {
@@ -677,7 +714,7 @@ class AIOSRuntime:
                     break
                 if not actions and not deferred_actions:
                     break
-                if len(all_actions) >= action_cap:
+                if action_cap is not None and len(all_actions) >= action_cap:
                     break
 
             task_budget.used_model_calls += model_calls_used
@@ -711,13 +748,14 @@ class AIOSRuntime:
             cycle_exhausted = bool(
                 not task_done
                 and (
-                    len(rounds) >= model_round_cap
-                    or len(all_actions) >= action_cap
-                    or budget_truncated
+                    (model_round_cap is not None and model_calls_used >= model_round_cap)
+                    or (action_cap is not None and len(all_actions) >= action_cap)
+                    or (task_budget.enabled and budget_truncated)
                 )
             )
             can_continue = bool(
-                cycle_exhausted
+                task_budget.enabled
+                and cycle_exhausted
                 and made_progress
                 and not planner_claimed_done
                 and not artifact_ready
@@ -726,8 +764,12 @@ class AIOSRuntime:
                 and remaining_task_budget["tokens"] > 0
                 and remaining_task_budget["cycles"] > 0
             )
+            shutdown_deferred = self.shutdown_requested and not task_done
+            can_continue = can_continue or shutdown_deferred
             if can_continue:
+                continuation_reason = "shutdown_requested" if shutdown_deferred else "cycle_budget"
                 checkpoint = {
+                    "continuation_reason": continuation_reason,
                     "cycle_id": cycle_id,
                     "summary": final_summary,
                     "budget": asdict(task_budget),
@@ -748,11 +790,19 @@ class AIOSRuntime:
                 checkpoint_id = self.store.add_checkpoint(int(task.id), "budget_deferred", checkpoint)
                 deferred_result = {
                     "cycle_id": cycle_id,
-                    "summary": "Cycle budget reached; task checkpointed for continuation",
+                    "summary": (
+                        "Runtime shutdown requested; task checkpointed for continuation"
+                        if shutdown_deferred else "Cycle budget reached; task checkpointed for continuation"
+                    ),
+                    "continuation_reason": continuation_reason,
                     "checkpoint_id": checkpoint_id,
                     "task_budget": asdict(task_budget),
                     "committed_files": committed,
-                    "evidence": {"success": False, "terminal": False, "budget_deferred": True},
+                    "evidence": {
+                        "success": False, "terminal": False,
+                        "budget_limits_enabled": task_budget.enabled,
+                        "budget_deferred": not shutdown_deferred,
+                    },
                 }
                 self.store.finalize_skill_usage(
                     cycle_id, verifier_passed=None, task_outcome="budget_deferred",
@@ -765,14 +815,15 @@ class AIOSRuntime:
                     int(task.id), checkpoint_id, task.request, task.priority,
                 )
                 self.store.trace(cycle_id, "budget_deferred", {
+                    "continuation_reason": continuation_reason,
                     "task_id": int(task.id), "checkpoint_id": checkpoint_id,
                     "continuation_event_id": continue_id,
                     "continuation_decision": continuation_decision,
                     "remaining": remaining_task_budget,
                 })
                 LOGGER.info(
-                    "Task %s deferred at cycle budget; checkpoint %s, continuation event %s queued",
-                    task.id, checkpoint_id, continue_id,
+                    "Task %s deferred (%s); checkpoint %s, continuation event %s queued",
+                    task.id, continuation_reason, checkpoint_id, continue_id,
                 )
                 return True
 
@@ -802,6 +853,7 @@ class AIOSRuntime:
                     "host_observed_completion": None,
                     "model_rounds": len(rounds),
                     "model_api_calls": task_budget.used_model_calls,
+                    "budget_limits_enabled": task_budget.enabled,
                     "model_tokens": task_budget.used_tokens,
                     "task_tool_calls": task_budget.used_tool_calls,
                     "cycle_model_api_calls": model_calls_used,
@@ -946,6 +998,7 @@ class AIOSRuntime:
                 "success": ok,
                 "model_rounds": len(rounds),
                 "model_api_calls": task_budget.used_model_calls,
+                "budget_limits_enabled": task_budget.enabled,
                 "model_tokens": task_budget.used_tokens,
                 "task_tool_calls": task_budget.used_tool_calls,
                 "cycle_model_api_calls": model_calls_used,
@@ -1085,6 +1138,8 @@ class AIOSRuntime:
                 )
             return True
         except ControllerError as exc:
+            model_calls_used += int(exc.model_usage.get("model_calls", 0))
+            model_tokens_total += int(exc.model_usage.get("total_tokens", 0))
             self.sandbox.discard()
             LOGGER.warning("Cycle %s rejected model response: %s", cycle_id, exc)
             self.store.trace(cycle_id, "cycle_failed", {"error": f"{type(exc).__name__}: {exc}"})
@@ -1281,6 +1336,7 @@ class AIOSRuntime:
     def _task_budget(self, task_id: int) -> TaskBudget:
         config = self.settings.budget
         budget = TaskBudget(
+            enabled=config.enabled,
             max_model_calls=config.max_model_calls_per_task,
             max_tool_calls=config.max_tool_calls_per_task,
             max_tokens=config.max_tokens_per_task,
@@ -1738,9 +1794,11 @@ class AIOSRuntime:
     @staticmethod
     def _select_actions(
         requested: list,
-        remaining: int,
+        remaining: int | None,
         reserved_completion_calls: int,
     ) -> tuple[list, list]:
+        if remaining is None:
+            return list(requested), []
         if remaining <= 0:
             return [], list(requested)
         completion_tools = {"write", "edit", "write_file", "append_file", "echo"}

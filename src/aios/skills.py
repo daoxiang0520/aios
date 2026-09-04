@@ -143,9 +143,11 @@ class SkillManager:
         # reports, history and deprecated code remain host-side lifecycle data.
         self.runtime = self.root / "runtime"
         self.runtime_active = self.runtime / "active"
+        self.lineage_runtime = self.runtime / "lineages"
         for directory in (self.candidates, self.active, self.history, self.deprecated, self.reports):
             directory.mkdir(parents=True, exist_ok=True)
         self.runtime_active.mkdir(parents=True, exist_ok=True)
+        self.lineage_runtime.mkdir(parents=True, exist_ok=True)
         self._write_dispatcher()
         self._sync_runtime()
 
@@ -362,6 +364,53 @@ class SkillManager:
             values.append(manifest.as_component_manifest(content_digest=digest, status="active"))
         return values
 
+    def candidate_component(self, candidate_id: str) -> dict[str, Any]:
+        """Return a validated Skill candidate as a non-active Component record."""
+        _package, manifest, source = self._candidate(candidate_id)
+        digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        return manifest.as_component_manifest(
+            content_digest=digest, status="candidate",
+        ).as_dict()
+
+    def materialize_lineage_runtime(
+        self, lineage_id: str, component_set: dict[str, Any],
+    ) -> Path:
+        """Build an isolated read-only Skill projection for one experimental lineage."""
+        if re.fullmatch(r"lin_[a-zA-Z0-9_]+", lineage_id) is None:
+            raise SkillValidationError("Invalid lineage id")
+        destination = (self.lineage_runtime / lineage_id).resolve()
+        if destination.parent != self.lineage_runtime.resolve():
+            raise SkillValidationError("Lineage runtime path escapes its root")
+        marker = destination / ".component-set.json"
+        expected_hash = str(component_set.get("active_set_hash") or "")
+        if marker.is_file():
+            try:
+                if json.loads(marker.read_text(encoding="utf-8")).get("active_set_hash") == expected_hash:
+                    return destination
+            except (OSError, json.JSONDecodeError):
+                pass
+        if destination.exists():
+            shutil.rmtree(destination)
+        active = destination / "active"
+        active.mkdir(parents=True)
+        self._write_dispatcher(destination)
+        for member in component_set.get("members", []):
+            if not isinstance(member, dict) or member.get("kind") != "skill":
+                continue
+            package = self._component_package(member)
+            shutil.copytree(package, active / str(member["name"]))
+        marker.write_text(json.dumps({"active_set_hash": expected_hash}), encoding="utf-8")
+        return destination
+
+    def catalog_for_component_set(
+        self, component_set: dict[str, Any], capabilities: CapabilityRegistry,
+    ) -> list[dict[str, Any]]:
+        manifests = []
+        for member in component_set.get("members", []):
+            if isinstance(member, dict) and member.get("kind") == "skill":
+                manifests.append(self._load_manifest(self._component_package(member)))
+        return self._catalog(manifests, capabilities)
+
     def list_candidates(self) -> list[dict[str, Any]]:
         values: list[dict[str, Any]] = []
         for candidate_root in sorted(self.candidates.iterdir(), reverse=True):
@@ -380,8 +429,14 @@ class SkillManager:
         return values
 
     def catalog(self, capabilities: CapabilityRegistry) -> list[dict[str, Any]]:
+        return self._catalog(self.active_skills(), capabilities)
+
+    @staticmethod
+    def _catalog(
+        manifests: list[SkillManifest], capabilities: CapabilityRegistry,
+    ) -> list[dict[str, Any]]:
         catalog: list[dict[str, Any]] = []
-        for manifest in self.active_skills():
+        for manifest in manifests:
             contract = EvidenceContract(
                 request=f"skill:{manifest.name}",
                 capabilities=[CapabilityRequirement(name, f"Required by skill {manifest.name}") for name in manifest.required_capabilities],
@@ -389,6 +444,30 @@ class SkillManager:
             assessment = capabilities.assess(contract)
             catalog.append({**manifest.as_dict(), "available": assessment["satisfied"], "capability_assessment": assessment})
         return catalog
+
+    def _component_package(self, member: dict[str, Any]) -> Path:
+        source = member.get("source") if isinstance(member.get("source"), dict) else {}
+        source_type = source.get("type")
+        name = str(member.get("name") or "")
+        version = str(member.get("version") or "")
+        if source_type == "skill_candidate":
+            package, manifest, _source = self._candidate(str(source.get("candidate_id") or ""))
+            if manifest.name != name or manifest.version != version:
+                raise SkillValidationError("Skill candidate does not match Component member")
+            return package
+        if source_type != "skill_version":
+            raise SkillValidationError(f"Unsupported Skill Component source: {source_type}")
+        paths = [
+            self.active / name,
+            self.history / name / version,
+            self.deprecated / name / version,
+        ]
+        for package in paths:
+            if package.is_dir():
+                manifest = self._load_manifest(package)
+                if manifest.name == name and manifest.version == version:
+                    return package
+        raise SkillValidationError(f"Unavailable Skill Component version: {name}@{version}")
 
     def versions(self, name: str) -> list[dict[str, Any]]:
         values: list[dict[str, Any]] = []
@@ -441,7 +520,7 @@ class SkillManager:
         (package / "manifest.json").write_text(json.dumps(manifest.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
         (package / manifest.entrypoint).write_text(source, encoding="utf-8")
 
-    def _write_dispatcher(self) -> None:
+    def _write_dispatcher(self, root: Path | None = None) -> None:
         dispatcher = '''import argparse,json,subprocess,sys
 from pathlib import Path
 ROOT=Path("/skills/active")
@@ -471,7 +550,9 @@ payload=json.loads(a.input_json)
 r=subprocess.run([sys.executable,str(ROOT/a.name/m.get("entrypoint","skill.py")),"--input-json",json.dumps(payload,ensure_ascii=False)],text=True,encoding="utf-8",errors="replace")
 raise SystemExit(r.returncode)
 '''
-        (self.runtime / "skill.py").write_text(dispatcher, encoding="utf-8")
+        target = root or self.runtime
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "skill.py").write_text(dispatcher, encoding="utf-8")
 
     def _sync_runtime(self) -> None:
         active_names = {item.name for item in self.active_skills()}

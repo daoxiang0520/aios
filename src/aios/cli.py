@@ -15,9 +15,13 @@ from .answers import CanonicalAnswer
 from .config import Settings
 from .capabilities import CapabilityRegistry, EvidenceContract
 from .controller import LLMController
+from .components import build_component_registry
 from .diagnostics import Diagnoser
 from .evolution import EvolutionManager
-from .lineage import AutonomousLineageController, LineageManager, ModelLineageReasoner
+from .lineage import (
+    AutonomousLineageController, LineageManager, ModelComponentCandidateAuthor,
+    ModelLineageReasoner,
+)
 from .evaluation import Verifier
 from .experiments import (
     CapsuleManager, ExperimentOrchestrator, ExperimentVariant, ModelSemanticJudge,
@@ -43,6 +47,42 @@ from .situation import SituationResolver, normalize_resource_path
 from .storage import StateStore
 from .types import Action, ActionResult, Event, Goal, GoalStatus, GoalType, Memory, MemoryType, Task, TaskStatus
 from .utility import SkillUtilityEvaluator
+
+
+class _LineageMeasurementEvaluator:
+    """Expose paired measurements without turning Host policy into lineage selection."""
+
+    @staticmethod
+    def evaluate(baseline_runs, candidate_runs, *, fidelity, semantic=None):
+        aggregate = ExperimentOrchestrator._sensitivity_aggregate
+        baseline = aggregate(baseline_runs) if baseline_runs else {}
+        candidate = aggregate(candidate_runs) if candidate_runs else {}
+        delta = {}
+        if baseline and candidate:
+            for key in baseline.keys() & candidate.keys():
+                if key == "runs":
+                    continue
+                left, right = baseline[key], candidate[key]
+                if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+                    delta[key] = round(float(right) - float(left), 6)
+        return {
+            "kind": "lineage_counterfactual_measurement/v1",
+            "evidence_level": "counterfactual_reexecution",
+            "fidelity": fidelity,
+            "baseline": baseline,
+            "candidate": candidate,
+            "delta": delta,
+            "semantic_measurement": semantic or {
+                "verdict": "insufficient_evidence", "tier": "model_judged",
+            },
+            "selection": "none_measurement_only",
+            # counterfactual_reports.promotion_state is a required persistence
+            # discriminator.  MEASUREMENT_ONLY means that no promotion decision
+            # was made; unlike PROMOTABLE/REJECTED it is not a fitness verdict.
+            "promotion_state": "MEASUREMENT_ONLY",
+            "host_fitness_judgment": False,
+            "production_activated": False,
+        }
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -329,7 +369,7 @@ def _print_json(value: Any) -> None:
 
 def _skill_services(settings: Settings) -> tuple[SkillManager, DockerSandboxBroker, CapabilityRegistry]:
     manager = SkillManager(settings.skills_root, settings.skills)
-    if settings.skills.enabled:
+    if settings.skills.enabled and settings.skills.bootstrap_builtins:
         manager.bootstrap_builtins()
     broker = DockerSandboxBroker(
         settings.sandbox_root, settings.sandbox, manager.runtime,
@@ -350,6 +390,20 @@ def _experiment_services(
     manager, _, capabilities = _skill_services(settings)
     capsules = CapsuleManager(settings, store, manager, capabilities)
     return manager, capsules, RuntimeVariantRunner(settings, manager)
+
+
+def _lineage_services(
+    settings: Settings, store: StateStore,
+) -> tuple[LineageManager, SkillManager, DockerSandboxBroker, CapabilityRegistry]:
+    skills, broker, capabilities = _skill_services(settings)
+    components = build_component_registry(
+        capabilities, store=store,
+        skill_manifests=skills.component_manifests() if settings.skills.enabled else (),
+        plugin_manifests=PluginManager(
+            settings.extensions, store, settings.workspace,
+        ).component_manifests(),
+    )
+    return LineageManager(store, components, skills), skills, broker, capabilities
 
 
 def _run_counterfactual(
@@ -818,16 +872,59 @@ def main(argv: list[str] | None = None) -> int:
         elif args.evolution_command == "runs":
             _print_json(store.list_evolution_runs(args.limit))
         elif args.evolution_command == "lineage-list":
-            lineage_manager = LineageManager(store)
+            lineage_manager, _skills, _broker, _capabilities = _lineage_services(settings, store)
             lineage_manager.ensure_root()
             _print_json(store.list_lineages())
         elif args.evolution_command == "lineage-show":
-            lineage_manager = LineageManager(store)
+            lineage_manager, _skills, _broker, _capabilities = _lineage_services(settings, store)
             lineage_manager.ensure_root()
             _print_json(lineage_manager.describe(args.lineage_id))
         elif args.evolution_command == "lineage-run":
+            lineage_manager, skills, broker, capabilities = _lineage_services(settings, store)
+            model_controller = LLMController(settings.model)
+            _, capsules, runner = _experiment_services(settings, store)
+            semantic = PairwiseSemanticJudge(
+                ModelSemanticJudge(settings.model)
+                if settings.experiments.semantic_judge_enabled else None
+            )
+            orchestrator = ExperimentOrchestrator(
+                store, capsules, runner, evaluator=_LineageMeasurementEvaluator(),
+                semantic_judge=semantic,
+            )
+
+            def evaluate_lineage(parent, candidate, decision):
+                cases = []
+                for capsule_id in decision["capsule_ids"]:
+                    cases.append(orchestrator.run(
+                        capsule_id,
+                        ExperimentVariant(
+                            "parent", mutation_type="harness",
+                            mutation=dict(parent.get("settings") or {}),
+                        ),
+                        ExperimentVariant(
+                            "candidate", mutation_type="harness",
+                            mutation=dict(candidate.get("settings") or {}),
+                        ),
+                        runs_per_variant=decision.get("runs_per_variant", 1),
+                        keep_worlds=settings.experiments.keep_worlds,
+                    ))
+                return {
+                    "schema": "lineage_counterfactual_evaluation/v1",
+                    "parent_lineage_id": parent["lineage_id"],
+                    "candidate_lineage_id": candidate["lineage_id"],
+                    "cases": cases,
+                    "selection": "none_measurement_only",
+                    "production_activated": False,
+                    "host_fitness_judgment": False,
+                }
             _print_json(AutonomousLineageController(
-                store, ModelLineageReasoner(LLMController(settings.model)),
+                store, ModelLineageReasoner(model_controller),
+                settings=settings,
+                manager=lineage_manager, components=lineage_manager.components, skills=skills,
+                component_authorer=ModelComponentCandidateAuthor(
+                    model_controller, skills, broker,
+                ) if settings.skills.enabled else None,
+                lineage_evaluator=evaluate_lineage,
             ).decide(args.lineage_id, task_limit=args.task_limit))
         elif args.evolution_command == "auto-run":
             skill_manager, capsules, runner = _experiment_services(settings, store)

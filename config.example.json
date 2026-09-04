@@ -7,6 +7,7 @@
     "completion_mode": "free"
   },
   "budget": {
+    "enabled": true,
     "max_model_calls_per_cycle": 6,
     "max_tool_calls_per_cycle": 8,
     "max_model_calls_per_task": 24,
@@ -44,6 +45,7 @@
   },
   "skills": {
     "enabled": true,
+    "bootstrap_builtins": true,
     "root": "./skills",
     "require_human_promotion": true,
     "max_source_bytes": 131072,
@@ -63,7 +65,7 @@
     "timeout_seconds": 60,
     "max_tokens": 2048,
     "temperature": 0.1,
-    "thinking": "disabled",
+    "thinking": "enabled",
     "protocol": "tool_calling"
   },
   "permissions": {

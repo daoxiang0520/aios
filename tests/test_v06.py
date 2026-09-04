@@ -74,6 +74,14 @@ class V06SkillTests(unittest.TestCase):
         names = {item["name"] for item in runtime.skills.catalog(runtime.capabilities)}
         self.assertEqual(names, {"workspace_search", "state_query", "trace_failure_analyzer"})
 
+    def test_builtin_skill_bootstrap_can_be_disabled_without_disabling_authoring(self) -> None:
+        self.settings.skills.bootstrap_builtins = False
+        runtime = AIOSRuntime(self.settings)
+        self.assertTrue(self.settings.skills.enabled)
+        self.assertEqual(runtime.skills.active_skills(), [])
+        proposal = runtime.skills.propose(manifest(), SKILL_SOURCE)
+        self.assertEqual(proposal["status"], "candidate")
+
     def test_skill_manifest_requires_declared_known_capabilities(self) -> None:
         manager = SkillManager(self.settings.skills_root, self.settings.skills)
         invalid = manifest()

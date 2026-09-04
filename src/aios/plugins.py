@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import shutil
 from dataclasses import dataclass
@@ -56,6 +57,27 @@ class ToolPlugin:
                 "parameters": self.parameters,
             },
         }
+
+    def as_component_manifest(self):
+        """Project the legacy Plugin lifecycle into the unified Component inventory."""
+        from .components import ComponentKind, ComponentManifest
+
+        requires = []
+        if self.permissions.get("filesystem") == "workspace_read":
+            requires.append("filesystem.read")
+        if self.permissions.get("database") == "read_only":
+            requires.append("state.task_read")
+        material = json.dumps(self.as_dict(), ensure_ascii=False, sort_keys=True)
+        return ComponentManifest(
+            kind=ComponentKind.PLUGIN, name=self.name.lower(), version=self.version,
+            description=self.description, requires=tuple(requires),
+            provides=(f"tool.{self.name.lower()}",),
+            runtime={"plane": "host", "isolation": "sidecar", "runner_kind": "plugin"},
+            spec={"plugin_kind": self.kind},
+            interface={"parameters": self.parameters},
+            evolution={"mutable": False, "auto_candidate": False, "auto_promote": False},
+            content_digest=hashlib.sha256(material.encode("utf-8")).hexdigest(),
+        )
 
 
 class PluginManager:
@@ -117,6 +139,9 @@ class PluginManager:
             except (OSError, json.JSONDecodeError, PluginValidationError):
                 continue
         return plugins
+
+    def component_manifests(self):
+        return [plugin.as_component_manifest() for plugin in self.active_plugins()]
 
     def validate(self, manifest: dict[str, Any]) -> ToolPlugin:
         plugin = ToolPlugin.from_dict(manifest)

@@ -1,11 +1,13 @@
 # Self-Evolving AIOS
 
-Current release: **v0.9.0-alpha.5**. The production/evolution loop now supports Free Runtime and
-Autonomous Lineage. An Agent may continue its current experimental Harness lineage, adopt an
-existing candidate into a child, author one bounded child mutation, or return to an ancestor.
-Each child inherits its parent's settings and can run ordinary durable tasks, while production
-`active_harness` remains unchanged. The Host records heredity, authority and resource facts; it does
-not select which lineage is better.
+Current release: **v0.9.0-alpha.6**. Autonomous Lineage now versions both Harness settings and a
+unified Component Set. Every lineage snapshots registered primitives, Skills, Plugins, resource
+adapters and environment providers; Workflow and kernel kinds share the same manifest/policy model.
+The first executable Component mutation surface is deliberately limited to Skills. A lineage may
+author a new isolated Skill candidate from bounded, redacted lineage evidence, validate its manifest,
+and benchmark it in Docker. Authoring never adopts the candidate. A later, separate decision may add
+or replace one benchmarked Skill in a child lineage without changing the production SkillRegistry,
+Plugin set, Harness default, or Root of Trust.
 
 The Free Runtime semantics introduced in alpha.4 remain unchanged: the online Verifier is disabled,
 Agent stop/yield declarations are recorded without turning them into true-completion claims, and
@@ -23,9 +25,30 @@ python -m aios --config config.json run
 python -m aios --config config.json evolution lineage-show lin_xxxxxxxxxxxxxxxx
 ```
 
-`lineage-run` never promotes to production. Alpha.5 executes Harness lineages only; Runtime,
-Sandbox, Authority, Storage/Audit and external evaluators remain outside the autonomous mutation
-surface.
+`lineage-run` never promotes to production. It can create an isolated Skill variation through
+`AUTHOR_COMPONENT_CANDIDATE`, fork a Harness mutation, or adopt an eligible Skill Component candidate
+through the separate `ADOPT_COMPONENT_CANDIDATE` action. Workflow, Plugin, resource-adapter,
+environment-provider, primitive and kernel mutation remain closed until their own governed candidate
+runner and rollback semantics exist. Runtime, Sandbox, Authority, Storage/Audit and external
+evaluators remain outside the autonomous mutation surface.
+
+### Lineage Behavioral Observability
+
+Lineage decisions now receive `behavior_digest` per task and bounded `cross_task_patterns`.
+These are factual projections of recorded action results, including successful procedures,
+operational families, failure classes, cache reuse, written paths and existing Trace references.
+Unexecuted plans are excluded; a repeated family shape is not evidence of equivalent purpose or
+a recommendation to create a Skill. The model remains free to choose `CONTINUE`.
+
+The projection reads at most 400 plan/result records per task, for at most 20 tasks. Task digests
+share a 24,000-character budget and cross-task patterns an 8,000-character budget; task summaries
+are capped at 1,200 characters. Sampling/truncation and missing history are explicit. Raw stdout,
+file bodies, source code and full traces are not added to the prompt. Selected task digests also
+reach the separate Skill authoring stage. Decision calls remain one-shot: Trace references are
+audit references, not newly enabled model inspection tools. No Skill trigger, automatic authoring
+threshold, or additional adoption policy is introduced.
+
+See [Lineage Behavioral Observability report](AIOS_Lineage_Behavioral_Observability_实现与测试报告.md).
 
 ## Agent Workbench（第一版）
 
@@ -397,6 +420,18 @@ python -m unittest discover -s tests -v
 v0.6 已开始 Skill Evolution：Trace 或重复任务可以被沉淀为候选 Skill，但是只有通过沙盒测试和晋升门的版本才会进入运行时。它是受约束的能力学习，不是任意宿主源码自修改。
 
 ## v0.6.6.1 Runtime Hardening
+
+### 可选无预算执行
+
+谱系决策的 `current_execution_config` 将保存值与有效限制分开：预算开关、有效周期/任务配额、失效的 Harness 参数、完成模式，以及仍保留的模型输出/命令超时/沙盒/上下文边界。Runtime 与谱系决策共用解析函数，运行时另记录 `execution_config_resolved` Trace。它仅描述本次加载的配置，不声称其他正在运行的进程已热更新；历史任务的 `execution_policy` 来自当时结果，缺失即未知。事实采用白名单，不发送 API 密钥、服务地址或宿主路径。缺少 Settings 的离线调用明确返回配置未知。已有 Run 不改写，也不因本功能触发模型调用。
+
+谱系原生动作 `REQUEST_COUNTERFACTUAL_EVALUATION` 可以从模型可见的执行前 Full Capsule 中选择 1–3 个，并让直接父 Harness 与当前 Harness 各从同一个不可变世界重放 1–3 次。它复用 ExperimentOrchestrator，保存每个实验 ID、父/子测量向量、差值和双序语义测量；事件只保存有界摘要，完整运行证据留在 Experiment 表。该动作不改变实验谱系头、不采用候选、不晋升生产，也不把 Host 指标聚合成适应度裁决。只有带直接 Harness 父节点的谱系可以使用；Root、Component mutation、Partial/Post-hoc Capsule 会在执行前被拒绝。实验失败作为 `lineage_evaluation_failed` 记录，不伪装成谱系选择。下一轮模型可以基于测量自行 `CONTINUE`、`RETURN` 或继续变异。
+
+在运行配置中设置 `budget.enabled=false`，取消普通任务的周期/任务级 Model Calls、Tool Calls、累计 Tokens、Cycles 和谱系 `max_actions_per_cycle` 配额；同时关闭预算预留、soft pressure 和预算强制收尾。旧配置及示例默认仍为 `true`。关闭时模型收到 `enabled=false`，剩余额度为 `null`（无限制），费用和调用计数仍记录，Web UI 显示“无限制”。这不改变任务的权限或完成模式。
+
+无预算时不会因配额产生周期续跑；Agent 可持续执行到最终回答、无行动让出、错误或人工停止。Ctrl+C 请求停止后，当前模型请求及该轮工具操作结束，Runtime 保存 continuation checkpoint，重启后可续跑。历史已 yielded 的任务不会自动重跑。预算开关以重启后的配置为准，旧检查点只恢复用量，不恢复旧开关。
+
+单次模型输出长度、上下文/观察裁剪、协议修复次数、命令超时、沙盒 CPU/内存/PID 及权限边界仍保留；外部实验/Benchmark 的独立保护不在此开关范围。无预算意味着不再有任务级费用上限，模型可能重复执行并持续计费。取消自动周期切分后，长任务也可能增加内存与上下文压力。
 
 - Bash 固定由 `bash -o pipefail -lc` 执行，pipeline 中前段失败不再被 `head` 等末端命令掩盖。
 - 沙盒命令超时拆为 `default_timeout_seconds` 与 `max_timeout_seconds`；旧 `timeout_seconds` 配置会自动迁移，任务请求的较长超时不再被默认值静默压回。

@@ -616,9 +616,12 @@ def build_component_registry(
     *,
     store: Any | None = None,
     skill_manifests: Iterable[ComponentManifest] = (),
+    plugin_manifests: Iterable[ComponentManifest] = (),
 ) -> ComponentRegistry:
     registry = ComponentRegistry(authority, store)
     for manifest in host_component_manifests():
         registry.register(manifest, source="host")
     registry.project_skills(skill_manifests)
+    for manifest in plugin_manifests:
+        registry.register(manifest, source="host")
     return registry

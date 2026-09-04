@@ -153,11 +153,13 @@ CREATE TABLE IF NOT EXISTS evolution_lineages (
     lineage_id TEXT PRIMARY KEY,
     parent_lineage_id TEXT,
     generation INTEGER NOT NULL,
-    kind TEXT NOT NULL DEFAULT 'harness',
+    kind TEXT NOT NULL DEFAULT 'system',
     status TEXT NOT NULL DEFAULT 'living',
     settings TEXT NOT NULL DEFAULT '{}',
+    component_set TEXT NOT NULL DEFAULT '{}',
     mutation TEXT NOT NULL DEFAULT '{}',
     source_candidate_id INTEGER,
+    source_component_candidate_id TEXT,
     created_by TEXT NOT NULL,
     decision TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -426,6 +428,17 @@ class StateStore:
         if "continuation_generation" not in task_columns:
             connection.execute(
                 "ALTER TABLE tasks ADD COLUMN continuation_generation INTEGER NOT NULL DEFAULT 0"
+            )
+        lineage_columns = {
+            str(row["name"]) for row in connection.execute("PRAGMA table_info(evolution_lineages)")
+        }
+        if "component_set" not in lineage_columns:
+            connection.execute(
+                "ALTER TABLE evolution_lineages ADD COLUMN component_set TEXT NOT NULL DEFAULT '{}'"
+            )
+        if "source_component_candidate_id" not in lineage_columns:
+            connection.execute(
+                "ALTER TABLE evolution_lineages ADD COLUMN source_component_candidate_id TEXT"
             )
         rows = connection.execute(
             "SELECT id,payload FROM events WHERE type='TASK_CONTINUE'"
@@ -868,6 +881,65 @@ class StateStore:
             }
             for row in rows
         ]
+
+    def task_behavior_traces(self, task_id: int, limit: int = 400) -> dict[str, Any]:
+        """Read bounded operational fields, never materialize full tool output/context.
+
+        Checkpoints associate all attempts/cycles with a task; lineage_bound also
+        covers an in-flight cycle. IN prevents duplicate checkpoint attribution.
+        """
+        limit = max(1, min(int(limit), 400))
+        with self.connect() as connection:
+            rows = connection.execute(
+                """WITH cycles AS (
+                    SELECT json_extract(data, '$.cycle_id') AS cycle_id
+                    FROM checkpoints WHERE task_id=?
+                    UNION
+                    SELECT cycle_id FROM traces WHERE kind='lineage_bound'
+                        AND json_extract(data, '$.task_id')=?
+                ), sampled AS (
+                    SELECT id,cycle_id,kind,data FROM traces
+                    WHERE cycle_id IN (SELECT cycle_id FROM cycles WHERE cycle_id IS NOT NULL)
+                        AND kind IN ('plan_created','action_result')
+                    ORDER BY id LIMIT ?
+                )
+                SELECT id,cycle_id,kind,
+                    json_extract(data, '$.round') AS round,
+                    CASE WHEN kind='plan_created' THEN (
+                        SELECT json_group_array(json_object(
+                            'tool', substr(json_extract(value,'$.tool'),1,64),
+                            'arguments', json_object(
+                                'path', substr(json_extract(value,'$.arguments.path'),1,384),
+                                'command', substr(json_extract(value,'$.arguments.command'),1,4096)),
+                            'arguments_truncated',
+                                coalesce(length(json_extract(value,'$.arguments.command')),0)>4096
+                                OR coalesce(length(json_extract(value,'$.arguments.path')),0)>384
+                        )) FROM json_each(data,'$.actions') WHERE CAST(key AS INTEGER)<100
+                    ) ELSE NULL END AS actions,
+                    CASE WHEN kind='action_result' THEN json_object(
+                        'tool', substr(json_extract(data,'$.tool'),1,64),
+                        'ok', json_extract(data,'$.ok'),
+                        'error', substr(json_extract(data,'$.error'),1,256),
+                        'output', json_object(
+                            'exit_code', json_extract(data,'$.output.exit_code'),
+                            'kind', substr(json_extract(data,'$.output.kind'),1,64),
+                            'observation_cache', json_object(
+                                'hit',json_extract(data,'$.output.observation_cache.hit')))
+                    ) ELSE NULL END AS result
+                FROM sampled ORDER BY id""",
+                (int(task_id), int(task_id), limit + 1),
+            ).fetchall()
+        traces = []
+        for row in rows[:limit]:
+            data = json.loads(row['result']) if row['result'] else {}
+            data['round'] = row['round']
+            if row['actions'] is not None:
+                data['actions'] = json.loads(row['actions'])
+            traces.append({
+                'id': int(row['id']), 'cycle_id': str(row['cycle_id']),
+                'kind': str(row['kind']), 'data': data,
+            })
+        return {'traces': traces, 'truncated': len(rows) > limit, 'limit': limit}
 
     def upsert_component(self, manifest: dict[str, Any]) -> str:
         component_id = str(manifest["component_id"])
@@ -1369,19 +1441,34 @@ class StateStore:
         with self.connect() as connection:
             connection.execute(
                 """INSERT INTO evolution_lineages(
-                       lineage_id,parent_lineage_id,generation,kind,status,settings,
-                       mutation,source_candidate_id,created_by,decision
-                   ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                       lineage_id,parent_lineage_id,generation,kind,status,settings,component_set,
+                       mutation,source_candidate_id,source_component_candidate_id,created_by,decision
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     lineage_id, lineage.get("parent_lineage_id"), int(lineage["generation"]),
-                    str(lineage.get("kind", "harness")), str(lineage.get("status", "living")),
+                    str(lineage.get("kind", "system")), str(lineage.get("status", "living")),
                     json.dumps(lineage.get("settings", {}), ensure_ascii=False),
+                    json.dumps(lineage.get("component_set", {}), ensure_ascii=False),
                     json.dumps(lineage.get("mutation", {}), ensure_ascii=False),
-                    lineage.get("source_candidate_id"), str(lineage.get("created_by", "agent")),
+                    lineage.get("source_candidate_id"), lineage.get("source_component_candidate_id"),
+                    str(lineage.get("created_by", "agent")),
                     json.dumps(lineage.get("decision", {}), ensure_ascii=False, default=str),
                 ),
             )
         return lineage_id
+
+    def update_lineage_component_set(
+        self, lineage_id: str, component_set: dict[str, Any], *, kind: str = "system",
+    ) -> None:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """UPDATE evolution_lineages
+                   SET component_set=?,kind=?,updated_at=CURRENT_TIMESTAMP
+                   WHERE lineage_id=?""",
+                (json.dumps(component_set, ensure_ascii=False), kind, lineage_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Unknown lineage: {lineage_id}")
 
     def get_lineage(self, lineage_id: str) -> dict[str, Any] | None:
         with self.connect() as connection:
@@ -1644,8 +1731,10 @@ class StateStore:
             ),
             "generation": int(row["generation"]), "kind": str(row["kind"]),
             "status": str(row["status"]), "settings": json.loads(row["settings"]),
+            "component_set": json.loads(row["component_set"] or "{}"),
             "mutation": json.loads(row["mutation"]),
             "source_candidate_id": row["source_candidate_id"],
+            "source_component_candidate_id": row["source_component_candidate_id"],
             "created_by": str(row["created_by"]), "decision": json.loads(row["decision"]),
             "created_at": str(row["created_at"]), "updated_at": str(row["updated_at"]),
         }

@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import http.client
 import json
+import logging
 import math
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -14,6 +17,9 @@ from .config import ModelConfig
 from .tools import CORE_TOOL_SCHEMAS
 from .protocol import contains_serialized_tool_call
 from .types import Action, Goal, Intent, Plan
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 JSON_SYSTEM_PROMPT = """You are the planning controller of a permission-gated AI runtime.
@@ -149,6 +155,9 @@ def _normalized_usage(value: Any) -> dict[str, int]:
     result: dict[str, int] = {"model_calls": 1}
     if not isinstance(value, dict):
         return result
+    calls = value.get("model_calls")
+    if isinstance(calls, int) and not isinstance(calls, bool) and calls > 0:
+        result["model_calls"] = calls
     for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
         item = value.get(key)
         if isinstance(item, int) and item >= 0:
@@ -165,7 +174,15 @@ def _merge_usage(*values: dict[str, int]) -> dict[str, int]:
 
 
 class ControllerError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, model_usage: dict[str, int] | None = None):
+        super().__init__(message)
+        self.model_usage = model_usage or {}
+
+
+class ModelRequestError(ControllerError):
+    def __init__(self, message: str, *, retryable: bool):
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class LLMController:
@@ -272,7 +289,12 @@ class LLMController:
             protocol_messages if isinstance(protocol_messages, list) else [],
             self.tool_schemas if use_tool_calling else [],
         )
-        response_data = self._send_request(request_data, key)
+        budget = (context or {}).get("budget", {})
+        remaining = budget.get("remaining_model_calls_after_this")
+        attempts = 3
+        if budget.get("enabled", True) and isinstance(remaining, int):
+            attempts = min(attempts, 1 + max(0, remaining))
+        response_data = self._request_with_recovery(request_data, key, max_attempts=attempts)
         model_usage = _normalized_usage(response_data.get("usage"))
         self._attribute_actual_tokens(attribution, model_usage.get("prompt_tokens"))
         try:
@@ -328,10 +350,74 @@ class LLMController:
                 finish_reason = choice.get("finish_reason", "unknown")
                 raise ControllerError(
                     f"Invalid structured plan: {exc}; finish_reason={finish_reason}; "
-                    f"content_chars={content_chars}"
+                    f"content_chars={content_chars}; "
+                    f"reasoning_chars={len(message.get('reasoning_content') or '')}; "
+                    f"output_budget={request_data['max_tokens']}"
                 ) from exc
         except (KeyError, IndexError, TypeError) as exc:
-            raise ControllerError("Model returned an invalid plan") from exc
+            raise ControllerError("Model returned an invalid plan", model_usage=model_usage) from exc
+        except ControllerError as exc:
+            if not exc.model_usage:
+                exc.model_usage = model_usage
+            raise
+
+    def _request_with_recovery(
+        self, request_data: dict[str, Any], key: str, *, max_attempts: int = 3,
+    ) -> dict[str, Any]:
+        """Retry an unexecuted model request, never replaying workspace actions."""
+        request = dict(request_data)
+        usage: dict[str, int] = {}
+        corrected = False
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = self._send_request(request, key)
+            except ModelRequestError as exc:
+                # The provider may have consumed tokens before disconnecting; those
+                # unknown tokens are not fabricated, but the attempted call is counted.
+                usage = _merge_usage(usage, {"model_calls": 1})
+                exc.model_usage = usage
+                if not exc.retryable or attempt == max_attempts:
+                    raise
+                LOGGER.warning("Model transport failed (%s); retrying request %s/%s",
+                               type(exc.__cause__).__name__, attempt + 1, max_attempts)
+                time.sleep(0.5 * 2 ** (attempt - 1))
+                continue
+            usage = _merge_usage(usage, _normalized_usage(response.get("usage")))
+            choices = response.get("choices")
+            choice = choices[0] if isinstance(choices, list) and choices else {}
+            message = choice.get("message") if isinstance(choice, dict) else None
+            empty = (
+                isinstance(message, dict)
+                and (message.get("content") is None or (
+                    isinstance(message.get("content"), str) and not message["content"].strip()
+                ))
+                and not message.get("tool_calls")
+                and not message.get("refusal")
+                and choice.get("finish_reason") in {"stop", "length"}
+            )
+            # Keep normal response metadata intact; only token totals/call count are
+            # aggregated after recovery. Parsing and authority checks stay with callers.
+            raw_usage = response.get("usage")
+            response["usage"] = {**(raw_usage if isinstance(raw_usage, dict) else {}), **usage}
+            if not empty or corrected or attempt == max_attempts:
+                return response
+            corrected = True
+            if request.get("response_format", {}).get("type") == "json_object":
+                instruction = "Return the required non-empty final JSON object in content."
+            elif request.get("tools") and request.get("tool_choice") != "none":
+                instruction = "Return a native tool call if needed, or a non-empty final answer in content."
+            else:
+                instruction = "Return a non-empty final answer in content using the available evidence."
+            request["messages"] = [*request.get("messages", []), {
+                "role": "user", "content": (
+                    "The previous attempt produced no final content or tool call. "
+                    + instruction + " Keep reasoning concise enough to finish within the output limit. "
+                    "Do not claim completion without evidence."
+                ),
+            }]
+            LOGGER.warning("Model returned empty content (finish_reason=%s); retrying request %s/%s",
+                           choice.get("finish_reason"), attempt + 1, max_attempts)
+        raise AssertionError("max_attempts must be positive")
 
     def _send_request(self, request_data: dict[str, Any], key: str) -> dict[str, Any]:
         body = json.dumps(request_data).encode("utf-8")
@@ -344,8 +430,18 @@ class LLMController:
         try:
             with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
                 response_data = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise ControllerError(f"Model request failed: {exc}") from exc
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            exc.close()
+            raise ModelRequestError(
+                f"Model request failed: HTTP {status}",
+                retryable=status in {408, 429, 500, 502, 503, 504},
+            ) from exc
+        except (urllib.error.URLError, OSError, http.client.HTTPException,
+                json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ModelRequestError(
+                f"Model request failed: {type(exc).__name__}", retryable=True,
+            ) from exc
         if not isinstance(response_data, dict):
             raise ControllerError("Model returned an invalid response object")
         return response_data

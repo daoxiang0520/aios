@@ -31,6 +31,7 @@ class PermissionConfig:
 
 @dataclass(slots=True)
 class BudgetConfig:
+    enabled: bool = True
     max_model_calls_per_cycle: int = 6
     max_tool_calls_per_cycle: int = 8
     max_model_calls_per_task: int = 24
@@ -43,6 +44,10 @@ class BudgetConfig:
     tool_observation_characters: int = 12_000
     hot_tool_results: int = 2
     working_state_characters: int = 8_000
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("budget.enabled must be a boolean")
 
 
 @dataclass(slots=True)
@@ -76,6 +81,7 @@ class SandboxConfig:
 @dataclass(slots=True)
 class SkillConfig:
     enabled: bool = True
+    bootstrap_builtins: bool = True
     root: str = "./skills"
     require_human_promotion: bool = True
     max_source_bytes: int = 131_072
@@ -186,3 +192,82 @@ class Settings:
         self.sandbox_root.mkdir(parents=True, exist_ok=True)
         self.skills_root.mkdir(parents=True, exist_ok=True)
         self.experiments_root.mkdir(parents=True, exist_ok=True)
+
+    def execution_config_facts(self, harness: dict[str, Any]) -> dict[str, Any]:
+        """Resolve a credential/path-free policy projection, also consumed by Runtime.
+
+        This describes this Settings instance, not another running process or old tasks.
+        """
+        budget = self.budget
+        action_setting = int(harness.get("max_actions_per_cycle", self.max_actions_per_cycle))
+        profile = harness.get("harness_profile", "structured")
+        budget_names = (
+            "max_model_calls_per_cycle", "max_tool_calls_per_cycle",
+            "max_model_calls_per_task", "max_tool_calls_per_task",
+            "max_tokens_per_task", "max_cycles_per_task",
+            "soft_model_calls_per_task", "soft_tokens_per_task",
+            "reserved_completion_tool_calls",
+        )
+        configured = {name: getattr(budget, name) for name in budget_names}
+        effective = dict(configured) if budget.enabled else dict.fromkeys(budget_names)
+        if budget.enabled:
+            effective["max_model_calls_per_cycle"] = max(1, budget.max_model_calls_per_cycle)
+            effective["max_tool_calls_per_cycle"] = max(1, budget.max_tool_calls_per_cycle)
+        effective["max_actions_per_cycle"] = (
+            min(action_setting, effective["max_tool_calls_per_cycle"]) if budget.enabled else None
+        )
+        return {
+            "available": True,
+            "source": "loaded_host_settings_and_selected_lineage",
+            "scope": "policy for tasks run with these loaded settings; not a live-process or health probe",
+            "historical_scope": "does not retroactively describe earlier tasks",
+            "completion_mode": self.runtime.completion_mode,
+            "budget": {
+                "enabled": budget.enabled,
+                "configured": configured,
+                "effective": effective,
+                "null_limit_means": "unlimited; not zero or missing",
+                "action_cap_semantics": "when enabled, also capped by task remaining tool calls",
+                "force_final_due_to_budget_enabled": budget.enabled,
+                "soft_pressure_enabled": budget.enabled,
+            },
+            "harness_effects": {
+                "max_actions_per_cycle": {
+                    "configured": action_setting,
+                    "source": "lineage" if "max_actions_per_cycle" in harness else "host_default",
+                    "effective": effective["max_actions_per_cycle"],
+                    "active": budget.enabled,
+                    "reason": "bounded by cycle/task tool budgets" if budget.enabled else "ignored because budget.enabled=false",
+                },
+                "memory_context_characters": {
+                    "configured": harness.get("memory_context_characters"),
+                    "budget_switch_disables_this": False,
+                    "controls": "retrieved episodic-memory text only, not total model context or task tokens",
+                },
+                "harness_profile": {"effective": profile},
+                "prompt_append": {
+                    "configured_nonempty": bool(str(harness.get("prompt_append", "")).strip()),
+                    "active": profile == "structured",
+                    "reason": "only structured profile uses prompt_append",
+                },
+            },
+            "retained_limits": {
+                "model_output_tokens_per_request": self.model.max_tokens,
+                "model_request_timeout_seconds": self.model.timeout_seconds,
+                "tool_observation_characters": budget.tool_observation_characters,
+                "hot_tool_results": budget.hot_tool_results,
+                "working_state_characters": budget.working_state_characters,
+                "sandbox_backend": self.sandbox.backend,
+                "command_default_timeout_seconds": self.sandbox.default_timeout_seconds,
+                "command_max_timeout_seconds": self.sandbox.max_timeout_seconds,
+                "sandbox_memory_mb": self.sandbox.memory_mb,
+                "sandbox_cpus": self.sandbox.cpus,
+                "sandbox_pids_limit": self.sandbox.pids_limit,
+                "allowed_tools": list(self.permissions.allowed_tools),
+                "allow_writes": self.permissions.allow_writes,
+                "max_read_bytes": self.permissions.max_read_bytes,
+                "max_write_bytes": self.permissions.max_write_bytes,
+                "network_enabled": self.capabilities.network_enabled,
+                "note": "configured permissions do not establish environment availability",
+            },
+        }
