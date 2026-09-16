@@ -14,10 +14,11 @@ from aios.evaluation import Verifier
 from aios.memory import MemoryManager
 from aios.plugins import PluginManager, PluginValidationError, state_query_manifest
 from aios.runtime import AIOSRuntime
+from aios.runtime_lock import RuntimeAlreadyRunning, RuntimeProcessLock
 from aios.security import PermissionDenied, SecurityKernel
 from aios.storage import StateStore
 from aios.tools import ToolExecutor, ToolRegistry
-from aios.types import Action, Event, Goal, GoalType, Intent, MemoryType, Plan, TaskStatus
+from aios.types import Action, Event, Goal, GoalType, Intent, MemoryType, Plan, Task, TaskStatus
 
 
 class AIOSMVPTests(unittest.TestCase):
@@ -121,6 +122,69 @@ class AIOSMVPTests(unittest.TestCase):
         self.assertEqual(len(store.claim_events()), 1)
         self.assertEqual(store.recover_processing_events(), 1)
         self.assertEqual(store.count_pending_events(), 1)
+
+    def test_interrupted_task_recovery_is_atomic_and_deduplicates_events(self) -> None:
+        self.settings.ensure_directories()
+        store = StateStore(self.settings.database)
+        store.initialize()
+        task_id = store.create_task(Task("recover", "recover"))
+        old_id = store.add_event(Event("TASK_REQUEST", {"task_id": task_id, "message": "old"}))
+        self.assertEqual(store.claim_events()[0].id, old_id)
+        store.start_task_attempt(task_id)
+        new_id = store.add_event(Event("TASK_REQUEST", {"task_id": task_id, "message": "new"}))
+
+        self.assertEqual(store.recover_processing_events(), 1)
+        self.assertEqual(store.get_task(task_id).status, TaskStatus.QUEUED)
+        with store.connect() as connection:
+            active = connection.execute(
+                "SELECT id FROM events WHERE task_id=? AND status='pending'", (task_id,)
+            ).fetchall()
+            stale = connection.execute(
+                "SELECT status,error FROM events WHERE id=?", (old_id,)
+            ).fetchone()
+        self.assertEqual([int(row["id"]) for row in active], [new_id])
+        self.assertEqual((stale["status"], stale["error"]),
+                         ("stale", "duplicate_active_task_event"))
+
+    def test_manual_retry_supersedes_request_and_continuation_events(self) -> None:
+        self.settings.ensure_directories()
+        store = StateStore(self.settings.database)
+        store.initialize()
+        task_id = store.create_task(Task("retry", "retry"))
+        request_id = store.add_event(Event("TASK_REQUEST", {"task_id": task_id, "message": "old"}))
+        store.claim_events()
+        store.start_task_attempt(task_id)
+
+        replacement_id = store.retry_task(task_id)
+        with store.connect() as connection:
+            old = connection.execute(
+                "SELECT status,error FROM events WHERE id=?", (request_id,)
+            ).fetchone()
+            active = connection.execute(
+                "SELECT id FROM events WHERE task_id=? AND status='pending'", (task_id,)
+            ).fetchall()
+        self.assertEqual((old["status"], old["error"]), ("stale", "manual_retry_reset"))
+        self.assertEqual([int(row["id"]) for row in active], [replacement_id])
+
+    def test_runtime_process_lock_rejects_second_owner(self) -> None:
+        first = RuntimeProcessLock(self.settings.database)
+        second = RuntimeProcessLock(self.settings.database)
+        first.acquire()
+        self.addCleanup(first.release)
+        with self.assertRaises(RuntimeAlreadyRunning):
+            second.acquire()
+        first.release()
+        second.acquire()
+        second.release()
+
+    def test_single_cycle_entrypoint_recovers_interrupted_events_before_running(self) -> None:
+        runtime = AIOSRuntime(self.settings)
+        runtime.store.add_event(Event("TEST"))
+        self.assertEqual(len(runtime.store.claim_events()), 1)
+        with patch.object(runtime, "run_once", return_value=False) as run_once:
+            self.assertFalse(runtime.run_single())
+        run_once.assert_called_once_with()
+        self.assertEqual(runtime.store.count_pending_events(), 1)
 
     def test_deepseek_uses_openai_compatible_transport(self) -> None:
         config = self.settings.model

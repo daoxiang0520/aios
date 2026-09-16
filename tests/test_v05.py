@@ -30,7 +30,10 @@ class V05Tests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_network_task_stops_before_model_and_memory(self) -> None:
-        runtime = AIOSRuntime(self.settings)
+        with patch(
+            "aios.sandbox.DockerSandboxBroker._probe_health", return_value=True,
+        ):
+            runtime = AIOSRuntime(self.settings)
         runtime.controller.plan = Mock(side_effect=AssertionError("model must not be called"))
         runtime.store.add_event(Event("USER_REQUEST", {"message": "搜索 arXiv 最新 AI 论文并生成 latest.md"}))
         runtime.run_once()
@@ -41,7 +44,10 @@ class V05Tests(unittest.TestCase):
 
     def test_enabled_network_is_available_and_uses_unrestricted_docker_bridge(self) -> None:
         self.settings.capabilities.network_enabled = True
-        runtime = AIOSRuntime(self.settings)
+        with patch(
+            "aios.sandbox.DockerSandboxBroker._probe_health", return_value=True,
+        ):
+            runtime = AIOSRuntime(self.settings)
         contract = EvidenceContract.from_request("联网查询最新资料")
         assessment = runtime.capabilities.assess(contract)
         self.assertTrue(assessment["satisfied"])
@@ -221,11 +227,14 @@ class V05Tests(unittest.TestCase):
         config.api_key_env = "TEST_DEEPSEEK_KEY"
         controller = LLMController(config)
         response = MagicMock()
-        response.read.return_value = json.dumps({
+        response.status_code = 200
+        response.json.return_value = {
             "choices": [{"message": {"content": "task complete", "tool_calls": []}, "finish_reason": "stop"}]
-        }).encode("utf-8")
+        }
         response.__enter__.return_value = response
-        with patch.dict(os.environ, {"TEST_DEEPSEEK_KEY": "test-only"}), patch("urllib.request.urlopen", return_value=response):
+        with patch.dict(os.environ, {"TEST_DEEPSEEK_KEY": "test-only"}), patch.object(
+            controller._session, "post", return_value=response,
+        ):
             plan = controller.plan(Intent("test", "test", None, []), [])
         self.assertTrue(plan.done)
         self.assertEqual(plan.summary, "task complete")
@@ -264,18 +273,21 @@ class V05Tests(unittest.TestCase):
         config.api_key_env = "TEST_DEEPSEEK_KEY"
         controller = LLMController(config)
         response = MagicMock()
-        response.read.return_value = json.dumps({
+        response.status_code = 200
+        response.json.return_value = {
             "choices": [{"message": {"content": "There are 0 matches.", "tool_calls": []}, "finish_reason": "stop"}]
-        }).encode("utf-8")
+        }
         response.__enter__.return_value = response
         captured = {}
 
-        def fake_open(request, timeout):
-            captured.update(json.loads(request.data.decode("utf-8")))
+        def fake_post(_url, *, data, **_kwargs):
+            captured.update(json.loads(data.decode("utf-8")))
             return response
 
         context = {"budget": {"remaining_model_calls_after_this": 0, "force_final": True}}
-        with patch.dict(os.environ, {"TEST_DEEPSEEK_KEY": "test-only"}), patch("urllib.request.urlopen", side_effect=fake_open):
+        with patch.dict(os.environ, {"TEST_DEEPSEEK_KEY": "test-only"}), patch.object(
+            controller._session, "post", side_effect=fake_post,
+        ):
             plan = controller.plan(Intent("test", "test", None, []), [], context)
         self.assertEqual(captured["tool_choice"], "none")
         self.assertTrue(plan.done)
@@ -297,11 +309,14 @@ class V05Tests(unittest.TestCase):
         config.api_key_env = "TEST_DEEPSEEK_KEY"
         controller = LLMController(config)
         response = MagicMock()
-        response.read.return_value = json.dumps({
+        response.status_code = 200
+        response.json.return_value = {
             "choices": [{"message": {"content": '<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="bash">', "tool_calls": []}, "finish_reason": "stop"}]
-        }).encode("utf-8")
+        }
         response.__enter__.return_value = response
-        with patch.dict(os.environ, {"TEST_DEEPSEEK_KEY": "test-only"}), patch("urllib.request.urlopen", return_value=response):
+        with patch.dict(os.environ, {"TEST_DEEPSEEK_KEY": "test-only"}), patch.object(
+            controller._session, "post", return_value=response,
+        ):
             with self.assertRaises(ControllerError) as caught:
                 controller.plan(Intent("test", "test", None, []), [])
         self.assertIn("serialized tool-call markup", str(caught.exception))
@@ -320,9 +335,10 @@ class V05Tests(unittest.TestCase):
 
         def response(content: str):
             value = MagicMock()
-            value.read.return_value = json.dumps({
+            value.status_code = 200
+            value.json.return_value = {
                 "choices": [{"message": {"content": content, "tool_calls": []}, "finish_reason": "stop"}]
-            }).encode("utf-8")
+            }
             value.__enter__.return_value = value
             return value
 
@@ -331,13 +347,13 @@ class V05Tests(unittest.TestCase):
             response("Skill inspection completed; three active skills are available."),
         ])
 
-        def fake_open(request, timeout):
-            payloads.append(json.loads(request.data.decode("utf-8")))
+        def fake_post(_url, *, data, **_kwargs):
+            payloads.append(json.loads(data.decode("utf-8")))
             return next(replies)
 
         context = {"budget": {"remaining_model_calls_after_this": 0, "force_final": True, "protocol_repairs_remaining": 1}}
-        with patch.dict(os.environ, {"TEST_DEEPSEEK_KEY": "test-only"}), patch(
-            "urllib.request.urlopen", side_effect=fake_open
+        with patch.dict(os.environ, {"TEST_DEEPSEEK_KEY": "test-only"}), patch.object(
+            controller._session, "post", side_effect=fake_post,
         ):
             plan = controller.plan(Intent("test", "test", None, []), [], context)
 
@@ -356,9 +372,10 @@ class V05Tests(unittest.TestCase):
 
         def response(content: str):
             value = MagicMock()
-            value.read.return_value = json.dumps({
+            value.status_code = 200
+            value.json.return_value = {
                 "choices": [{"message": {"content": content, "tool_calls": []}, "finish_reason": "stop"}]
-            }).encode("utf-8")
+            }
             value.__enter__.return_value = value
             return value
 
@@ -373,8 +390,8 @@ class V05Tests(unittest.TestCase):
                 "content": json.dumps({"ok": False, "error": "Command exited with 1"}),
             }],
         }
-        with patch.dict(os.environ, {"TEST_DEEPSEEK_KEY": "test-only"}), patch(
-            "urllib.request.urlopen", side_effect=lambda request, timeout: next(replies)
+        with patch.dict(os.environ, {"TEST_DEEPSEEK_KEY": "test-only"}), patch.object(
+            controller._session, "post", side_effect=lambda *_args, **_kwargs: next(replies),
         ):
             plan = controller.plan(Intent("test", "test", None, []), [], context)
 

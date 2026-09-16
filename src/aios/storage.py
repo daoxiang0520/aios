@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -681,11 +682,46 @@ class StateStore:
 
     def recover_processing_events(self) -> int:
         with self.connect() as connection:
-            cursor = connection.execute(
-                "UPDATE events SET status=?,updated_at=CURRENT_TIMESTAMP WHERE status=?",
+            connection.execute("BEGIN IMMEDIATE")
+            interrupted = connection.execute(
+                """SELECT id,task_id FROM events WHERE status=? ORDER BY id""",
+                (EventStatus.PROCESSING.value,),
+            ).fetchall()
+            if not interrupted:
+                return 0
+            connection.execute(
+                """UPDATE events SET status=?,error='runtime_interrupted_requeued',
+                   updated_at=CURRENT_TIMESTAMP WHERE status=?""",
                 (EventStatus.PENDING.value, EventStatus.PROCESSING.value),
             )
-            return cursor.rowcount
+            task_ids = sorted({
+                int(row["task_id"]) for row in interrupted if row["task_id"] is not None
+            })
+            for task_id in task_ids:
+                active = connection.execute(
+                    """SELECT id FROM events WHERE task_id=?
+                       AND type IN ('TASK_REQUEST','TASK_CONTINUE')
+                       AND status IN ('pending','processing') ORDER BY id DESC""",
+                    (task_id,),
+                ).fetchall()
+                stale_ids = [int(row["id"]) for row in active[1:]]
+                if stale_ids:
+                    placeholders = ",".join("?" for _ in stale_ids)
+                    connection.execute(
+                        f"""UPDATE events SET status='stale',error='duplicate_active_task_event',
+                            updated_at=CURRENT_TIMESTAMP WHERE id IN ({placeholders})""",
+                        tuple(stale_ids),
+                    )
+                    self._increment_metric(
+                        connection, "duplicate_active_task_events_discarded", len(stale_ids)
+                    )
+                connection.execute(
+                    """UPDATE tasks SET status=?,updated_at=CURRENT_TIMESTAMP
+                       WHERE id=? AND status=?""",
+                    (TaskStatus.QUEUED.value, task_id, TaskStatus.RUNNING.value),
+                )
+            self._increment_metric(connection, "interrupted_events_recovered", len(interrupted))
+            return len(interrupted)
 
     def count_pending_events(self) -> int:
         with self.connect() as connection:
@@ -863,6 +899,77 @@ class StateStore:
             {"id": int(row["id"]), **json.loads(row["report"]), "created_at": row["created_at"]}
             for row in rows
         ]
+
+    def task_trace_catalog(
+        self, task_id: int, *, after_id: int = 0, limit: int = 50,
+    ) -> dict[str, Any]:
+        """Return addressable immutable event envelopes, not interpreted metrics."""
+        bounded_limit = max(1, min(int(limit), 100))
+        bounded_after = max(0, int(after_id))
+        with self.connect() as connection:
+            rows = connection.execute(
+                """WITH task_cycles AS (
+                       SELECT DISTINCT json_extract(data, '$.cycle_id') AS cycle_id
+                       FROM checkpoints
+                       WHERE task_id=? AND json_extract(data, '$.cycle_id') IS NOT NULL
+                   )
+                   SELECT id,cycle_id,kind,data,created_at FROM traces
+                   WHERE id>? AND (
+                       cycle_id IN (SELECT cycle_id FROM task_cycles)
+                       OR CAST(json_extract(data, '$.task_id') AS INTEGER)=?
+                   )
+                   ORDER BY id LIMIT ?""",
+                (int(task_id), bounded_after, int(task_id), bounded_limit + 1),
+            ).fetchall()
+        events: list[dict[str, Any]] = []
+        for row in rows[:bounded_limit]:
+            raw = str(row["data"])
+            try:
+                keys = sorted(str(key) for key in json.loads(raw))
+            except (TypeError, json.JSONDecodeError):
+                keys = []
+            events.append({
+                "ref": f"trace:{int(row['id'])}",
+                "id": int(row["id"]),
+                "cycle_id": str(row["cycle_id"]),
+                "kind": str(row["kind"]),
+                "created_at": str(row["created_at"]),
+                "data_characters": len(raw),
+                "data_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+                "data_keys": keys,
+                "data_prefix": raw[:600],
+            })
+        return {
+            "task_id": int(task_id),
+            "events": events,
+            "after_id": bounded_after,
+            "next_after_id": events[-1]["id"] if events else bounded_after,
+            "truncated": len(rows) > bounded_limit,
+        }
+
+    def task_trace_record(self, task_id: int, trace_id: int) -> dict[str, Any] | None:
+        """Resolve a Trace only when it belongs to the requested task."""
+        with self.connect() as connection:
+            row = connection.execute(
+                """WITH task_cycles AS (
+                       SELECT DISTINCT json_extract(data, '$.cycle_id') AS cycle_id
+                       FROM checkpoints
+                       WHERE task_id=? AND json_extract(data, '$.cycle_id') IS NOT NULL
+                   )
+                   SELECT id,cycle_id,kind,data,created_at FROM traces
+                   WHERE id=? AND (
+                       cycle_id IN (SELECT cycle_id FROM task_cycles)
+                       OR CAST(json_extract(data, '$.task_id') AS INTEGER)=?
+                   )""",
+                (int(task_id), int(trace_id), int(task_id)),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": int(row["id"]), "cycle_id": str(row["cycle_id"]),
+            "kind": str(row["kind"]), "data": str(row["data"]),
+            "created_at": str(row["created_at"]),
+        }
 
     def traces_for_cycles(self, cycle_ids: list[str]) -> list[dict[str, Any]]:
         if not cycle_ids:
@@ -1439,7 +1546,8 @@ class StateStore:
         with self.connect() as connection:
             connection.execute(
                 """UPDATE events SET status='stale',error='manual_retry_reset',
-                   updated_at=CURRENT_TIMESTAMP WHERE type='TASK_CONTINUE' AND task_id=?
+                   updated_at=CURRENT_TIMESTAMP
+                   WHERE type IN ('TASK_REQUEST','TASK_CONTINUE') AND task_id=?
                    AND status IN ('pending','processing')""",
                 (task_id,),
             )

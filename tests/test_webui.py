@@ -118,6 +118,105 @@ class WebUITest(unittest.TestCase):
         self.assertEqual(run["model_intended_decision"], "PROPOSE")
         self.assertEqual(run["effective_host_decision"], "NO_ACTION")
 
+    def test_ui_projects_self_recovery_as_a_distinct_runtime_mode(self) -> None:
+        task_id = self.store.create_task(Task("recovering", "original request"))
+        cycle_id = "failed-cycle"
+        self.store.add_checkpoint(task_id, "failed_attempt", {
+            "cycle_id": cycle_id, "error": "RuntimeError: failed",
+        })
+        incident_id = self.store.trace(cycle_id, "self_recovery_incident", {
+            "task_id": task_id, "error": "RuntimeError: failed",
+        })
+        incident = {
+            "incident_ref": f"trace:{incident_id}",
+            "failed_self_version": "v000004",
+            "recovery_base_version": "v000003",
+            "parent_fallback_used": True,
+        }
+        self.store.add_checkpoint(task_id, "self_recovery_scheduled", incident)
+        self.store.trace(cycle_id, "self_recovery_scheduled", {
+            "task_id": task_id, **incident,
+        })
+        self.store.update_task(task_id, TaskStatus.RETRYING, error="failed")
+
+        detail = self.app.task_detail(task_id)
+
+        self.assertTrue(detail["self_recovery"]["observed"])
+        self.assertEqual(detail["self_recovery"]["state"], "scheduled")
+        self.assertEqual(detail["self_recovery"]["recovery_base_version"], "v000003")
+        self.assertTrue(detail["self_recovery"]["parent_fallback_used"])
+        recovery_activity = [
+            item for item in detail["activity"] if item["actor"] == "RECOVERY"
+        ]
+        self.assertTrue(recovery_activity)
+        self.assertIn("Self Recovery", recovery_activity[-1]["label"])
+
+        self.store.trace(cycle_id, "self_recovery_failed", {
+            "task_id": task_id,
+            "incident_ref": f"trace:{incident_id}",
+            "error": "ControllerError: recovery could not continue",
+        })
+        failed_detail = self.app.task_detail(task_id)
+        self.assertEqual(failed_detail["self_recovery"]["state"], "failed")
+        self.assertEqual(
+            failed_detail["activity"][-1]["label"], "Self Recovery Failed",
+        )
+
+    def test_ui_correlates_model_reasoning_repeated_reads_and_self_changes(self) -> None:
+        task_id = self.store.create_task(Task("observable", "inspect the same source"))
+        cycle_id = "observable-cycle"
+        self.store.add_checkpoint(task_id, "started", {
+            "cycle_id": cycle_id, "attempt": 1,
+        })
+        self.store.trace(cycle_id, "plan_created", {
+            "round": 1, "summary": "inspect the source", "done": False,
+            "actions": [{
+                "tool": "read", "arguments": {"path": "notes.md"},
+                "reason": "initial inspection",
+            }],
+        })
+        self.store.trace(cycle_id, "model_reasoning", {
+            "task_id": task_id, "round": 2,
+            "reasoning": "I need to confirm whether the file changed.",
+            "reasoning_excerpt": "I need to confirm whether the file changed.",
+            "source": "provider_reasoning_content", "truncated": False,
+        })
+        self.store.trace(cycle_id, "plan_created", {
+            "round": 2, "summary": "confirm the source", "done": False,
+            "actions": [{
+                "tool": "read", "arguments": {"path": "notes.md"},
+                "reason": "check for a newer content version",
+            }],
+        })
+        self.store.trace(cycle_id, "repeated_resource_read", {
+            "task_id": task_id, "round": 2, "path": "notes.md",
+            "prior_evidence_ref": "trace:10",
+        })
+        self.store.trace(cycle_id, "observation_reused", {
+            "task_id": task_id, "round": 2, "path": "notes.md",
+            "source_observation_ref": "trace:10",
+        })
+        self.store.trace(cycle_id, "self_version_opened", {
+            "task_id": task_id, "round": 2, "operation": "open",
+            "version": "v000005", "parent_version": "v000004",
+            "restart_required": False,
+        })
+
+        detail = self.app.task_detail(task_id)
+
+        decision = detail["decision_log"]["entries"][-1]
+        self.assertTrue(decision["reasoning_available"])
+        self.assertIn("file changed", decision["reasoning"])
+        repeated = detail["repetition_analysis"]
+        self.assertEqual(repeated["repeated_requests"], 1)
+        self.assertEqual(repeated["exact_repeated_actions"], 1)
+        self.assertEqual(repeated["exact_action_entries"][0]["occurrence"], 2)
+        self.assertEqual(repeated["observation_reuse_hits"], 1)
+        self.assertEqual(repeated["entries"][0]["outcome"], "observation_reused")
+        self.assertIn("newer content", repeated["entries"][0]["action_reason"])
+        self.assertTrue(detail["self_changes"]["observed"])
+        self.assertEqual(detail["self_changes"]["entries"][0]["version"], "v000005")
+
     def test_topbar_remains_visible_when_narrow_layout_scrolls(self) -> None:
         css = (self.app.assets / "app.css").read_text(encoding="utf-8")
         self.assertIn(".topbar{position:sticky;top:0;z-index:20}", css)
@@ -149,6 +248,16 @@ class WebUITest(unittest.TestCase):
         self.assertIn('Production / Unbound', javascript)
         self.assertIn('Current experimental', javascript)
         self.assertIn('lineage_id:state.lineageChoice', javascript)
+        self.assertIn('id="task-self-recovery"', javascript)
+        self.assertIn("SELF RECOVERY", javascript)
+        self.assertIn("activity-node ${a.actor}", javascript)
+        self.assertIn(".runtime-policy.recovery", css)
+        self.assertIn(".actor.RECOVERY", css)
+        self.assertIn('data-tab="reasoning"', html)
+        self.assertIn("renderReasoning(root)", javascript)
+        self.assertIn("PROVIDER-SUPPLIED REASONING", javascript)
+        self.assertIn("SELF VERSION ACTIONS", javascript)
+        self.assertIn(".reasoning-card", css)
 
 
 if __name__ == "__main__":

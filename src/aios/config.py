@@ -22,7 +22,7 @@ class ModelConfig:
 @dataclass(slots=True)
 class PermissionConfig:
     allowed_tools: list[str] = field(
-        default_factory=lambda: ["read", "write", "edit", "bash"]
+        default_factory=lambda: ["read", "write", "edit", "bash", "observe"]
     )
     allow_writes: bool = True
     max_read_bytes: int = 1_048_576
@@ -99,6 +99,10 @@ class ExperimentConfig:
 @dataclass(slots=True)
 class RuntimePolicyConfig:
     completion_mode: str = "verified"
+    # This is a context/liveness boundary, not a task budget.  Zero disables
+    # it.  When reached, an unfinished unlimited task is checkpointed and
+    # resumed with a fresh HOT context while its private workspace is kept.
+    liveness_checkpoint_rounds: int = 48
 
 
 @dataclass(slots=True)
@@ -107,6 +111,23 @@ class SelfModificationConfig:
     root: str = "./self"
     experiment_condition: str = "natural"
     max_system_prompt_characters: int = 8_000
+    # These are observation opportunities, not execution limits.  The same
+    # ordinary Agent may continue the task, stop, or open a reversible Self
+    # change after inspecting the factual experience accumulated so far.
+    in_task_reflection_rounds: list[int] = field(
+        default_factory=lambda: [12, 36, 72]
+    )
+    # After a dedicated Self decision (including a commit), require this many
+    # ordinary liveness checkpoints before offering another one.  This avoids
+    # reflection recursion while still allowing a long task to discover new
+    # reusable evidence after an earlier mutation.
+    reflection_cooldown_checkpoints: int = 3
+    # A recovery invocation is the same Self lineage restarted by Host after
+    # ordinary execution can no longer reach its own reflection point.  It is
+    # bounded independently from task attempts and receives observations, not
+    # a Host diagnosis or a required mutation.
+    failure_recovery_enabled: bool = True
+    max_failure_recovery_invocations: int = 1
 
 
 @dataclass(slots=True)
@@ -146,10 +167,47 @@ class Settings:
         runtime = RuntimePolicyConfig(**raw.get("runtime", {}))
         if runtime.completion_mode not in {"verified", "free"}:
             raise ValueError("runtime.completion_mode must be 'verified' or 'free'")
+        if (
+            isinstance(runtime.liveness_checkpoint_rounds, bool)
+            or not isinstance(runtime.liveness_checkpoint_rounds, int)
+            or runtime.liveness_checkpoint_rounds < 0
+        ):
+            raise ValueError("runtime.liveness_checkpoint_rounds must be a non-negative integer")
         self_modification = SelfModificationConfig(**raw.get("self_modification", {}))
         if self_modification.experiment_condition not in {"natural", "positive_control"}:
             raise ValueError(
                 "self_modification.experiment_condition must be 'natural' or 'positive_control'"
+            )
+        reflection_rounds = self_modification.in_task_reflection_rounds
+        if (
+            not isinstance(reflection_rounds, list)
+            or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                   for value in reflection_rounds)
+        ):
+            raise ValueError(
+                "self_modification.in_task_reflection_rounds must be a list of positive integers"
+            )
+        self_modification.in_task_reflection_rounds = sorted(set(reflection_rounds))
+        if (
+            isinstance(self_modification.reflection_cooldown_checkpoints, bool)
+            or not isinstance(self_modification.reflection_cooldown_checkpoints, int)
+            or self_modification.reflection_cooldown_checkpoints < 0
+        ):
+            raise ValueError(
+                "self_modification.reflection_cooldown_checkpoints must be a "
+                "non-negative integer"
+            )
+        if not isinstance(self_modification.failure_recovery_enabled, bool):
+            raise ValueError(
+                "self_modification.failure_recovery_enabled must be a boolean"
+            )
+        if (
+            isinstance(self_modification.max_failure_recovery_invocations, bool)
+            or not isinstance(self_modification.max_failure_recovery_invocations, int)
+            or self_modification.max_failure_recovery_invocations < 0
+        ):
+            raise ValueError(
+                "self_modification.max_failure_recovery_invocations must be a non-negative integer"
             )
         if self_modification.enabled and runtime.completion_mode != "free":
             raise ValueError("self modification requires runtime.completion_mode='free'")
@@ -245,6 +303,25 @@ class Settings:
             "scope": "policy for tasks run with these loaded settings; not a live-process or health probe",
             "historical_scope": "does not retroactively describe earlier tasks",
             "completion_mode": self.runtime.completion_mode,
+            "liveness": {
+                "checkpoint_rounds": self.runtime.liveness_checkpoint_rounds,
+                "semantics": (
+                    "fresh-context continuation boundary; not a task completion, "
+                    "fitness verdict, or cumulative budget"
+                ),
+            },
+            "self_recovery": {
+                "enabled": bool(
+                    self.self_modification.enabled
+                    and self.self_modification.failure_recovery_enabled
+                ),
+                "max_invocations_per_task": (
+                    self.self_modification.max_failure_recovery_invocations
+                ),
+                "trigger_semantics": "after ordinary retry/protocol exhaustion",
+                "decision_owner": "same_self_lineage",
+                "host_diagnosis": None,
+            },
             "budget": {
                 "enabled": budget.enabled,
                 "configured": configured,

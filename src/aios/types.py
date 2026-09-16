@@ -95,6 +95,9 @@ class Plan:
     summary: str
     actions: list[Action]
     done: bool = False
+    # Provider-returned reasoning is an observable model output, not a Host
+    # diagnosis and not a claim that the explanation is causally correct.
+    reasoning: str | None = None
     protocol_message: dict[str, Any] | None = None
     model_usage: dict[str, int] | None = None
     model_attributions: list[dict[str, Any]] = field(default_factory=list)

@@ -41,10 +41,11 @@ class V0662ContextEfficiencyTests(unittest.TestCase):
         config.api_key_env = "TEST_CONTEXT_KEY"
         controller = LLMController(config)
         response = MagicMock()
-        response.read.return_value = json.dumps({
+        response.status_code = 200
+        response.json.return_value = {
             "choices": [{"message": {"content": "done", "tool_calls": []}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 1000, "completion_tokens": 10, "total_tokens": 1010},
-        }).encode("utf-8")
+        }
         response.__enter__.return_value = response
         context = {
             "workspace_inventory": {"files": [{"path": "x.xlsx"}]},
@@ -54,8 +55,8 @@ class V0662ContextEfficiencyTests(unittest.TestCase):
             "capabilities": {"resource.read": {"state": "available"}},
             "_protocol_messages": [{"role": "assistant", "content": "prior"}],
         }
-        with patch.dict(os.environ, {"TEST_CONTEXT_KEY": "test-only"}), patch(
-            "urllib.request.urlopen", return_value=response
+        with patch.dict(os.environ, {"TEST_CONTEXT_KEY": "test-only"}), patch.object(
+            controller._session, "post", return_value=response,
         ):
             plan = controller.plan(Intent("task", "test", None, []), [], context)
         attribution = plan.model_attributions[0]

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from aios.config import SandboxConfig
 from aios.runtime_evolution import (
@@ -79,6 +81,29 @@ class SandboxReadonlyCleanupGate(unittest.TestCase):
         second = self.broker.prepare(1, self.workspace)
         self.assertTrue((second / "source.txt").is_file())
         self.assertFalse(stale.exists())
+
+    def test_cleanup_retries_transient_directory_not_empty(self) -> None:
+        target = self.root / "sandbox" / "task_9"
+        target.mkdir(parents=True)
+        (target / "result.txt").write_text("x", encoding="utf-8")
+        real_rmtree = __import__("shutil").rmtree
+        calls = 0
+
+        def transient_then_remove(path, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                error = OSError(errno.ENOTEMPTY, "directory not empty")
+                error.winerror = 145
+                raise error
+            return real_rmtree(path, *args, **kwargs)
+
+        with patch("aios.sandbox.shutil.rmtree", side_effect=transient_then_remove), \
+             patch("aios.sandbox.time.sleep"):
+            self.broker._remove_tree(target)
+
+        self.assertEqual(calls, 2)
+        self.assertFalse(target.exists())
 
     def test_discard_preserves_production_workspace_isolation(self) -> None:
         snapshot = self.broker.prepare(1, self.workspace)

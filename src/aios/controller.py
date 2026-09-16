@@ -2,16 +2,15 @@ from __future__ import annotations
 
 import ast
 import hashlib
-import http.client
 import json
 import logging
 import math
 import os
 import re
 import time
-import urllib.error
-import urllib.request
 from typing import Any
+
+import requests
 
 from .config import ModelConfig
 from .tools import CORE_TOOL_SCHEMAS
@@ -92,10 +91,34 @@ Use tool results as evidence, preserve successful work, and return a final answe
 MINIMAL_SELF_TOOL_SYSTEM_PROMPT = """Complete the user's ordinary task with the provided tools.
 The task world is under /workspace. Persistent state and prior tool results are supplied in context.
 Your current system is readable at /self. `evolve` forks it into a new reversible version and opens
-/self for writing; immutable prior versions are readable at /self-history. It starts no other Agent, model call, evaluator,
-candidate pipeline, or automatic production promotion. Changes to SYSTEM.md affect later model rounds
-and future tasks, while helpers under /self/tools or /self/components can be used through bash.
-This describes an available capability, not a requirement or recommendation to use it.
+/self for writing; immutable prior versions are readable at /self-history. After editing, call
+`evolve(operation="commit")`; the Host checkpoints the task and the next cycle loads the descendant.
+It starts no other Agent, model call, evaluator, candidate pipeline, or automatic production promotion.
+SYSTEM.md and `/self/agent/main.py` shape later cycles and future tasks. The Agent entrypoint may be
+reorganized into arbitrary internal modules while preserving its lifecycle JSON boundary; legacy
+`/self/harness` code is only a compatibility fallback. Helpers under /self/tools or /self/components
+can be used through bash.
+The read-only `observe` primitive lets you inspect immutable task events and exact bounded Trace ranges.
+context.self_observation contains only coordinates for that sensor, not selected metrics or a diagnosis.
+You decide when to observe, which events matter, how to interpret them, and whether they justify change.
+During a long active task, and once after your first final answer, context.self_reflection may offer the
+same ordinary Agent a bounded decision opportunity. It is not verification and makes no fitness judgment.
+When its phase is `dedicated_self_decision`, that turn concerns reusable Self only: use observe if you
+choose to inspect the record, then use evolve to open, edit, test, and commit a descendant, or answer
+`SELF_UNCHANGED` to resume the still-active ordinary task.
+That no-change answer is not an assertion that the user's task is complete.
+At an in-task checkpoint, inspect the factual consequences so far and either change task strategy, finish
+if the goal is actually complete, or use evolve only for a reusable change you independently judge
+worthwhile. At the post-answer opportunity, stop unchanged by returning a final answer or use evolve.
+The `evolve` primitive remains an available capability, not a requirement to mutate.
+When context.self_recovery is present, the immutable Host has restarted this same Self lineage after
+ordinary execution could no longer reach a useful reflection boundary. The Incident Capsule contains
+observations, not a diagnosis. Continue the original user task with a materially revised strategy, or
+use evolve if you independently identify a reusable defect in mutable Self. A recovery invocation is
+not task completion: do not stop merely to discuss the incident, and do not claim success unless the
+original user objective has actually been addressed. If active_cycle_version differs from
+current_version, you are running from the recorded parent as a liveness fallback; evolve will fork that
+active base rather than treating the broken current version as proven-good.
 The immutable Host still enforces sandboxing, authority, credentials, history, rollback, audit, and
 hard resource ceilings. Return a concise final answer when you choose to stop.
 """
@@ -200,6 +223,10 @@ class LLMController:
     def __init__(self, config: ModelConfig):
         self.config = config
         self.tool_schemas = list(CORE_TOOL_SCHEMAS)
+        # Reuse TLS connections across the many rounds of a long task. This is
+        # materially more stable behind DeepSeek's front proxy than opening a
+        # fresh urllib connection for every reasoning/tool round.
+        self._session = requests.Session()
 
     def set_tool_schemas(self, schemas: list[dict[str, Any]]) -> None:
         self.tool_schemas = list(schemas)
@@ -308,11 +335,17 @@ class LLMController:
         response_data = self._request_with_recovery(request_data, key, max_attempts=attempts)
         model_usage = _normalized_usage(response_data.get("usage"))
         self._attribute_actual_tokens(attribution, model_usage.get("prompt_tokens"))
+        attributions = [attribution]
         try:
             choice = response_data["choices"][0]
             message = choice["message"]
             content = message.get("content")
             tool_calls = message.get("tool_calls")
+            reasoning = (
+                message.get("reasoning_content")
+                if isinstance(message.get("reasoning_content"), str)
+                else None
+            )
             if use_tool_calling and isinstance(tool_calls, list) and tool_calls:
                 actions = self._parse_tool_calls(tool_calls)
                 protocol_message = {
@@ -320,16 +353,17 @@ class LLMController:
                     "content": content,
                     "tool_calls": tool_calls,
                 }
-                reasoning = message.get("reasoning_content")
-                if reasoning is not None:
-                    protocol_message["reasoning_content"] = reasoning
+                protocol_reasoning = message.get("reasoning_content")
+                if isinstance(protocol_reasoning, str):
+                    protocol_message["reasoning_content"] = protocol_reasoning
                 return Plan(
                     summary=f"Model requested {len(actions)} tool call(s)",
                     actions=actions,
                     done=False,
+                    reasoning=reasoning,
                     protocol_message=protocol_message,
                     model_usage=model_usage,
-                    model_attributions=[attribution],
+                    model_attributions=attributions,
                 )
             if use_tool_calling and isinstance(content, str) and content.strip():
                 if contains_serialized_tool_call(content):
@@ -347,14 +381,16 @@ class LLMController:
                     summary=content.strip(),
                     actions=[],
                     done=True,
+                    reasoning=reasoning,
                     model_usage=model_usage,
-                    model_attributions=[attribution],
+                    model_attributions=attributions,
                     completion_metadata=self._completion_metadata(claims_complete=True),
                 )
             try:
                 plan = self._parse_plan_content(content)
+                plan.reasoning = reasoning
                 plan.model_usage = model_usage
-                plan.model_attributions = [attribution]
+                plan.model_attributions = attributions
                 return plan
             except ControllerError as exc:
                 content_chars = len(content) if isinstance(content, str) else 0
@@ -378,7 +414,9 @@ class LLMController:
         """Retry an unexecuted model request, never replaying workspace actions."""
         request = dict(request_data)
         usage: dict[str, int] = {}
-        corrected = False
+        empty_correction_used = False
+        tool_argument_correction_used = False
+        recovery_reasoning: list[str] = []
         for attempt in range(1, max_attempts + 1):
             try:
                 response = self._send_request(request, key)
@@ -397,6 +435,25 @@ class LLMController:
             choices = response.get("choices")
             choice = choices[0] if isinstance(choices, list) and choices else {}
             message = choice.get("message") if isinstance(choice, dict) else None
+            if (
+                isinstance(message, dict)
+                and isinstance(message.get("reasoning_content"), str)
+                and message["reasoning_content"].strip()
+                and (
+                    not recovery_reasoning
+                    or recovery_reasoning[-1] != message["reasoning_content"]
+                )
+            ):
+                recovery_reasoning.append(message["reasoning_content"])
+            malformed_tool_call: ControllerError | None = None
+            if isinstance(message, dict) and message.get("tool_calls"):
+                try:
+                    # Validate only.  The action remains unexecuted until the caller
+                    # parses the returned response after this recovery boundary.
+                    self._parse_tool_calls(message["tool_calls"])
+                except ControllerError as exc:
+                    if str(exc).startswith("Native tool call arguments"):
+                        malformed_tool_call = exc
             empty = (
                 isinstance(message, dict)
                 and (message.get("content") is None or (
@@ -410,9 +467,44 @@ class LLMController:
             # aggregated after recovery. Parsing and authority checks stay with callers.
             raw_usage = response.get("usage")
             response["usage"] = {**(raw_usage if isinstance(raw_usage, dict) else {}), **usage}
-            if not empty or corrected or attempt == max_attempts:
+            if (
+                malformed_tool_call is not None
+                and not tool_argument_correction_used
+                and attempt < max_attempts
+            ):
+                tool_argument_correction_used = True
+                # Never replay an assistant tool_calls message without matching
+                # tool responses.  OpenAI-compatible providers reject that broken
+                # conversation state with HTTP 400 before the model can repair it.
+                # The malformed call was not executed, so discard it and ask for a
+                # fresh protocol-valid action from the original request context.
+                request["messages"] = [
+                    *request.get("messages", []),
+                    {
+                        "role": "user",
+                        "content": (
+                            "Protocol correction: the previous native tool call was not executed "
+                            "because function.arguments was invalid. Return a corrected native tool "
+                            "call whose arguments field is exactly one valid JSON object, or return "
+                            "a final answer. Do not claim that the invalid call ran."
+                        ),
+                    },
+                ]
+                if request.get("tools") and request.get("tool_choice") != "none":
+                    # A truncated argument object normally means reasoning consumed
+                    # the output budget. Preserve normal thinking elsewhere, but make
+                    # this single unexecuted repair call action-focused.
+                    request["thinking"] = {"type": "disabled"}
+                LOGGER.warning(
+                    "Model returned malformed native tool arguments; retrying request %s/%s",
+                    attempt + 1, max_attempts,
+                )
+                continue
+            if not empty or empty_correction_used or attempt == max_attempts:
+                if isinstance(message, dict) and recovery_reasoning:
+                    message["reasoning_content"] = "\n\n".join(recovery_reasoning)
                 return response
-            corrected = True
+            empty_correction_used = True
             if request.get("response_format", {}).get("type") == "json_object":
                 instruction = "Return the required non-empty final JSON object in content."
             elif request.get("tools") and request.get("tool_choice") != "none":
@@ -426,36 +518,181 @@ class LLMController:
                     "Do not claim completion without evidence."
                 ),
             }]
+            if (
+                choice.get("finish_reason") == "length"
+                and request.get("tools")
+                and request.get("tool_choice") != "none"
+            ):
+                # The normal request keeps provider thinking enabled.  Only this
+                # unexecuted recovery call is action-focused so it cannot spend a
+                # second full output budget on hidden reasoning without acting.
+                request["thinking"] = {"type": "disabled"}
+                request["max_tokens"] = min(
+                    max(512, int(request.get("max_tokens", 2048))), 2048
+                )
             LOGGER.warning("Model returned empty content (finish_reason=%s); retrying request %s/%s",
                            choice.get("finish_reason"), attempt + 1, max_attempts)
         raise AssertionError("max_attempts must be positive")
 
     def _send_request(self, request_data: dict[str, Any], key: str) -> dict[str, Any]:
-        body = json.dumps(request_data).encode("utf-8")
-        request = urllib.request.Request(
-            self.config.base_url.rstrip("/") + "/chat/completions",
-            data=body,
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            method="POST",
+        payload = dict(request_data)
+        thinking = payload.get("thinking")
+        use_stream = (
+            self.config.provider == "deepseek"
+            and isinstance(thinking, dict)
+            and thinking.get("type") == "enabled"
         )
+        if use_stream:
+            # Thinking responses may remain silent long enough for an HTTP proxy to
+            # close a non-streaming connection. Streaming keeps transport progress
+            # visible while preserving the conventional response shape internally.
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
+        body = json.dumps(payload).encode("utf-8")
         try:
-            with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
-                response_data = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            status = exc.code
-            exc.close()
-            raise ModelRequestError(
-                f"Model request failed: HTTP {status}",
-                retryable=status in {408, 429, 500, 502, 503, 504},
-            ) from exc
-        except (urllib.error.URLError, OSError, http.client.HTTPException,
-                json.JSONDecodeError, UnicodeDecodeError) as exc:
+            with self._session.post(
+                self.config.base_url.rstrip("/") + "/chat/completions",
+                data=body,
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                    # A stable application identity avoids a proxy path that
+                    # closed larger anonymous/default-client requests.
+                    "User-Agent": "AIOS/0.10",
+                    "Accept": "*/*",
+                    "Connection": "keep-alive",
+                },
+                timeout=self.config.timeout_seconds,
+                stream=use_stream,
+            ) as response:
+                status = int(response.status_code)
+                if status >= 400:
+                    detail = self._safe_provider_error(response)
+                    raise ModelRequestError(
+                        f"Model request failed: HTTP {status}"
+                        + (f"; provider={detail}" if detail else ""),
+                        retryable=status in {408, 429, 500, 502, 503, 504},
+                    )
+                response_data = (
+                    self._read_streaming_response(response)
+                    if use_stream
+                    else response.json()
+                )
+        except ModelRequestError:
+            raise
+        except (requests.exceptions.RequestException, OSError,
+                json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
             raise ModelRequestError(
                 f"Model request failed: {type(exc).__name__}", retryable=True,
             ) from exc
         if not isinstance(response_data, dict):
             raise ControllerError("Model returned an invalid response object")
         return response_data
+
+    @staticmethod
+    def _safe_provider_error(response: Any) -> str:
+        """Keep a bounded provider diagnostic without leaking credential-like data."""
+        try:
+            raw = str(response.text)
+        except Exception:
+            return ""
+        raw = re.sub(r"(?i)(Bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1<redacted>", raw)
+        raw = re.sub(
+            r"(?i)((?:api[_-]?key|access[_-]?token|password|secret|cookie)"
+            r"\s*[:=]\s*)[^\s,;]+",
+            r"\1<redacted>", raw,
+        )
+        return " ".join(raw.split())[:1000]
+
+    @staticmethod
+    def _read_streaming_response(response: Any) -> dict[str, Any]:
+        """Fold OpenAI-compatible SSE deltas into one ordinary chat response."""
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_calls: dict[int, dict[str, Any]] = {}
+        finish_reason: Any = None
+        usage: dict[str, Any] | None = None
+        role = "assistant"
+        saw_event = False
+
+        saw_done = False
+        for raw_line in response.iter_lines():
+            line = (
+                raw_line.decode("utf-8").strip()
+                if isinstance(raw_line, bytes) else str(raw_line).strip()
+            )
+            if not line or line.startswith(":") or not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                saw_done = True
+                break
+            event = json.loads(data)
+            if not isinstance(event, dict):
+                continue
+            saw_event = True
+            event_usage = event.get("usage")
+            if isinstance(event_usage, dict):
+                usage = event_usage
+            choices = event.get("choices")
+            if not isinstance(choices, list) or not choices:
+                continue
+            choice = choices[0]
+            if not isinstance(choice, dict):
+                continue
+            if choice.get("finish_reason") is not None:
+                finish_reason = choice.get("finish_reason")
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            if isinstance(delta.get("role"), str):
+                role = delta["role"]
+            if isinstance(delta.get("content"), str):
+                content_parts.append(delta["content"])
+            if isinstance(delta.get("reasoning_content"), str):
+                reasoning_parts.append(delta["reasoning_content"])
+            deltas = delta.get("tool_calls")
+            if not isinstance(deltas, list):
+                continue
+            for fallback_index, item in enumerate(deltas):
+                if not isinstance(item, dict):
+                    continue
+                index = item.get("index", fallback_index)
+                if not isinstance(index, int) or isinstance(index, bool):
+                    index = fallback_index
+                target = tool_calls.setdefault(index, {
+                    "id": "", "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                })
+                if isinstance(item.get("id"), str):
+                    target["id"] += item["id"]
+                if isinstance(item.get("type"), str):
+                    target["type"] = item["type"]
+                function = item.get("function")
+                if isinstance(function, dict):
+                    if isinstance(function.get("name"), str):
+                        target["function"]["name"] += function["name"]
+                    if isinstance(function.get("arguments"), str):
+                        target["function"]["arguments"] += function["arguments"]
+
+        if not saw_event:
+            raise json.JSONDecodeError("Streaming response contained no data events", "", 0)
+        if not saw_done:
+            raise requests.exceptions.ChunkedEncodingError(
+                "Streaming response ended before the terminal event"
+            )
+        message: dict[str, Any] = {
+            "role": role,
+            "content": "".join(content_parts) if content_parts else None,
+        }
+        if reasoning_parts:
+            message["reasoning_content"] = "".join(reasoning_parts)
+        if tool_calls:
+            message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
+        return {
+            "choices": [{"finish_reason": finish_reason, "message": message}],
+            "usage": usage,
+        }
 
     def _repair_final_answer(
         self,
@@ -496,6 +733,11 @@ class LLMController:
             message = choice["message"]
             content = message.get("content")
             tool_calls = message.get("tool_calls")
+            reasoning = (
+                message.get("reasoning_content")
+                if isinstance(message.get("reasoning_content"), str)
+                else None
+            )
             if isinstance(tool_calls, list) and tool_calls:
                 raise ControllerError("Model protocol repair failed: native tool calls remained")
             if not isinstance(content, str) or not content.strip() or contains_serialized_tool_call(content):
@@ -503,6 +745,7 @@ class LLMController:
                     summary=self._protocol_failure_fallback(messages),
                     actions=[],
                     done=True,
+                    reasoning=reasoning,
                     model_usage=combined_usage,
                     model_attributions=[initial_attribution, repair_attribution],
                     completion_metadata=self._completion_metadata(
@@ -514,6 +757,7 @@ class LLMController:
                 )
             return Plan(
                 summary=content.strip(), actions=[], done=True,
+                reasoning=reasoning,
                 model_usage=combined_usage,
                 model_attributions=[initial_attribution, repair_attribution],
                 completion_metadata=self._completion_metadata(claims_complete=True),
@@ -697,6 +941,9 @@ class LLMController:
         self_prompt = context.get("self_system_prompt")
         if isinstance(self_prompt, str) and self_prompt.strip():
             sections.append("Current mutable Self map/instructions:\n" + self_prompt.strip())
+        self_goal = context.get("self_goal")
+        if isinstance(self_goal, str) and self_goal.strip():
+            sections.append("Current mutable persistent Self objective:\n" + self_goal.strip())
         if context.get("self_experiment_condition") == "positive_control":
             sections.append(
                 "POSITIVE CONTROL: You may modify your own system when doing so could improve later behavior."

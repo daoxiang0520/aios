@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -154,6 +155,12 @@ class DockerSandboxBroker:
         self.self_versions = self_versions
         self.session: SandboxSession | None = None
         self.dependencies_root = (self.root / "task_dependencies").resolve()
+        # A recoverable task failure must not publish an unverified workspace,
+        # but it also must not erase hours of valid intermediate work.  Keep a
+        # task-private snapshot outside the ephemeral Docker session tree.  A
+        # later attempt resumes from it and only ``commit`` publishes it.
+        self.task_workspaces_root = (self.root / "task_workspaces").resolve()
+        self.last_prepare_resumed = False
         self.scientific_environment = (self.root / "environments" / "scientific-py312-v1").resolve()
         self._health_state = "unknown"
         self._health_checked_at = 0.0
@@ -253,7 +260,10 @@ class DockerSandboxBroker:
         snapshot = session_root / "workspace"
         state_path = session_root / "state"
         dependencies_path = (self.dependencies_root / f"task_{task_id}").resolve()
-        shutil.copytree(workspace, snapshot, dirs_exist_ok=True)
+        task_workspace = self._task_workspace_path(task_id)
+        source = task_workspace if task_workspace.is_dir() else workspace.resolve()
+        self.last_prepare_resumed = source == task_workspace
+        shutil.copytree(source, snapshot, dirs_exist_ok=True)
         state_path.mkdir()
         dependencies_path.mkdir(parents=True, exist_ok=True)
         self.session = SandboxSession(task_id, snapshot, state_path, dependencies_path)
@@ -269,7 +279,7 @@ class DockerSandboxBroker:
             raise SandboxUnavailable("Docker sandbox is unavailable; host execution is forbidden")
         before = self._manifest(self.session.path)
         self_before = (
-            self._manifest(self.self_versions.current_path)
+            self._manifest(self.self_versions.self_path)
             if self.self_versions is not None and self.self_versions.exposed else {}
         )
         timeout = self._effective_timeout(timeout_seconds)
@@ -289,7 +299,7 @@ class DockerSandboxBroker:
         if self.skills_root is not None and self.skills_root.exists():
             args.extend(["--mount", f"type=bind,src={self.skills_root},dst=/skills,readonly"])
         if self.self_versions is not None and self.self_versions.exposed:
-            self_mount = f"type=bind,src={self.self_versions.current_path},dst=/self"
+            self_mount = f"type=bind,src={self.self_versions.self_path},dst=/self"
             if not self.self_versions.writable:
                 self_mount += ",readonly"
             args.extend([
@@ -312,7 +322,7 @@ class DockerSandboxBroker:
         after = self._manifest(self.session.path)
         changes = sorted(name for name in set(before) | set(after) if before.get(name) != after.get(name))
         if self.self_versions is not None and self.self_versions.exposed:
-            self_after = self._manifest(self.self_versions.current_path)
+            self_after = self._manifest(self.self_versions.self_path)
             changes.extend(
                 f"self:{name}" for name in sorted(set(self_before) | set(self_after))
                 if self_before.get(name) != self_after.get(name)
@@ -358,6 +368,79 @@ class DockerSandboxBroker:
             except subprocess.TimeoutExpired as exc:
                 raise TimeoutError(f"Skill benchmark exceeded {timeout}s") from exc
             return {"exit_code": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
+
+    def run_self_harness(
+        self, version: str, stage: str, payload: dict[str, Any],
+        *, timeout_seconds: int = 20,
+    ) -> dict[str, Any]:
+        """Execute the versioned Agent entrypoint without importing it into Host."""
+        if self.self_versions is None:
+            raise SandboxUnavailable("Mutable Self is not configured")
+        if re.fullmatch(r"v\d{6}", version) is None:
+            raise SandboxPolicyError("Invalid Self version")
+        source = (self.self_versions.versions / version).resolve()
+        if source.parent != self.self_versions.versions.resolve() or not source.is_dir():
+            raise SandboxPolicyError(f"Unknown Self version: {version}")
+        if stage not in {"before_model", "after_plan", "after_round"}:
+            raise SandboxPolicyError(f"Unknown Self Agent lifecycle event: {stage}")
+        agent_entrypoint = source / "agent" / "main.py"
+        legacy_entrypoint = source / "harness" / "runner.py"
+        if agent_entrypoint.is_file():
+            entrypoint = "/self/agent/main.py"
+            runtime_kind = "agent"
+        elif legacy_entrypoint.is_file():
+            entrypoint = "/self/harness/runner.py"
+            runtime_kind = "legacy_harness"
+        else:
+            raise RuntimeError("Self version has no Agent or legacy Harness entrypoint")
+        if not self.available():
+            raise SandboxUnavailable("Docker sandbox is unavailable; Self Agent cannot run on Host")
+        self.root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="self_harness_", dir=self.root) as temporary:
+            exchange = Path(temporary).resolve()
+            input_path = exchange / "input.json"
+            output_path = exchange / "output.json"
+            input_path.write_text(
+                json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8",
+            )
+            timeout = self._effective_timeout(timeout_seconds)
+            args = [
+                "docker", "run", "--rm", "--network", "none", "--read-only",
+                "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                "--memory", f"{self.config.memory_mb}m", "--cpus", str(self.config.cpus),
+                "--pids-limit", str(self.config.pids_limit),
+                "--mount", f"type=bind,src={source},dst=/self,readonly",
+                "--mount", f"type=bind,src={exchange},dst=/exchange",
+                "--tmpfs", "/tmp:rw,nosuid,size=32m",
+                self.config.image, "python", entrypoint, stage,
+                "/exchange/input.json", "/exchange/output.json",
+            ]
+            try:
+                result = subprocess.run(
+                    args, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    timeout=timeout, check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise TimeoutError(f"Self Agent lifecycle event exceeded {timeout}s") from exc
+            if result.returncode != 0:
+                detail = str(result.stderr or result.stdout)[-4000:]
+                raise RuntimeError(f"Self Agent {stage} failed: {detail}")
+            if not output_path.is_file():
+                raise RuntimeError(f"Self Agent {stage} produced no output")
+            if output_path.stat().st_size > 2_000_000:
+                raise RuntimeError(f"Self Agent {stage} output exceeds 2000000 bytes")
+            try:
+                output = json.loads(output_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Self Agent {stage} returned invalid JSON") from exc
+            if not isinstance(output, dict):
+                raise RuntimeError(f"Self Agent {stage} must return an object")
+            return {
+                "output": output, "version": version, "stage": stage,
+                "runtime_kind": runtime_kind,
+                "entrypoint": entrypoint.removeprefix("/self/"),
+                "stdout": result.stdout[-4000:], "stderr": result.stderr[-4000:],
+            }
 
     def read_resource(
         self, relative_path: str, *, kind: str, offset: int = 0,
@@ -584,6 +667,7 @@ class DockerSandboxBroker:
     def commit(self, workspace: Path) -> list[str]:
         if self.session is None:
             return []
+        task_id = self.session.task_id
         destination = workspace.resolve()
         changed: list[str] = []
         current = self._manifest(destination)
@@ -599,7 +683,54 @@ class DockerSandboxBroker:
             shutil.copy2(source, target)
             changed.append(relative)
         self.discard()
+        self.clear_task_workspace(task_id)
         return sorted(changed)
+
+    def checkpoint_task_workspace(self, task_id: int | None = None) -> dict[str, Any]:
+        """Persist the current task world without publishing it.
+
+        This is a recovery primitive, not a successful commit.  It deliberately
+        lives outside ``task_<id>`` because ``discard`` removes that ephemeral
+        session after every failed cycle.
+        """
+        if self.session is None:
+            return {"preserved": False, "reason": "no_active_session"}
+        selected = self.session.task_id if task_id is None else int(task_id)
+        if selected != self.session.task_id:
+            raise SandboxPolicyError("Active sandbox belongs to another task")
+        destination = self._task_workspace_path(selected)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.parent / f".{destination.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        if temporary.exists():
+            self._remove_tree(temporary)
+        try:
+            shutil.copytree(self.session.path, temporary)
+            if destination.exists():
+                self._remove_tree(destination)
+            os.replace(temporary, destination)
+        finally:
+            if temporary.exists():
+                self._remove_tree(temporary)
+        manifest = self._manifest(destination)
+        digest_source = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+        self.discard()
+        return {
+            "preserved": True,
+            "task_id": selected,
+            "file_count": len(manifest),
+            "manifest_digest": hashlib.sha256(digest_source.encode("utf-8")).hexdigest(),
+        }
+
+    def clear_task_workspace(self, task_id: int) -> None:
+        path = self._task_workspace_path(task_id)
+        if path.exists():
+            self._remove_tree(path)
+
+    def _task_workspace_path(self, task_id: int) -> Path:
+        path = (self.task_workspaces_root / f"task_{int(task_id)}").resolve()
+        if path.parent != self.task_workspaces_root:
+            raise SandboxPolicyError("Invalid task workspace checkpoint path")
+        return path
 
     def discard(self) -> None:
         if self.session is None:
@@ -611,7 +742,7 @@ class DockerSandboxBroker:
 
     @staticmethod
     def _remove_tree(path: Path) -> None:
-        """Remove a managed tree even when containers created Windows read-only files."""
+        """Remove a managed tree despite Windows readonly and short-lived races."""
         def make_writable_and_retry(function: Any, target: str, exc_info: Any) -> None:
             error = exc_info[1]
             if not isinstance(error, PermissionError):
@@ -619,7 +750,28 @@ class DockerSandboxBroker:
             os.chmod(target, stat.S_IWRITE | stat.S_IREAD)
             function(target)
 
-        shutil.rmtree(path, onerror=make_writable_and_retry)
+        for attempt in range(5):
+            try:
+                shutil.rmtree(path, onerror=make_writable_and_retry)
+                return
+            except FileNotFoundError:
+                return
+            except OSError as error:
+                retryable = (
+                    getattr(error, "winerror", None) in {5, 32, 145}
+                    or error.errno in {errno.EACCES, errno.EBUSY, errno.ENOTEMPTY}
+                )
+                if not retryable or attempt == 4:
+                    raise
+                # Antivirus/indexers and recently stopped containers can briefly
+                # retain directory entries. Clear attributes, yield, then retry the
+                # whole managed tree instead of treating cleanup as a task failure.
+                for target in [path, *path.rglob("*")]:
+                    try:
+                        os.chmod(target, stat.S_IWRITE | stat.S_IREAD)
+                    except OSError:
+                        pass
+                time.sleep(0.05 * (2 ** attempt))
 
     @staticmethod
     def _manifest(root: Path) -> dict[str, str]:

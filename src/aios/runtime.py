@@ -20,6 +20,7 @@ from .lineage import LineageManager
 from .memory import ContextComposer, MemoryManager
 from .plugins import PluginManager
 from .runtime_provenance import RuntimeProvenanceManager
+from .runtime_lock import RuntimeProcessLock
 from .security import SecurityKernel
 from .self_versioning import SelfVersionManager
 from .situation import SituationResolver, coverage_labels, normalize_resource_path
@@ -110,6 +111,7 @@ class AIOSRuntime:
             None if self.self_versions is not None else self.plugins,
             self.sandbox,
             self.self_versions,
+            self._agent_observe,
         )
         self.controller.set_tool_schemas(registry.schemas())
         self.security = SecurityKernel(
@@ -121,21 +123,44 @@ class AIOSRuntime:
         )
         self.runtime_provenance = RuntimeProvenanceManager(settings, self.store)
         self.shutdown_requested = False
+        self._active_observation_task_id: int | None = None
 
     def request_shutdown(self, *_: object) -> None:
         self.shutdown_requested = True
 
     def run_forever(self) -> None:
-        self.store.recover_processing_events()
-        signal.signal(signal.SIGINT, self.request_shutdown)
-        if hasattr(signal, "SIGTERM"):
-            signal.signal(signal.SIGTERM, self.request_shutdown)
-        LOGGER.info("AIOS started; database=%s workspace=%s", self.settings.database, self.settings.workspace)
-        while not self.shutdown_requested:
-            worked = self.run_once()
-            if not worked:
-                time.sleep(self.settings.poll_interval_seconds)
-        LOGGER.info("AIOS stopped")
+        with RuntimeProcessLock(self.settings.database):
+            recovered = self.store.recover_processing_events()
+            if recovered:
+                LOGGER.warning("Recovered %s interrupted runtime event(s)", recovered)
+            signal.signal(signal.SIGINT, self.request_shutdown)
+            if hasattr(signal, "SIGTERM"):
+                signal.signal(signal.SIGTERM, self.request_shutdown)
+            LOGGER.info("AIOS started; database=%s workspace=%s", self.settings.database, self.settings.workspace)
+            while not self.shutdown_requested:
+                worked = self.run_once()
+                if not worked:
+                    time.sleep(self.settings.poll_interval_seconds)
+            LOGGER.info("AIOS stopped")
+
+    def run_single(self) -> bool:
+        """Run one owned cycle with the same recovery and signal semantics as the daemon."""
+        with RuntimeProcessLock(self.settings.database):
+            recovered = self.store.recover_processing_events()
+            if recovered:
+                LOGGER.warning("Recovered %s interrupted runtime event(s)", recovered)
+            watched = [signal.SIGINT]
+            if hasattr(signal, "SIGTERM"):
+                watched.append(signal.SIGTERM)
+            previous: dict[signal.Signals, object] = {}
+            try:
+                for watched_signal in watched:
+                    previous[watched_signal] = signal.getsignal(watched_signal)
+                    signal.signal(watched_signal, self.request_shutdown)
+                return self.run_once()
+            finally:
+                for watched_signal, handler in previous.items():
+                    signal.signal(watched_signal, handler)
 
     def run_once(self) -> bool:
         model_calls_used = 0
@@ -147,9 +172,26 @@ class AIOSRuntime:
         event_ids = [int(event.id) for event in events if event.id is not None]
         self.store.trace(cycle_id, "cycle_started", {"events": [asdict(event) for event in events]})
         event = events[0]
+        recovery_context = (
+            dict(event.payload.get("self_recovery"))
+            if event.type == "SELF_RECOVERY"
+            and isinstance(event.payload.get("self_recovery"), dict)
+            else None
+        )
+        recovery_invocation = recovery_context is not None
         task: Task | None = None
+        # Keep enough live state available to the failure path to create a
+        # resumable private checkpoint.  These values are deliberately not a
+        # completion claim; they are only observed task-world state.
+        task_budget: TaskBudget | None = None
+        task_metrics: dict[str, object] = {}
+        working_state: dict[str, object] | None = None
+        all_actions: list[Action] = []
+        all_results: list[ActionResult] = []
+        final_summary = ""
         try:
             task = self._load_or_create_task(event)
+            self._active_observation_task_id = int(task.id) if task.id is not None else None
             continuation = event.type == "TASK_CONTINUE" or bool(event.payload.get("continuation"))
             terminal_statuses = {
                 TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.DEAD_LETTER,
@@ -182,7 +224,9 @@ class AIOSRuntime:
                         task.id, event.id, reason,
                     )
                     return True
-            task = self.store.start_task_attempt(int(task.id), increment_attempt=not continuation)
+            task = self.store.start_task_attempt(
+                int(task.id), increment_attempt=not continuation and not recovery_invocation,
+            )
             try:
                 self.runtime_provenance.capture_cycle(int(task.id), cycle_id)
             except Exception as provenance_error:
@@ -201,8 +245,13 @@ class AIOSRuntime:
                 "prompt_tokens": 0, "repeated_tokens": 0, "calls": 0,
             })
             task_budget.used_cycles += 1
-            self.store.add_checkpoint(int(task.id), "continued" if continuation else "started", {
+            cycle_phase = (
+                "self_recovery_started" if recovery_invocation
+                else "continued" if continuation else "started"
+            )
+            self.store.add_checkpoint(int(task.id), cycle_phase, {
                 "cycle_id": cycle_id, "attempt": task.attempts, "task_cycle": task_budget.used_cycles,
+                "recovery_invocation": recovery_invocation,
             })
             active_goals = self.goals.active()
             intent = self.arbiter.select(events, active_goals)
@@ -259,10 +308,36 @@ class AIOSRuntime:
                 )
 
             cycle_health_probe_start = self.sandbox.health_probe_count
-            snapshot = self.sandbox.prepare(int(task.id), self.settings.workspace)
+            active_self_version = None
             if self.self_versions is not None:
-                self.self_versions.begin_task(int(task.id))
+                recovery_base = (
+                    recovery_context.get("recovery_base_version")
+                    if recovery_context is not None else None
+                )
+                recovery_base = recovery_base if isinstance(recovery_base, str) else None
+                self.self_versions.begin_task(
+                    int(task.id), execution_version=recovery_base,
+                )
+                active_self_version = recovery_base or self.self_versions.current_version()
+                if recovery_invocation:
+                    started = {
+                        "task_id": int(task.id),
+                        "attempt": task.attempts,
+                        "active_self_version": active_self_version,
+                        "current_self_version": self.self_versions.current_version(),
+                        "incident_ref": recovery_context.get("incident_ref"),
+                        "trigger": recovery_context.get("trigger"),
+                        "same_self_lineage": True,
+                        "host_diagnosis": None,
+                    }
+                    self.store.trace(cycle_id, "self_recovery_started", started)
+            snapshot = self.sandbox.prepare(int(task.id), self.settings.workspace)
             task_metrics["sandbox_sessions"] = int(task_metrics.get("sandbox_sessions", 0)) + 1
+            self.store.trace(cycle_id, "task_workspace_prepared", {
+                "task_id": int(task.id),
+                "resumed_private_checkpoint": self.sandbox.last_prepare_resumed,
+                "published_to_workspace": False,
+            })
             environment_observation = None
             if any(item.name == "execution.python.scientific" for item in contract.capabilities):
                 environment_observation = self.sandbox.ensure_scientific_environment()
@@ -315,16 +390,32 @@ class AIOSRuntime:
             context["harness_version"] = harness.get("version")
             context["lineage"] = lineage
             if self.self_versions is not None:
-                context["self_system_prompt"] = self.self_versions.system_prompt()
+                context["self_system_prompt"] = self.self_versions.system_prompt(active_self_version)
+                context["self_goal"] = self.self_versions.self_goal(active_self_version)
                 context["self_experiment_condition"] = (
                     self.settings.self_modification.experiment_condition
                 )
+                active_architecture = self.self_versions.architecture(active_self_version)
                 context["self_state"] = {
                     "current_version": self.self_versions.current_version(),
+                    "active_cycle_version": active_self_version,
                     "mutable_root": "/self",
                     "exposed_after_evolve": True,
                     "transaction_open": self.self_versions.writable,
+                    "architecture": active_architecture,
                 }
+                context["self_observation"] = {
+                    "schema": "agent_observation_entrypoint/v1",
+                    "current_task_id": int(task.id),
+                    "current_cycle_id": cycle_id,
+                    "tool": "observe",
+                    "available_views": [
+                        "tasks", "task_events", "trace", "self_versions",
+                    ],
+                    "host_interpretation": None,
+                }
+                if recovery_context is not None:
+                    context["self_recovery"] = recovery_context
             if lineage is not None:
                 self.store.trace(cycle_id, "lineage_bound", {
                     "task_id": task.id, "lineage_id": lineage["lineage_id"],
@@ -369,10 +460,87 @@ class AIOSRuntime:
             budget_truncated = False
             budget_deferred = 0
             round_number = 0
+            self_restart_requested = False
+            harness_checkpoint_requested = False
+            liveness_checkpoint_requested = False
+            harness_stop_requested = False
+            self_reflection_offered = bool(
+                working_state.get("_self_reflection_offered", False)
+            )
+            in_task_reflection_rounds = working_state.setdefault(
+                "_in_task_reflection_rounds", []
+            )
+            if not isinstance(in_task_reflection_rounds, list):
+                in_task_reflection_rounds = []
+                working_state["_in_task_reflection_rounds"] = in_task_reflection_rounds
             while not self.shutdown_requested and (
                 model_round_cap is None or model_calls_used < model_round_cap
             ):
                 round_number += 1
+                # A reflection opportunity is a one-model-turn observation, never a
+                # persistent policy injection.  Post-answer opportunities are queued
+                # by the previous round; long-task opportunities are offered at the
+                # configured factual checkpoints without forcing any mutation.
+                context.pop("self_reflection", None)
+                pending_reflection = working_state.pop("_pending_self_reflection", None)
+                active_reflection = working_state.get("_active_self_reflection")
+                if (
+                    not isinstance(active_reflection, dict)
+                    and isinstance(pending_reflection, dict)
+                    and pending_reflection.get("trigger") == "runtime_liveness_checkpoint"
+                ):
+                    active_reflection = {
+                        **pending_reflection,
+                        "phase": "dedicated_self_decision",
+                        "no_change_signal": "SELF_UNCHANGED",
+                        "instruction": (
+                            "This is a dedicated decision phase for your reusable Self, not an "
+                            "ordinary task-execution turn. Use observe if you choose to inspect "
+                            "the immutable record, and interpret the selected events yourself. "
+                            "If your observation supports a reusable change, use evolve, inspect/edit /self, test, "
+                            "and commit the descendant. If it does not, return a concise final answer "
+                            "stating SELF_UNCHANGED; the Host will then resume the ordinary task. "
+                            "Do not claim that the ordinary user task is complete in this phase."
+                        ),
+                    }
+                    working_state["_active_self_reflection"] = active_reflection
+                reflection_payload = (
+                    active_reflection if isinstance(active_reflection, dict)
+                    else pending_reflection if isinstance(pending_reflection, dict) else None
+                )
+                if (
+                    reflection_payload is None
+                    and self.self_versions is not None
+                    and round_number in self.settings.self_modification.in_task_reflection_rounds
+                    and round_number not in in_task_reflection_rounds
+                    and not bool(working_state.get("_self_evolution_observed", False))
+                ):
+                    in_task_reflection_rounds.append(round_number)
+                    reflection_payload = {
+                        "schema": "self_reflection_opportunity/v1",
+                        "trigger": "in_task_checkpoint",
+                        "host_fitness_judgment": None,
+                        "mutation_required": False,
+                        "decision_owner": "ordinary_agent",
+                        "instruction": (
+                            "The ordinary task is still active. You may use observe to inspect "
+                            "immutable events and draw your own conclusions. Continue with a "
+                            "useful next action, return a final answer only if the task is "
+                            "actually complete, or use evolve only if you independently "
+                            "identify a reusable Self change. This checkpoint imposes no "
+                            "execution budget or stop."
+                        ),
+                    }
+                    self.store.trace(cycle_id, "self_reflection_offered", {
+                        "task_id": int(task.id),
+                        "round": round_number,
+                        "active_self_version": active_self_version,
+                        "trigger": "in_task_checkpoint",
+                        "host_fitness_judgment": None,
+                        "mutation_required": False,
+                    })
+                if reflection_payload is not None:
+                    context["self_reflection"] = reflection_payload
                 first_task_call = task_budget.used_model_calls == 0 and round_number == 1
                 if not first_task_call:
                     context["workspace_inventory"] = self._relevant_workspace_map(full_workspace_inventory, working_state)
@@ -382,12 +550,33 @@ class AIOSRuntime:
                         context["environment"] = {"scientific_python": "ready"}
                 context["task_working_state"] = self._working_state_projection(working_state)
                 if self.self_versions is not None:
-                    context["self_system_prompt"] = self.self_versions.system_prompt()
+                    context["self_system_prompt"] = self.self_versions.system_prompt(active_self_version)
+                    context["self_goal"] = self.self_versions.self_goal(active_self_version)
+                    active_architecture = self.self_versions.architecture(active_self_version)
                     context["self_state"] = {
                         "current_version": self.self_versions.current_version(),
+                        "active_cycle_version": active_self_version,
                         "mutable_root": "/self",
                         "exposed_after_evolve": True,
                         "transaction_open": self.self_versions.writable,
+                        "architecture": active_architecture,
+                        "in_task_reflection_rounds": list(
+                            self.settings.self_modification.in_task_reflection_rounds
+                        ),
+                    }
+                    # The Host exposes only stable observation coordinates.  It does
+                    # not preselect metrics or turn them into an efficiency diagnosis.
+                    # The ordinary Agent may call `observe` whenever it chooses and
+                    # decide which immutable events are relevant.
+                    context["self_observation"] = {
+                        "schema": "agent_observation_entrypoint/v1",
+                        "current_task_id": int(task.id),
+                        "current_cycle_id": cycle_id,
+                        "tool": "observe",
+                        "available_views": [
+                            "tasks", "task_events", "trace", "self_versions",
+                        ],
+                        "host_interpretation": None,
                     }
                 context["situation_map"] = self.situations.resolve(
                     task.request, full_workspace_inventory, contract, working_state, full_skills,
@@ -458,10 +647,48 @@ class AIOSRuntime:
                 }
                 context["_protocol_messages"] = protocol_messages
                 model_context = self._harness_context_projection(context, harness_settings)
+                if self.self_versions is not None and active_self_version is not None:
+                    harness_run = self.sandbox.run_self_harness(
+                        active_self_version, "before_model", {
+                            "context": model_context,
+                            "state": {
+                                "task_id": int(task.id), "round": round_number,
+                                "cycle_id": cycle_id,
+                            },
+                        },
+                    )
+                    candidate_context = harness_run["output"].get("context")
+                    if not isinstance(candidate_context, dict):
+                        raise RuntimeError("Self Harness before_model returned no context object")
+                    model_context = candidate_context
+                    model_context["harness"] = {"harness_profile": "minimal_self"}
+                    self.store.trace(cycle_id, self._self_runtime_trace_kind(harness_run), {
+                        "task_id": int(task.id), "round": round_number,
+                        "stage": "before_model", "self_version": active_self_version,
+                        "entrypoint": harness_run.get("entrypoint"),
+                        "context_keys": sorted(str(key) for key in model_context),
+                    })
                 plan = self.controller.plan(intent, active_goals, model_context)
                 model_usage = plan.model_usage or {}
                 model_calls_used += int(model_usage.get("model_calls", 1))
                 model_tokens_total += int(model_usage.get("total_tokens", 0))
+                if isinstance(plan.reasoning, str) and plan.reasoning.strip():
+                    raw_reasoning = plan.reasoning.strip()
+                    redacted_reasoning = self._redact_incident_text(raw_reasoning)
+                    reasoning_limit = 16_000
+                    reasoning_text = redacted_reasoning[:reasoning_limit]
+                    self.store.trace(cycle_id, "model_reasoning", {
+                        "task_id": int(task.id),
+                        "task_cycle": task_budget.used_cycles,
+                        "round": round_number,
+                        "reasoning": reasoning_text,
+                        "reasoning_excerpt": reasoning_text[:500],
+                        "original_characters": len(raw_reasoning),
+                        "recorded_characters": len(reasoning_text),
+                        "truncated": len(redacted_reasoning) > reasoning_limit,
+                        "source": "provider_reasoning_content",
+                        "interpretation": "model_self_report_not_host_diagnosis",
+                    })
                 for attribution in plan.model_attributions:
                     repeated_tokens = 0
                     attribution_blocks = attribution.get("blocks", {})
@@ -490,6 +717,42 @@ class AIOSRuntime:
                     })
                 if plan.protocol_message:
                     protocol_messages.append(plan.protocol_message)
+                dedicated_self_decision = bool(
+                    isinstance(reflection_payload, dict)
+                    and reflection_payload.get("phase") == "dedicated_self_decision"
+                )
+                if dedicated_self_decision and plan.done and not plan.actions:
+                    if self.self_versions is not None and self.self_versions.writable:
+                        working_state["_active_self_reflection"] = {
+                            **reflection_payload,
+                            "instruction": (
+                                "A Self transaction is still open. Commit it with evolve after "
+                                "testing, or abort it explicitly; a prose answer cannot close the "
+                                "transaction or complete the ordinary task."
+                            ),
+                        }
+                        self.store.trace(cycle_id, "self_reflection_decision_deferred", {
+                            "task_id": int(task.id), "round": round_number,
+                            "reason": "self_transaction_open",
+                            "model_summary": plan.summary[:2000],
+                        })
+                        continue
+                    working_state.pop("_active_self_reflection", None)
+                    working_state.pop("liveness", None)
+                    working_state["_self_reflection_cooldown_remaining"] = int(
+                        self.settings.self_modification.reflection_cooldown_checkpoints
+                    )
+                    self.store.trace(cycle_id, "self_reflection_resolved", {
+                        "task_id": int(task.id),
+                        "round": round_number,
+                        "trigger": "runtime_liveness_checkpoint",
+                        "self_evolution_observed": False,
+                        "agent_stopped": False,
+                        "ordinary_task_resumed": True,
+                        "model_summary": plan.summary[:2000],
+                        "host_fitness_judgment": None,
+                    })
+                    continue
                 final_summary = plan.summary
                 completion_metadata = plan.completion_metadata
                 working_state["semantic_state"] = {"latest_model_summary": plan.summary[:2000]}
@@ -501,6 +764,38 @@ class AIOSRuntime:
                     remaining_before_round,
                     reserved,
                 )
+                if self.self_versions is not None and active_self_version is not None and actions:
+                    original_actions = [asdict(action) for action in actions]
+                    harness_run = self.sandbox.run_self_harness(
+                        active_self_version, "after_plan", {
+                            "actions": original_actions,
+                            "state": {
+                                "task_id": int(task.id), "round": round_number,
+                                "cycle_id": cycle_id, "summary": plan.summary,
+                                "objective": task.request[:4000],
+                            },
+                        },
+                    )
+                    agent_output = harness_run["output"]
+                    selected_actions = agent_output.get("actions")
+                    autonomous_actions = agent_output.get("autonomous_actions", [])
+                    autonomous_limit = (
+                        max(0, remaining_before_round - len(actions))
+                        if remaining_before_round is not None else 8
+                    )
+                    actions = self._self_harness_actions(
+                        actions, selected_actions, autonomous_actions,
+                        max_autonomous_actions=min(8, autonomous_limit),
+                    )
+                    self.store.trace(cycle_id, self._self_runtime_trace_kind(harness_run), {
+                        "task_id": int(task.id), "round": round_number,
+                        "stage": "after_plan", "self_version": active_self_version,
+                        "entrypoint": harness_run.get("entrypoint"),
+                        "changed": original_actions != [asdict(action) for action in actions],
+                        "autonomous_action_count": max(0, len(actions) - len(original_actions)),
+                        "model_actions": original_actions,
+                        "effective_actions": [asdict(action) for action in actions],
+                    })
                 if skill_authoring is not None and not skill_candidate_written:
                     authoring_writes = [
                         action for action in actions if action.tool in {"write", "write_file"}
@@ -519,6 +814,7 @@ class AIOSRuntime:
                     "done": plan.done,
                     "actions": [asdict(action) for action in actions],
                     "completion_metadata": completion_metadata,
+                    "model_usage": model_usage,
                 }
                 rounds.append(plan_data)
                 self.store.trace(cycle_id, "plan_created", plan_data)
@@ -596,7 +892,30 @@ class AIOSRuntime:
                     result_data = {"round": round_number, **asdict(result)}
                     result_trace_id = self.store.trace(cycle_id, "action_result", result_data)
                     if action.tool == "evolve" and result.ok:
-                        self.store.trace(cycle_id, "self_version_opened", {
+                        # Persist this fact across a commit/restart so a task which
+                        # already chose Self modification is not given a redundant
+                        # post-answer reflection turn on its descendant.
+                        working_state["_self_evolution_observed"] = True
+                        operation = (
+                            str(result.output.get("operation", "open"))
+                            if isinstance(result.output, dict) else "open"
+                        )
+                        restart_required = bool(
+                            isinstance(result.output, dict)
+                            and result.output.get("restart_required")
+                        )
+                        if operation == "commit":
+                            working_state.pop("_active_self_reflection", None)
+                            working_state.pop("liveness", None)
+                            working_state["_self_reflection_cooldown_remaining"] = int(
+                                self.settings.self_modification.reflection_cooldown_checkpoints
+                            )
+                        self_restart_requested = self_restart_requested or restart_required
+                        trace_kind = {
+                            "commit": "self_version_committed",
+                            "abort": "self_version_aborted",
+                        }.get(operation, "self_version_opened")
+                        self.store.trace(cycle_id, trace_kind, {
                             "task_id": int(task.id), "round": round_number,
                             "result_ref": f"trace:{result_trace_id}",
                             "version": result.output.get("version")
@@ -604,6 +923,8 @@ class AIOSRuntime:
                             "parent_version": result.output.get("parent_version")
                             if isinstance(result.output, dict) else None,
                             "host_evaluation_started": False,
+                            "operation": operation,
+                            "restart_required": restart_required,
                         })
                     cache_metadata = (
                         result.output.get("observation_cache")
@@ -732,8 +1053,64 @@ class AIOSRuntime:
                 self._retain_hot_protocol_rounds(
                     protocol_messages, self.settings.budget.hot_tool_results
                 )
+                if any(
+                    self._is_workspace_change(action, result)
+                    for action, result in zip(actions, round_results, strict=False)
+                ):
+                    task_metrics["workspace_change_actions"] = int(
+                        task_metrics.get("workspace_change_actions", 0)
+                    ) + sum(
+                        self._is_workspace_change(action, result)
+                        for action, result in zip(actions, round_results, strict=False)
+                    )
+                    task_metrics["rounds_since_workspace_change"] = 0
+                else:
+                    task_metrics["rounds_since_workspace_change"] = int(
+                        task_metrics.get("rounds_since_workspace_change", 0)
+                    ) + 1
                 has_final_action = any(action.tool in {"write", "edit", "echo", "write_file", "append_file"} for action in actions)
                 task_done = bool(plan.done and (has_final_action or not actions))
+                if (
+                    task_done
+                    and self.self_versions is not None
+                    and not self_reflection_offered
+                    and int(working_state.get(
+                        "_self_reflection_cooldown_remaining", 0
+                    ) or 0) <= 0
+                ):
+                    # The ordinary Agent, not a second Evolution Agent, gets one
+                    # post-answer opportunity to inspect factual consequences and
+                    # either stop unchanged or create a reversible descendant.
+                    # This is deliberately offered for every eligible task: the
+                    # Host does not diagnose which observations deserve mutation.
+                    self_reflection_offered = True
+                    working_state["_self_reflection_offered"] = True
+                    working_state["_pending_agent_answer"] = plan.summary[:20_000]
+                    working_state["pending"] = ["decide_self_change_or_stop"]
+                    working_state["_pending_self_reflection"] = {
+                        "schema": "self_reflection_opportunity/v1",
+                        "trigger": "agent_declared_stop",
+                        "host_fitness_judgment": None,
+                        "mutation_required": False,
+                        "decision_owner": "ordinary_agent",
+                        "instruction": (
+                            "The ordinary task answer is pending. You may inspect immutable "
+                            "task events with observe and interpret them yourself. Return a "
+                            "final answer to stop unchanged, or use evolve only if you independently identify a reusable "
+                            "change worth carrying into later tasks. Do not repeat completed "
+                            "task work merely to gain certainty."
+                        ),
+                    }
+                    self.store.trace(cycle_id, "self_reflection_offered", {
+                        "task_id": int(task.id),
+                        "round": round_number,
+                        "active_self_version": active_self_version,
+                        "trigger": "agent_declared_stop",
+                        "host_fitness_judgment": None,
+                        "mutation_required": False,
+                    })
+                    task_done = False
+                    continue
                 if task_done and self.settings.runtime.completion_mode == "verified":
                     provisional_situation = self.situations.resolve(
                         task.request, full_workspace_inventory, contract, working_state, full_skills,
@@ -764,9 +1141,155 @@ class AIOSRuntime:
                             "coverage": provisional_coverage,
                         })
                         continue
+                if (
+                    self.self_versions is not None
+                    and active_self_version is not None
+                    and not task_done
+                    and not self_restart_requested
+                ):
+                    harness_run = self.sandbox.run_self_harness(
+                        active_self_version, "after_round", {
+                            "state": {
+                                "task_id": int(task.id), "round": round_number,
+                                "cycle_id": cycle_id, "plan_done": plan.done,
+                                "actions": [asdict(action) for action in actions],
+                                "results": [asdict(result) for result in round_results],
+                                "unresolved_failures": list(
+                                    working_state.get("unresolved_failures", [])
+                                ),
+                            },
+                        },
+                    )
+                    harness_output = harness_run["output"]
+                    loop_decision = harness_output.get("loop", {})
+                    continuation_decision = harness_output.get("continuation", {})
+                    if not isinstance(loop_decision, dict) or not isinstance(
+                        continuation_decision, dict
+                    ):
+                        raise RuntimeError("Self Harness after_round returned invalid decisions")
+                    harness_stop_requested = loop_decision.get("allow_another_round") is False
+                    harness_checkpoint_requested = bool(
+                        continuation_decision.get("checkpoint", False)
+                    )
+                    self.store.trace(cycle_id, self._self_runtime_trace_kind(harness_run), {
+                        "task_id": int(task.id), "round": round_number,
+                        "stage": "after_round", "self_version": active_self_version,
+                        "entrypoint": harness_run.get("entrypoint"),
+                        "loop": loop_decision, "continuation": continuation_decision,
+                    })
                 if task_done:
                     working_state["pending"] = []
+                    if self_reflection_offered:
+                        self.store.trace(cycle_id, "self_reflection_resolved", {
+                            "task_id": int(task.id),
+                            "round": round_number,
+                            "self_evolution_observed": bool(
+                                working_state.get("_self_evolution_observed", False)
+                            ),
+                            "agent_stopped": True,
+                        })
                 if task_done:
+                    break
+                liveness_rounds = self.settings.runtime.liveness_checkpoint_rounds
+                if (
+                    not task_budget.enabled
+                    and liveness_rounds > 0
+                    and round_number >= liveness_rounds
+                    and not self_restart_requested
+                    and not harness_checkpoint_requested
+                    and not harness_stop_requested
+                ):
+                    liveness_checkpoint_requested = True
+                    task_metrics["liveness_checkpoints"] = int(
+                        task_metrics.get("liveness_checkpoints", 0)
+                    ) + 1
+                    liveness_facts = {
+                        "rounds_in_cycle": round_number,
+                        "model_calls_in_cycle": model_calls_used,
+                        "tool_calls_in_cycle": len(all_results),
+                        "successful_tool_calls_in_cycle": sum(item.ok for item in all_results),
+                        "failed_tool_calls_in_cycle": sum(not item.ok for item in all_results),
+                        "workspace_change_actions_in_cycle": sum(
+                            self._is_workspace_change(action, result)
+                            for action, result in zip(all_actions, all_results, strict=False)
+                        ),
+                        "rounds_since_workspace_change": task_metrics.get(
+                            "rounds_since_workspace_change", 0
+                        ),
+                    }
+                    working_state["liveness"] = liveness_facts
+                    liveness_trace_id = self.store.trace(
+                        cycle_id, "liveness_checkpoint_requested", {
+                            "task_id": int(task.id),
+                            "round": round_number,
+                            "observed": liveness_facts,
+                            "budget_limits_enabled": False,
+                        },
+                    )
+                    if dedicated_self_decision:
+                        if not (
+                            self.self_versions is not None
+                            and self.self_versions.writable
+                        ):
+                            # A dedicated reflection is a bounded opportunity, not
+                            # a second task that can recursively schedule itself.
+                            # Without a concrete draft, return control to ordinary
+                            # task execution at the next fresh-context cycle.
+                            working_state.pop("_active_self_reflection", None)
+                            working_state.pop("_pending_self_reflection", None)
+                            working_state.pop("liveness", None)
+                            working_state["_self_reflection_cooldown_remaining"] = int(
+                                self.settings.self_modification.reflection_cooldown_checkpoints
+                            )
+                            self.store.trace(
+                                cycle_id, "self_reflection_window_exhausted", {
+                                    "task_id": int(task.id),
+                                    "round": round_number,
+                                    "ordinary_task_resumed_next_cycle": True,
+                                    "self_evolution_observed": False,
+                                    "host_fitness_judgment": None,
+                                },
+                            )
+                        # If a draft is open, _active_self_reflection and the
+                        # durable Self transaction remain available next cycle.
+                        # Never create a nested reflection request here.
+                    else:
+                        cooldown_remaining = int(working_state.get(
+                            "_self_reflection_cooldown_remaining", 0
+                        ) or 0)
+                        if cooldown_remaining > 0:
+                            working_state["_self_reflection_cooldown_remaining"] = (
+                                cooldown_remaining - 1
+                            )
+                            self.store.trace(
+                                cycle_id, "self_reflection_cooldown_advanced", {
+                                    "task_id": int(task.id),
+                                    "remaining_before": cooldown_remaining,
+                                    "remaining_after": cooldown_remaining - 1,
+                                    "host_fitness_judgment": None,
+                                },
+                            )
+                        else:
+                            working_state["_pending_self_reflection"] = {
+                                "schema": "self_reflection_opportunity/v1",
+                                "trigger": "runtime_liveness_checkpoint",
+                                "host_fitness_judgment": None,
+                                "mutation_required": False,
+                                "decision_owner": "ordinary_agent",
+                                "observation_entrypoint": {
+                                    "tool": "observe", "task_id": int(task.id),
+                                    "checkpoint_ref": f"trace:{liveness_trace_id}",
+                                },
+                                "instruction": (
+                                    "A fresh-context continuation boundary was reached. Use the read-only "
+                                    "observe tool if you choose to inspect what happened; select and "
+                                    "interpret the immutable events yourself. Continue the task, stop if "
+                                    "the objective is actually satisfied, or use evolve only if your own "
+                                    "observation supports a reusable Self change."
+                                ),
+                            }
+                    break
+                if self_restart_requested or harness_checkpoint_requested or harness_stop_requested:
                     break
                 if not actions and not deferred_actions:
                     break
@@ -820,10 +1343,23 @@ class AIOSRuntime:
                 and remaining_task_budget["tokens"] > 0
                 and remaining_task_budget["cycles"] > 0
             )
+            can_continue = (
+                can_continue
+                or self_restart_requested
+                or harness_checkpoint_requested
+                or liveness_checkpoint_requested
+            )
             shutdown_deferred = self.shutdown_requested and not task_done
             can_continue = can_continue or shutdown_deferred
             if can_continue:
-                continuation_reason = "shutdown_requested" if shutdown_deferred else "cycle_budget"
+                if self_restart_requested:
+                    continuation_reason = "self_version_commit"
+                elif harness_checkpoint_requested:
+                    continuation_reason = "self_harness_checkpoint"
+                elif liveness_checkpoint_requested:
+                    continuation_reason = "runtime_liveness_checkpoint"
+                else:
+                    continuation_reason = "shutdown_requested" if shutdown_deferred else "cycle_budget"
                 checkpoint = {
                     "continuation_reason": continuation_reason,
                     "cycle_id": cycle_id,
@@ -848,7 +1384,14 @@ class AIOSRuntime:
                     "cycle_id": cycle_id,
                     "summary": (
                         "Runtime shutdown requested; task checkpointed for continuation"
-                        if shutdown_deferred else "Cycle budget reached; task checkpointed for continuation"
+                        if shutdown_deferred else
+                        "Self version committed; task checkpointed to restart on the descendant"
+                        if self_restart_requested else
+                        "Self Harness requested a checkpoint continuation"
+                        if harness_checkpoint_requested else
+                        "Runtime liveness boundary reached; task checkpointed for fresh-context continuation"
+                        if liveness_checkpoint_requested else
+                        "Cycle budget reached; task checkpointed for continuation"
                     ),
                     "continuation_reason": continuation_reason,
                     "checkpoint_id": checkpoint_id,
@@ -857,7 +1400,7 @@ class AIOSRuntime:
                     "evidence": {
                         "success": False, "terminal": False,
                         "budget_limits_enabled": task_budget.enabled,
-                        "budget_deferred": not shutdown_deferred,
+                        "budget_deferred": continuation_reason == "cycle_budget",
                     },
                 }
                 self.store.finalize_skill_usage(
@@ -877,6 +1420,19 @@ class AIOSRuntime:
                     "continuation_decision": continuation_decision,
                     "remaining": remaining_task_budget,
                 })
+                if recovery_invocation:
+                    self.store.trace(cycle_id, "self_recovery_checkpointed", {
+                        "task_id": int(task.id),
+                        "active_self_version": active_self_version,
+                        "current_self_version": (
+                            self.self_versions.current_version()
+                            if self.self_versions is not None else None
+                        ),
+                        "continuation_reason": continuation_reason,
+                        "self_evolution_observed": bool(
+                            working_state.get("_self_evolution_observed", False)
+                        ),
+                    })
                 LOGGER.info(
                     "Task %s deferred (%s); checkpoint %s, continuation event %s queued",
                     task.id, continuation_reason, checkpoint_id, continue_id,
@@ -949,6 +1505,17 @@ class AIOSRuntime:
                     "established_evidence": list(working_state.get("evidence_ledger", [])),
                 }
                 self.store.trace(cycle_id, "agent_stop_observation", evidence)
+                if recovery_invocation:
+                    self.store.trace(cycle_id, "self_recovery_resolved", {
+                        "task_id": int(task.id),
+                        "outcome": "agent_declared_stop" if task_done else "agent_yielded",
+                        "active_self_version": active_self_version,
+                        "current_self_version": self.self_versions.current_version(),
+                        "self_evolution_observed": bool(
+                            working_state.get("_self_evolution_observed", False)
+                        ),
+                        "host_fitness_judgment": None,
+                    })
                 task_result = {
                     "cycle_id": cycle_id, "summary": final_summary,
                     "user_message": canonical_answer.user_message,
@@ -964,8 +1531,19 @@ class AIOSRuntime:
                 if self.self_versions is not None:
                     task_result["self_modification"] = {
                         "current_version": self.self_versions.current_version(),
+                        "active_cycle_version": active_self_version,
                         "transaction_opened": self.self_versions.writable,
                         "experiment_condition": self.settings.self_modification.experiment_condition,
+                        "reflection_offered": self_reflection_offered,
+                        "in_task_reflection_rounds": list(in_task_reflection_rounds),
+                        "evolution_observed": bool(
+                            working_state.get("_self_evolution_observed", False)
+                        ),
+                        "recovery_invocation": recovery_invocation,
+                        "recovery_incident_ref": (
+                            recovery_context.get("incident_ref")
+                            if recovery_context is not None else None
+                        ),
                     }
                 committed = self.sandbox.commit(self.settings.workspace)
                 canonical_answer.mark_committed()
@@ -1186,7 +1764,11 @@ class AIOSRuntime:
                 self.sandbox.purge_task_dependencies(int(task.id))
                 LOGGER.warning("Task %s completed in degraded state; memory write suppressed", task.id)
             else:
-                self.sandbox.discard()
+                workspace_checkpoint = self._checkpoint_failure_workspace(
+                    int(task.id), cycle_id
+                )
+                task_result["workspace_checkpoint"] = workspace_checkpoint
+                task_result["task_metrics"] = dict(task_metrics)
                 error = "; ".join(result.error or "unknown error" for result in all_results if not result.ok)
                 if not error:
                     failed_checks = [
@@ -1202,33 +1784,115 @@ class AIOSRuntime:
         except ControllerError as exc:
             model_calls_used += int(exc.model_usage.get("model_calls", 0))
             model_tokens_total += int(exc.model_usage.get("total_tokens", 0))
-            self.sandbox.discard()
+            failure_result = self._partial_failure_result(
+                task, cycle_id, final_summary, working_state, task_metrics,
+                all_actions, all_results, task_budget,
+                model_calls_used=model_calls_used,
+                model_tokens_total=model_tokens_total,
+            )
             LOGGER.warning("Cycle %s rejected model response: %s", cycle_id, exc)
-            self.store.trace(cycle_id, "cycle_failed", {"error": f"{type(exc).__name__}: {exc}"})
+            self.store.trace(cycle_id, "cycle_failed", {
+                "error": f"{type(exc).__name__}: {exc}",
+                "failed_call_usage": dict(exc.model_usage),
+                "workspace_checkpoint": failure_result.get("workspace_checkpoint"),
+            })
             error = f"{type(exc).__name__}: {exc}"
             if task is None:
                 self.store.finish_events(event_ids, error=error)
             else:
                 self._handle_failure(
-                    task, event, event_ids, error, cycle_id,
+                    task, event, event_ids, error, cycle_id, failure_result,
                     model_calls_after=model_calls_used,
                     tokens_after=model_tokens_total,
                 )
             return True
         except Exception as exc:
-            self.sandbox.discard()
+            failure_result = self._partial_failure_result(
+                task, cycle_id, final_summary, working_state, task_metrics,
+                all_actions, all_results, task_budget,
+                model_calls_used=model_calls_used,
+                model_tokens_total=model_tokens_total,
+            )
             LOGGER.exception("Cycle %s failed", cycle_id)
-            self.store.trace(cycle_id, "cycle_failed", {"error": f"{type(exc).__name__}: {exc}"})
+            self.store.trace(cycle_id, "cycle_failed", {
+                "error": f"{type(exc).__name__}: {exc}",
+                "workspace_checkpoint": failure_result.get("workspace_checkpoint"),
+            })
             error = f"{type(exc).__name__}: {exc}"
             if task is None:
                 self.store.finish_events(event_ids, error=error)
             else:
                 self._handle_failure(
-                    task, event, event_ids, error, cycle_id,
+                    task, event, event_ids, error, cycle_id, failure_result,
                     model_calls_after=model_calls_used,
                     tokens_after=model_tokens_total,
                 )
             return True
+
+    def _partial_failure_result(
+        self,
+        task: Task | None,
+        cycle_id: str,
+        summary: str,
+        working_state: dict[str, object] | None,
+        metrics: dict[str, object],
+        actions: list[Action],
+        results: list[ActionResult],
+        budget: TaskBudget | None,
+        *,
+        model_calls_used: int,
+        model_tokens_total: int,
+    ) -> dict[str, object]:
+        if budget is not None:
+            budget.used_model_calls += model_calls_used
+            budget.used_tool_calls += len(results)
+            budget.used_tokens += model_tokens_total
+        workspace_checkpoint = (
+            self._checkpoint_failure_workspace(int(task.id), cycle_id)
+            if task is not None and task.id is not None
+            else {"preserved": False, "reason": "no_task"}
+        )
+        state = (
+            self._working_state_projection(working_state)
+            if isinstance(working_state, dict)
+            else None
+        )
+        return {
+            "cycle_id": cycle_id,
+            "summary": summary,
+            "actions": [asdict(action) for action in actions],
+            "action_results": [asdict(result) for result in results],
+            "task_working_state": state,
+            "task_metrics": dict(metrics),
+            "task_budget": asdict(budget) if budget is not None else None,
+            "workspace_checkpoint": workspace_checkpoint,
+            "evidence": {
+                "success": False,
+                "terminal": False,
+                "cycle_model_api_calls": model_calls_used,
+                "cycle_model_tokens": model_tokens_total,
+                "executed_actions": len(results),
+                "failed_actions": sum(not result.ok for result in results),
+            },
+        }
+
+    def _checkpoint_failure_workspace(
+        self, task_id: int, cycle_id: str,
+    ) -> dict[str, object]:
+        try:
+            checkpoint = self.sandbox.checkpoint_task_workspace(task_id)
+        except Exception as exc:
+            self.sandbox.discard()
+            checkpoint = {
+                "preserved": False,
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+        self.store.trace(cycle_id, "task_workspace_checkpointed", {
+            "task_id": task_id,
+            **checkpoint,
+            "published_to_production": False,
+        })
+        return checkpoint
 
     @staticmethod
     def _skill_candidate_written(actions: list, results: list) -> bool:
@@ -1289,6 +1953,22 @@ class AIOSRuntime:
                 if path:
                     return str(path)
         return summary
+
+    @staticmethod
+    def _is_workspace_change(action: object, result: object) -> bool:
+        """Return a factual durable-world change signal without judging its quality."""
+        if not bool(getattr(result, "ok", False)):
+            return False
+        tool = str(getattr(action, "tool", ""))
+        if tool in {"write", "write_file", "edit", "append_file", "evolve"}:
+            return True
+        output = getattr(result, "output", None)
+        return bool(
+            tool == "bash"
+            and isinstance(output, dict)
+            and isinstance(output.get("changes"), list)
+            and output["changes"]
+        )
 
     def _published_output(self, output: str, snapshot: object) -> str:
         from pathlib import Path
@@ -1375,14 +2055,19 @@ class AIOSRuntime:
                 text = str(output_summary)
             else:
                 text = str(output)
-            compact.append({
+            entry = {
                 "round": item.get("round"),
                 "tool": action.get("tool"),
                 "arguments": cls._bounded_value(action.get("arguments", {}), 1000),
                 "ok": result.get("ok"),
                 "error": cls._bounded_value(result.get("error"), 1000),
                 "output_summary": text[:2000],
-            })
+            }
+            if action.get("tool") == "observe" and isinstance(output, dict):
+                # `observe` is already bounded at its source.  Preserve its factual
+                # payload so the Agent can reason from what it chose to inspect.
+                entry["observation"] = cls._bounded_value(output, 8000)
+            compact.append(entry)
         return compact
 
     @staticmethod
@@ -1449,11 +2134,16 @@ class AIOSRuntime:
             "protocol_repair_tokens": 0,
             "failed_tool_calls": 0,
             "post_failure_tool_changes": 0,
+            "workspace_change_actions": 0,
+            "rounds_since_workspace_change": 0,
+            "liveness_checkpoints": 0,
         }
         for checkpoint in reversed(self.store.task_checkpoints(task_id)):
             if checkpoint["phase"] == "retry_reset":
+                if checkpoint["data"].get("preserve_working_state"):
+                    continue
                 break
-            if checkpoint["phase"] == "budget_deferred":
+            if checkpoint["phase"] in {"budget_deferred", "failed_attempt"}:
                 saved = checkpoint["data"].get("metrics", {})
                 if isinstance(saved, dict):
                     metrics.update({key: saved[key] for key in metrics if key in saved})
@@ -1463,12 +2153,22 @@ class AIOSRuntime:
     def _task_working_state(self, task_id: int, objective: str) -> dict[str, object]:
         for checkpoint in reversed(self.store.task_checkpoints(task_id)):
             if checkpoint["phase"] == "retry_reset":
+                if checkpoint["data"].get("preserve_working_state"):
+                    continue
                 break
             if checkpoint["phase"] in {"budget_deferred", "failed_attempt"}:
                 state = checkpoint["data"].get("working_state")
                 if isinstance(state, dict):
                     upgraded = self._upgrade_working_state(state)
                     if checkpoint["phase"] == "failed_attempt":
+                        workspace_checkpoint = checkpoint["data"].get(
+                            "workspace_checkpoint", {}
+                        )
+                        if (
+                            isinstance(workspace_checkpoint, dict)
+                            and workspace_checkpoint.get("preserved")
+                        ):
+                            return upgraded
                         return self._sanitize_retry_state(upgraded)
                     return upgraded
         return self._upgrade_working_state({
@@ -1602,11 +2302,18 @@ class AIOSRuntime:
         if profile == "minimal_self":
             projected = {
                 key: context[key] for key in (
-                    "workspace_inventory", "retrieved_memories", "harness", "budget", "observations",
+                    "workspace_inventory", "retrieved_memories", "harness", "budget",
                     "round", "_protocol_messages", "self_system_prompt",
-                    "self_experiment_condition", "self_state",
+                    "self_goal", "self_experiment_condition", "self_state",
+                    "self_observation", "self_reflection", "self_recovery",
                 ) if key in context
             }
+            observations = context.get("observations")
+            if isinstance(observations, list):
+                # Raw action results are immutable trace evidence, not bounded model
+                # context.  In particular, a command may legitimately emit several
+                # megabytes; never make a pass-through Self Harness copy that payload.
+                projected["observations"] = AIOSRuntime._compact_observations(observations)
             state = context.get("task_working_state")
             if isinstance(state, dict):
                 projected["task_working_state"] = {
@@ -1617,6 +2324,127 @@ class AIOSRuntime:
                 }
             return projected
         return context
+
+    def _agent_observe(
+        self, *, view: str, task_id: int | None = None, ref: str | None = None,
+        after_id: int = 0, offset: int = 0, limit: int | None = None,
+    ) -> dict[str, object]:
+        """Expose bounded stored observations while leaving all interpretation to Self."""
+        selected_task_id = task_id or self._active_observation_task_id
+        if view == "tasks":
+            bounded = max(1, min(int(limit or 20), 50))
+            return {
+                "schema": "agent_observation/v1", "view": view,
+                "host_interpretation": None,
+                "tasks": [
+                    {
+                        "task_id": item.id, "title": item.title,
+                        "request_prefix": item.request[:1000],
+                        "request_characters": len(item.request),
+                        "status": item.status.value, "attempts": item.attempts,
+                        "created_at": item.created_at, "updated_at": item.updated_at,
+                    }
+                    for item in self.store.list_tasks(limit=bounded)
+                ],
+            }
+        if view == "self_versions":
+            versions = (
+                self.self_versions.versions_summary()
+                if self.self_versions is not None else []
+            )
+            return {
+                "schema": "agent_observation/v1", "view": view,
+                "host_interpretation": None, "versions": versions,
+            }
+        if selected_task_id is None:
+            raise ValueError("task_id is required outside an active task")
+        if self.store.get_task(int(selected_task_id)) is None:
+            raise ValueError(f"Unknown task: {selected_task_id}")
+        if view == "task_events":
+            catalog = self.store.task_trace_catalog(
+                int(selected_task_id), after_id=after_id,
+                limit=max(1, min(int(limit or 50), 100)),
+            )
+            return {
+                "schema": "agent_observation/v1", "view": view,
+                "host_interpretation": None, **catalog,
+            }
+        if view == "trace":
+            if not isinstance(ref, str) or not ref.startswith("trace:"):
+                raise ValueError("trace view requires ref='trace:<integer>'")
+            try:
+                trace_id = int(ref.split(":", 1)[1])
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Invalid trace reference") from exc
+            record = self.store.task_trace_record(int(selected_task_id), trace_id)
+            if record is None:
+                raise ValueError("Trace does not belong to the selected task")
+            raw = str(record.pop("data"))
+            bounded_offset = max(0, int(offset))
+            bounded_limit = max(1, min(int(limit or 8000), 12_000))
+            content = raw[bounded_offset:bounded_offset + bounded_limit]
+            return {
+                "schema": "agent_observation/v1", "view": view,
+                "host_interpretation": None, "task_id": int(selected_task_id),
+                "ref": f"trace:{trace_id}", **record,
+                "offset": bounded_offset, "limit": bounded_limit,
+                "total_characters": len(raw), "content": content,
+                "truncated": bounded_offset + len(content) < len(raw),
+                "next_offset": bounded_offset + len(content),
+            }
+        raise ValueError(f"Unknown observation view: {view}")
+
+    @staticmethod
+    def _self_harness_actions(
+        original: list[Action], selected: object, autonomous: object = None,
+        *, max_autonomous_actions: int = 0,
+    ) -> list[Action]:
+        """Route model calls and admit bounded actions authored by Self code."""
+        if not isinstance(selected, list) or len(selected) != len(original):
+            raise RuntimeError(
+                "Self Harness tool_policy must return exactly one action per model tool call"
+            )
+        result: list[Action] = []
+        for source, value in zip(original, selected, strict=True):
+            if not isinstance(value, dict):
+                raise RuntimeError("Self Harness tool_policy actions must be objects")
+            tool = value.get("tool")
+            arguments = value.get("arguments", {})
+            if not isinstance(tool, str) or not isinstance(arguments, dict):
+                raise RuntimeError("Self Harness tool_policy returned an invalid action")
+            result.append(Action(
+                tool=tool,
+                arguments=arguments,
+                reason=str(value.get("reason") or source.reason)[:2000],
+                call_id=source.call_id,
+            ))
+        additional = [] if autonomous is None else autonomous
+        if not isinstance(additional, list):
+            raise RuntimeError("Self Agent autonomous_actions must be an array")
+        if len(additional) > max(0, int(max_autonomous_actions)):
+            raise RuntimeError("Self Agent autonomous_actions exceed the Host hard per-round ceiling")
+        for value in additional:
+            if not isinstance(value, dict):
+                raise RuntimeError("Self Agent autonomous actions must be objects")
+            tool = value.get("tool")
+            arguments = value.get("arguments", {})
+            if not isinstance(tool, str) or not isinstance(arguments, dict):
+                raise RuntimeError("Self Agent returned an invalid autonomous action")
+            result.append(Action(
+                tool=tool,
+                arguments=arguments,
+                reason=("[self-agent] " + str(value.get("reason") or "architecture-authored action"))[:2000],
+                call_id=None,
+            ))
+        return result
+
+    @staticmethod
+    def _self_runtime_trace_kind(run: dict[str, object]) -> str:
+        return (
+            "self_agent_applied"
+            if run.get("runtime_kind") == "agent"
+            else "self_harness_applied"
+        )
 
     def _working_state_projection(self, state: dict[str, object]) -> dict[str, object]:
         projected = {key: value for key, value in state.items() if not key.startswith("_")}
@@ -1926,6 +2754,13 @@ class AIOSRuntime:
             )
         )
         working_state = result.get("task_working_state") if isinstance(result, dict) else None
+        workspace_checkpoint = (
+            result.get("workspace_checkpoint") if isinstance(result, dict) else None
+        )
+        preserved_workspace = bool(
+            isinstance(workspace_checkpoint, dict)
+            and workspace_checkpoint.get("preserved")
+        )
         self.store.add_checkpoint(task_id, "failed_attempt", {
             "error": error,
             "cycle_id": cycle_id,
@@ -1934,6 +2769,11 @@ class AIOSRuntime:
                 working_state.get("verification_gap") if isinstance(working_state, dict) else None
             ),
             "working_state": working_state if isinstance(working_state, dict) else None,
+            "metrics": (
+                result.get("task_metrics") if isinstance(result, dict)
+                and isinstance(result.get("task_metrics"), dict) else None
+            ),
+            "workspace_checkpoint": workspace_checkpoint,
         })
         evolution_result = self.evolution.observe_failure(task, error, result)
         if evolution_result.get("triggered"):
@@ -1963,6 +2803,8 @@ class AIOSRuntime:
             or (alternative_provider_available and missing_executable_attempts == 1)
         )
         if (
+            event.type != "SELF_RECOVERY"
+            and
             task.attempts < task.max_attempts
             and not terminal_protocol_failure
             and guided_missing_executable_retry
@@ -1973,6 +2815,7 @@ class AIOSRuntime:
                 "failed_cycle_id": cycle_id,
                 "completed_attempt": task.attempts,
                 "next_attempt": task.attempts + 1,
+                "preserve_working_state": preserved_workspace,
             }
             reset_id = self.store.add_checkpoint(task_id, "retry_reset", reset)
             self.store.trace(cycle_id, "retry_reset", {
@@ -2025,6 +2868,25 @@ class AIOSRuntime:
                     retry_id,
                 )
                 return
+            if self._schedule_self_recovery(
+                task, event, error, cycle_id, result, failure_class,
+            ):
+                return
+            if event.type == "SELF_RECOVERY":
+                recovery = (
+                    event.payload.get("self_recovery")
+                    if isinstance(event.payload.get("self_recovery"), dict)
+                    else {}
+                )
+                self.store.trace(cycle_id, "self_recovery_failed", {
+                    "task_id": task_id,
+                    "incident_ref": recovery.get("incident_ref"),
+                    "recovery_base_version": recovery.get("recovery_base_version"),
+                    "same_self_lineage": True,
+                    "failure_class": failure_class,
+                    "error": self._redact_incident_text(error[:4000]),
+                    "further_recovery_scheduled": False,
+                })
             final_status = (
                 TaskStatus.ABANDONED
                 if self.settings.runtime.completion_mode == "free"
@@ -2049,7 +2911,138 @@ class AIOSRuntime:
             else:
                 LOGGER.error("Task %s exhausted retries and entered %s", task_id, final_status.value)
 
+    def _schedule_self_recovery(
+        self,
+        task: Task,
+        event: Event,
+        error: str,
+        cycle_id: str,
+        result: dict | None,
+        failure_class: str,
+    ) -> bool:
+        """Give the same Self lineage one bounded invocation after terminal failure.
+
+        The Host records and forwards observable facts.  It neither diagnoses
+        the failure nor requires a mutation.  A lifecycle failure may boot the
+        recorded parent solely so broken mutable code cannot prevent recovery.
+        """
+        config = self.settings.self_modification
+        if (
+            self.self_versions is None
+            or not config.failure_recovery_enabled
+            or config.max_failure_recovery_invocations <= 0
+            or event.type == "SELF_RECOVERY"
+        ):
+            return False
+        prior = sum(
+            checkpoint["phase"] == "self_recovery_scheduled"
+            for checkpoint in self.store.task_checkpoints(int(task.id))
+        )
+        if prior >= config.max_failure_recovery_invocations:
+            return False
+
+        current_version = self.self_versions.current_version()
+        self_lifecycle_failure = bool(re.search(
+            r"Self (?:Agent|Harness)|Self version has no .*entrypoint|"
+            r"lifecycle event",
+            error,
+            flags=re.IGNORECASE,
+        ))
+        parent_version = (
+            self.self_versions.parent_version(current_version)
+            if self_lifecycle_failure else None
+        )
+        recovery_base = parent_version or current_version
+        failed_actions: list[dict[str, object]] = []
+        if isinstance(result, dict):
+            action_results = result.get("action_results", [])
+            if not isinstance(action_results, list):
+                action_results = []
+            for item in action_results[-8:]:
+                if not isinstance(item, dict) or item.get("ok") is not False:
+                    continue
+                failed_actions.append({
+                    "tool": str(item.get("tool") or "unknown")[:80],
+                    "error": self._redact_incident_text(
+                        str(item.get("error") or "unknown error")[:1000]
+                    ),
+                })
+        capsule: dict[str, object] = {
+            "schema": "self_recovery_incident/v1",
+            "trigger": "terminal_execution_failure",
+            "task_id": int(task.id),
+            "failed_cycle_id": cycle_id,
+            "ordinary_attempt": task.attempts,
+            "ordinary_max_attempts": task.max_attempts,
+            "failure_class": failure_class,
+            "error": self._redact_incident_text(error[:4000]),
+            "failed_actions": failed_actions,
+            "failed_self_version": current_version,
+            "recovery_base_version": recovery_base,
+            "parent_fallback_used": recovery_base != current_version,
+            "self_transaction_open": self.self_versions.writable,
+            "same_self_lineage": True,
+            "host_diagnosis": None,
+            "mutation_required": False,
+            "allowed_interpretations": (
+                "Continue the original task with a revised strategy, or create a "
+                "reversible Self descendant when the observed defect is reusable."
+            ),
+        }
+        trace_id = self.store.trace(cycle_id, "self_recovery_incident", capsule)
+        capsule["incident_ref"] = f"trace:{trace_id}"
+        checkpoint_id = self.store.add_checkpoint(
+            int(task.id), "self_recovery_scheduled", capsule,
+        )
+        self.store.update_task(
+            int(task.id), TaskStatus.RETRYING, result=result, error=error,
+        )
+        recovery_event_id = self.store.add_event(Event(
+            "SELF_RECOVERY",
+            {
+                "task_id": int(task.id),
+                "message": task.request,
+                "self_recovery": capsule,
+                "recovery_checkpoint_id": checkpoint_id,
+            },
+            task.priority,
+        ))
+        self.store.trace(cycle_id, "self_recovery_scheduled", {
+            "task_id": int(task.id),
+            "event_id": recovery_event_id,
+            "checkpoint_id": checkpoint_id,
+            "incident_ref": capsule["incident_ref"],
+            "recovery_base_version": recovery_base,
+            "parent_fallback_used": recovery_base != current_version,
+            "same_self_lineage": True,
+            "host_fitness_judgment": None,
+        })
+        LOGGER.warning(
+            "Task %s scheduled bounded Self recovery event %s from %s",
+            task.id, recovery_event_id, recovery_base,
+        )
+        return True
+
+    @staticmethod
+    def _redact_incident_text(value: str) -> str:
+        text = re.sub(
+            r"(?i)(Bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1<redacted>", value,
+        )
+        text = re.sub(
+            r"(?i)((?:api[_-]?key|access[_-]?token|token|password|secret|cookie)"
+            r"\s*[:=]\s*)[^\s,;]+",
+            r"\1<redacted>",
+            text,
+        )
+        return re.sub(
+            r"(?i)\b[A-Z]:\\Users\\[^\\\s]+", "<host-user-path>", text,
+        )
+
     def _reload_generated_tools(self) -> None:
-        registry = ToolRegistry(self.settings.permissions, self.plugins, self.sandbox)
+        registry = ToolRegistry(
+            self.settings.permissions,
+            None if self.self_versions is not None else self.plugins,
+            self.sandbox, self.self_versions, self._agent_observe,
+        )
         self.executor.registry = registry
         self.controller.set_tool_schemas(registry.schemas())

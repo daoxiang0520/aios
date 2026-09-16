@@ -31,6 +31,7 @@ from .plugins import PluginManager
 from .sandbox import DockerSandboxBroker
 from .skills import SkillManager
 from .runtime import AIOSRuntime
+from .runtime_lock import RuntimeProcessLock
 from .self_evolution import (
     ExperienceAnalyzer, ModelEvolutionReasoner, SelfEvolutionLoop,
     SoftFrictionExperienceBuilder, StrategyOptimizationReasoner,
@@ -126,6 +127,16 @@ def _parser() -> argparse.ArgumentParser:
     self_commands.add_parser("versions")
     self_show = self_commands.add_parser("show")
     self_show.add_argument("version", nargs="?", help="Defaults to CURRENT")
+    self_migrate_agent = self_commands.add_parser(
+        "migrate-agent",
+        help="Create and activate a human-confirmed descendant with /self/agent/main.py",
+    )
+    self_migrate_agent.add_argument("--approve", action="store_true")
+    self_activate = self_commands.add_parser(
+        "activate", help="Explicit Host recovery to a preserved Self version",
+    )
+    self_activate.add_argument("version")
+    self_activate.add_argument("--approve", action="store_true")
 
     task = commands.add_parser("task", help="Submit and inspect durable tasks")
     task_commands = task.add_subparsers(dest="task_command", required=True)
@@ -519,7 +530,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         runtime = AIOSRuntime(settings)
         if args.once:
-            worked = runtime.run_once()
+            worked = runtime.run_single()
             print("Processed one cycle" if worked else "No pending events")
         else:
             runtime.run_forever()
@@ -542,9 +553,22 @@ def main(argv: list[str] | None = None) -> int:
                     "enabled": settings.self_modification.enabled,
                     "experiment_condition": settings.self_modification.experiment_condition,
                     "current_version": self_manager.current_version() if self_manager else None,
+                    "architecture": self_manager.architecture() if self_manager else None,
+                    "in_task_reflection_rounds": (
+                        settings.self_modification.in_task_reflection_rounds
+                        if self_manager else []
+                    ),
+                    "failure_recovery_enabled": (
+                        settings.self_modification.failure_recovery_enabled
+                        if self_manager else False
+                    ),
+                    "max_failure_recovery_invocations": (
+                        settings.self_modification.max_failure_recovery_invocations
+                        if self_manager else 0
+                    ),
                 },
                 "model_visible_tools": [
-                    name for name in ["read", "write", "edit", "bash", "evolve"]
+                    name for name in ["read", "write", "edit", "bash", "observe", "evolve"]
                     if name in settings.permissions.allowed_tools
                     and (name != "evolve" or settings.self_modification.enabled)
                 ],
@@ -577,7 +601,7 @@ def main(argv: list[str] | None = None) -> int:
                 "current_version": manager.current_version(),
                 "versions": manager.versions_summary(),
             })
-        else:
+        elif args.self_command == "show":
             version = args.version or manager.current_version()
             if manager.VERSION_PATTERN.fullmatch(version) is None:
                 raise SystemExit("Invalid self version")
@@ -589,10 +613,21 @@ def main(argv: list[str] | None = None) -> int:
                 "current": version == manager.current_version(),
                 "system": (root / "SYSTEM.md").read_text(encoding="utf-8", errors="replace")
                     if (root / "SYSTEM.md").is_file() else "",
+                "self_goal": manager.self_goal(version),
+                "architecture": manager.architecture(version),
                 "files": sorted(
                     item.relative_to(root).as_posix() for item in root.rglob("*") if item.is_file()
                 ),
             })
+        elif args.self_command == "migrate-agent":
+            if not args.approve:
+                raise SystemExit("Self Agent migration requires --approve")
+            with RuntimeProcessLock(settings.database):
+                _print_json(manager.migrate_agent_architecture())
+        else:
+            if not args.approve:
+                raise SystemExit("Self activation requires --approve")
+            _print_json(manager.activate(args.version))
         return 0
     if args.command == "task":
         if args.task_command == "submit":

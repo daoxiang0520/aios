@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import mimetypes
 import re
 import secrets
@@ -85,6 +86,12 @@ class AIOSWebApplication:
                 "experiment_condition": self.settings.self_modification.experiment_condition,
                 "current_version": self.self_versions.current_version()
                     if self.self_versions is not None else None,
+                "failure_recovery_enabled": (
+                    self.settings.self_modification.failure_recovery_enabled
+                ),
+                "max_failure_recovery_invocations": (
+                    self.settings.self_modification.max_failure_recovery_invocations
+                ),
             },
             "lineages": self.store.list_lineages(),
             "experimental_lineage_head": lineage_manager.current()["lineage_id"],
@@ -107,14 +114,22 @@ class AIOSWebApplication:
         traces = self.store.traces_for_cycles(list(dict.fromkeys(cycle_ids)))
         result = task.result or {}
         completion = self._completion_projection(task, result)
+        self_recovery = self._self_recovery_projection(traces, checkpoints)
+        decision_log = self._decision_log(traces)
         return {
             "task": self._task_summary(task, include_request=True),
             "chat": self._chat(task.request, result, task.error),
             "activity": self._activity(traces, checkpoints),
-            "budget": self._budget(result, checkpoints),
+            "budget": self._budget(result, checkpoints, traces),
             "artifacts": self._artifacts(result),
             "evidence": self._evidence(result, traces, checkpoints),
             "completion": completion,
+            "self_recovery": self_recovery,
+            "decision_log": decision_log,
+            "repetition_analysis": self._repetition_projection(
+                traces, decision_log,
+            ),
+            "self_changes": self._self_change_projection(traces, decision_log),
             "lineage": self.store.task_lineage(task_id),
             "evolution": self.evolution_runs(task_id),
         }
@@ -335,10 +350,30 @@ class AIOSWebApplication:
                 actor = "HOST"
             if any(word in kind for word in ("gate", "evaluation")):
                 actor = "GATE"
+            if kind.startswith("self_") or (
+                kind == "action_result" and data.get("tool") == "evolve"
+            ):
+                actor = "SELF"
+            if kind.startswith("self_recovery"):
+                actor = "RECOVERY"
             label = kind.replace("_", " ").title()
             if kind == "action_result":
                 label = f"{data.get('tool', 'tool')} · {'succeeded' if data.get('ok') else 'failed'}"
-            detail = data.get("error") or data.get("reason") or data.get("summary")
+            recovery_labels = {
+                "self_recovery_incident": "Incident Capsule Frozen",
+                "self_recovery_scheduled": "Self Recovery Scheduled",
+                "self_recovery_started": "Self Recovery Started",
+                "self_recovery_checkpointed": "Recovery Checkpointed",
+                "self_recovery_resolved": "Self Recovery Resolved",
+                "self_recovery_failed": "Self Recovery Failed",
+                "model_reasoning": "Model Reasoning Recorded",
+            }
+            label = recovery_labels.get(kind, label)
+            detail = (
+                data.get("error") or data.get("reason") or data.get("summary")
+                or data.get("reasoning_excerpt") or data.get("outcome")
+                or data.get("trigger")
+            )
             values.append({
                 "id": trace["id"], "cycle_id": trace["cycle_id"], "kind": kind,
                 "actor": actor, "label": label, "detail": str(detail)[:500] if detail else None,
@@ -347,7 +382,312 @@ class AIOSWebApplication:
             })
         return values
 
-    def _budget(self, result: dict[str, Any], checkpoints: list[dict[str, Any]]) -> dict[str, Any]:
+    @staticmethod
+    def _self_recovery_projection(
+        traces: list[dict[str, Any]], checkpoints: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        recovery_traces = [
+            trace for trace in traces
+            if str(trace.get("kind", "")).startswith("self_recovery")
+        ]
+        incidents = [
+            checkpoint.get("data", {}) for checkpoint in checkpoints
+            if checkpoint.get("phase") == "self_recovery_scheduled"
+            and isinstance(checkpoint.get("data"), dict)
+        ]
+        if not recovery_traces and not incidents:
+            return {
+                "observed": False, "state": "not_invoked", "invocations": 0,
+                "same_self_lineage": None, "incident": None,
+            }
+        state = "scheduled"
+        latest: dict[str, Any] = {}
+        state_by_kind = {
+            "self_recovery_started": "active",
+            "self_recovery_checkpointed": "checkpointed",
+            "self_recovery_resolved": "resolved",
+            "self_recovery_failed": "failed",
+        }
+        for trace in recovery_traces:
+            kind = str(trace.get("kind", ""))
+            if kind in state_by_kind:
+                state = state_by_kind[kind]
+                latest = trace.get("data", {}) if isinstance(trace.get("data"), dict) else {}
+        started = sum(
+            trace.get("kind") == "self_recovery_started" for trace in recovery_traces
+        )
+        incident = dict(incidents[-1]) if incidents else None
+        return {
+            "observed": True,
+            "state": state,
+            "invocations": started,
+            "same_self_lineage": True,
+            "incident_ref": (
+                incident.get("incident_ref") if isinstance(incident, dict) else None
+            ),
+            "recovery_base_version": (
+                incident.get("recovery_base_version")
+                if isinstance(incident, dict) else latest.get("active_self_version")
+            ),
+            "failed_self_version": (
+                incident.get("failed_self_version") if isinstance(incident, dict) else None
+            ),
+            "parent_fallback_used": (
+                incident.get("parent_fallback_used")
+                if isinstance(incident, dict) else None
+            ),
+            "self_evolution_observed": latest.get("self_evolution_observed"),
+            "outcome": latest.get("outcome") or latest.get("continuation_reason"),
+            "incident": incident,
+        }
+
+    @staticmethod
+    def _decision_log(traces: list[dict[str, Any]]) -> dict[str, Any]:
+        """Project model decisions without treating reasoning as ground truth."""
+        reasoning_by_round = {}
+        for trace in traces:
+            if trace.get("kind") != "model_reasoning":
+                continue
+            data = trace.get("data", {})
+            if not isinstance(data, dict):
+                continue
+            reasoning_by_round[(trace.get("cycle_id"), data.get("round"))] = trace
+
+        plan_traces = [trace for trace in traces if trace.get("kind") == "plan_created"]
+        total = len(plan_traces)
+        entries = []
+        for trace in plan_traces[-80:]:
+            data = trace.get("data", {})
+            if not isinstance(data, dict):
+                continue
+            reasoning_trace = reasoning_by_round.get((
+                trace.get("cycle_id"), data.get("round"),
+            ))
+            reasoning_data = (
+                reasoning_trace.get("data", {})
+                if isinstance(reasoning_trace, dict) else {}
+            )
+            reasoning = str(reasoning_data.get("reasoning") or "")
+            actions = []
+            raw_actions = data.get("actions", [])
+            if isinstance(raw_actions, list):
+                for action in raw_actions[:20]:
+                    if not isinstance(action, dict):
+                        continue
+                    arguments = action.get("arguments", {})
+                    arguments = arguments if isinstance(arguments, dict) else {}
+                    target = arguments.get("path") or arguments.get("url")
+                    actions.append({
+                        "tool": str(action.get("tool") or "unknown")[:80],
+                        "target": str(target)[:500] if target is not None else None,
+                        "reason": str(action.get("reason") or "")[:1000] or None,
+                        "argument_keys": sorted(str(key)[:80] for key in arguments)[:20],
+                    })
+            entries.append({
+                "trace_id": trace.get("id"),
+                "reasoning_trace_id": (
+                    reasoning_trace.get("id")
+                    if isinstance(reasoning_trace, dict) else None
+                ),
+                "cycle_id": trace.get("cycle_id"),
+                "round": data.get("round"),
+                "summary": str(data.get("summary") or "")[:4000],
+                "done": bool(data.get("done")),
+                "actions": actions,
+                "reasoning_available": bool(reasoning),
+                "reasoning": reasoning[:6000] if reasoning else None,
+                "reasoning_truncated": bool(
+                    reasoning_data.get("truncated") or len(reasoning) > 6000
+                ),
+                "reasoning_source": reasoning_data.get("source"),
+                "created_at": trace.get("created_at"),
+            })
+        return {
+            "entries": entries,
+            "total_rounds": total,
+            "displayed_rounds": len(entries),
+            "truncated": total > len(entries),
+            "interpretation": (
+                "Provider-supplied reasoning is a model self-report, not a Host "
+                "diagnosis or proof of the action's real cause."
+            ),
+        }
+
+    @staticmethod
+    def _repetition_projection(
+        traces: list[dict[str, Any]], decision_log: dict[str, Any],
+    ) -> dict[str, Any]:
+        decisions = {
+            (entry.get("cycle_id"), entry.get("round")): entry
+            for entry in decision_log.get("entries", [])
+            if isinstance(entry, dict)
+        }
+        reused = set()
+        for trace in traces:
+            if trace.get("kind") != "observation_reused":
+                continue
+            data = trace.get("data", {})
+            if isinstance(data, dict):
+                reused.add((trace.get("cycle_id"), data.get("round"), data.get("path")))
+        repeats = [
+            trace for trace in traces if trace.get("kind") == "repeated_resource_read"
+        ]
+        entries = []
+        for trace in repeats[-100:]:
+            data = trace.get("data", {})
+            if not isinstance(data, dict):
+                continue
+            key = (trace.get("cycle_id"), data.get("round"))
+            decision = decisions.get(key, {})
+            path = data.get("path")
+            action_reason = None
+            for action in decision.get("actions", []):
+                if not isinstance(action, dict) or action.get("tool") != "read":
+                    continue
+                target = str(action.get("target") or "").replace("\\", "/")
+                if target == str(path).replace("\\", "/"):
+                    action_reason = action.get("reason")
+                    break
+            entries.append({
+                "trace_id": trace.get("id"),
+                "cycle_id": trace.get("cycle_id"),
+                "round": data.get("round"),
+                "path": path,
+                "prior_evidence_ref": data.get("prior_evidence_ref"),
+                "outcome": (
+                    "observation_reused"
+                    if (trace.get("cycle_id"), data.get("round"), path) in reused
+                    else "executed_again"
+                ),
+                "model_summary": decision.get("summary"),
+                "action_reason": action_reason,
+                "model_reasoning": (
+                    str(decision.get("reasoning"))[:2000]
+                    if decision.get("reasoning") else None
+                ),
+                "reasoning_available": bool(decision.get("reasoning_available")),
+                "created_at": trace.get("created_at"),
+            })
+        repeat_keys = [
+            (trace.get("cycle_id"), trace.get("data", {}).get("round"),
+             trace.get("data", {}).get("path"))
+            for trace in repeats if isinstance(trace.get("data"), dict)
+        ]
+        exact_counts: dict[str, int] = {}
+        exact_entries = []
+        for trace in traces:
+            if trace.get("kind") != "plan_created":
+                continue
+            data = trace.get("data", {})
+            if not isinstance(data, dict) or not isinstance(data.get("actions"), list):
+                continue
+            decision = decisions.get((trace.get("cycle_id"), data.get("round")), {})
+            for action in data["actions"]:
+                if not isinstance(action, dict):
+                    continue
+                signature_payload = json.dumps({
+                    "tool": action.get("tool"),
+                    "arguments": action.get("arguments", {}),
+                }, ensure_ascii=False, sort_keys=True, default=str)
+                signature = hashlib.sha256(signature_payload.encode("utf-8")).hexdigest()[:16]
+                occurrence = exact_counts.get(signature, 0) + 1
+                exact_counts[signature] = occurrence
+                if occurrence <= 1:
+                    continue
+                arguments = action.get("arguments", {})
+                arguments = arguments if isinstance(arguments, dict) else {}
+                target = arguments.get("path") or arguments.get("url")
+                exact_entries.append({
+                    "cycle_id": trace.get("cycle_id"),
+                    "round": data.get("round"),
+                    "tool": str(action.get("tool") or "unknown")[:80],
+                    "target": str(target)[:500] if target is not None else None,
+                    "argument_keys": sorted(str(key)[:80] for key in arguments)[:20],
+                    "signature": signature,
+                    "occurrence": occurrence,
+                    "action_reason": str(action.get("reason") or "")[:1000] or None,
+                    "model_summary": decision.get("summary"),
+                    "model_reasoning": (
+                        str(decision.get("reasoning"))[:2000]
+                        if decision.get("reasoning") else None
+                    ),
+                    "created_at": trace.get("created_at"),
+                })
+        return {
+            "entries": entries,
+            "repeated_requests": len(repeats),
+            "displayed_requests": len(entries),
+            "observation_reuse_hits": sum(
+                key in reused for key in repeat_keys
+            ),
+            "reexecuted_requests": sum(
+                key not in reused for key in repeat_keys
+            ),
+            "exact_repeated_actions": len(exact_entries),
+            "exact_action_entries": exact_entries[-100:],
+            "interpretation": (
+                "The Host correlates requests and observations; only the model-supplied "
+                "reasoning/action reason can explain the model's stated intent."
+            ),
+        }
+
+    @staticmethod
+    def _self_change_projection(
+        traces: list[dict[str, Any]], decision_log: dict[str, Any],
+    ) -> dict[str, Any]:
+        decisions = {
+            (entry.get("cycle_id"), entry.get("round")): entry
+            for entry in decision_log.get("entries", [])
+            if isinstance(entry, dict)
+        }
+        entries = []
+        lifecycle = {
+            "self_version_opened", "self_version_committed", "self_version_aborted",
+        }
+        for trace in traces:
+            data = trace.get("data", {})
+            if not isinstance(data, dict):
+                continue
+            kind = str(trace.get("kind") or "")
+            failed_evolve = (
+                kind == "action_result" and data.get("tool") == "evolve"
+                and data.get("ok") is False
+            )
+            if kind not in lifecycle and not failed_evolve:
+                continue
+            decision = decisions.get((trace.get("cycle_id"), data.get("round")), {})
+            entries.append({
+                "trace_id": trace.get("id"),
+                "cycle_id": trace.get("cycle_id"),
+                "round": data.get("round"),
+                "kind": kind,
+                "operation": data.get("operation") or (
+                    "failed" if failed_evolve else kind.removeprefix("self_version_")
+                ),
+                "version": data.get("version"),
+                "parent_version": data.get("parent_version"),
+                "restart_required": data.get("restart_required"),
+                "error": data.get("error"),
+                "model_summary": decision.get("summary"),
+                "model_reasoning": (
+                    str(decision.get("reasoning"))[:2000]
+                    if decision.get("reasoning") else None
+                ),
+                "created_at": trace.get("created_at"),
+            })
+        return {
+            "entries": entries,
+            "observed": bool(entries),
+            "host_fitness_judgment": None,
+        }
+
+    def _budget(
+        self,
+        result: dict[str, Any],
+        checkpoints: list[dict[str, Any]],
+        traces: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        traces = traces or []
         budget = result.get("task_budget", result.get("budget", {}))
         budget = budget if isinstance(budget, dict) else {}
         for checkpoint in reversed(checkpoints):
@@ -359,15 +699,70 @@ class AIOSWebApplication:
         enabled = evidence.get("budget_limits_enabled", budget.get(
             "enabled", True if result else self.settings.budget.enabled,
         ))
+        recorded_tokens = int(evidence.get(
+            "model_tokens", budget.get("used_tokens", budget.get("tokens_used") or budget.get("total_tokens") or 0)
+        ) or 0)
+        recorded_model_calls = int(evidence.get(
+            "model_api_calls", budget.get("used_model_calls", budget.get("model_calls_used") or budget.get("model_calls") or 0)
+        ) or 0)
+        recorded_tool_calls = int(evidence.get(
+            "task_tool_calls", budget.get("used_tool_calls", budget.get("tool_calls_used") or budget.get("tool_calls") or 0)
+        ) or 0)
+        trace_total_tokens = 0
+        trace_model_calls = 0
+        usage_records = 0
+        prompt_token_lower_bound = 0
+        attributed_model_calls = 0
+        for trace in traces:
+            data = trace.get("data", {})
+            if trace.get("kind") == "plan_created":
+                usage = data.get("model_usage")
+            elif trace.get("kind") == "cycle_failed":
+                usage = data.get("failed_call_usage")
+            else:
+                usage = None
+            if isinstance(usage, dict):
+                usage_records += 1
+                trace_total_tokens += int(usage.get("total_tokens", 0) or 0)
+                trace_model_calls += int(usage.get("model_calls", 1) or 0)
+            if trace.get("kind") == "model_call_attribution":
+                attributed_model_calls += 1
+                prompt_token_lower_bound += int(
+                    data.get("actual_prompt_tokens")
+                    or data.get("estimated_prompt_tokens", 0)
+                    or 0
+                )
+        traced_tool_calls = sum(
+            trace.get("kind") == "action_result" for trace in traces
+        )
+        lifetime_tokens = max(
+            recorded_tokens, trace_total_tokens, prompt_token_lower_bound
+        )
+        if prompt_token_lower_bound and lifetime_tokens == prompt_token_lower_bound:
+            token_measurement = "prompt_lower_bound"
+        elif usage_records and lifetime_tokens == trace_total_tokens:
+            token_measurement = "recorded_total_with_trace_usage"
+        else:
+            token_measurement = "recorded_total"
         return {
             "enabled": enabled,
-            "tokens": evidence.get("model_tokens", budget.get("used_tokens", budget.get("tokens_used") or budget.get("total_tokens") or 0)),
+            "scope": "task_lifetime",
+            "tokens": lifetime_tokens,
+            "token_measurement": token_measurement,
+            "prompt_token_lower_bound": prompt_token_lower_bound,
             "token_limit": budget.get("max_tokens", self.settings.budget.max_tokens_per_task) if enabled else None,
-            "model_calls": evidence.get("model_api_calls", budget.get("used_model_calls", budget.get("model_calls_used") or budget.get("model_calls") or 0)),
+            "model_calls": max(
+                recorded_model_calls, trace_model_calls, attributed_model_calls
+            ),
             "model_call_limit": budget.get("max_model_calls", self.settings.budget.max_model_calls_per_task) if enabled else None,
-            "tool_calls": evidence.get("task_tool_calls", budget.get("used_tool_calls", budget.get("tool_calls_used") or budget.get("tool_calls") or 0)),
+            "tool_calls": max(recorded_tool_calls, traced_tool_calls),
             "tool_call_limit": budget.get("max_tool_calls", self.settings.budget.max_tool_calls_per_task) if enabled else None,
-            "cycles": len({c.get("data", {}).get("cycle_id") for c in checkpoints if c.get("data", {}).get("cycle_id")}),
+            "cycles": len({
+                trace.get("cycle_id") for trace in traces if trace.get("cycle_id")
+            } | {
+                c.get("data", {}).get("cycle_id") for c in checkpoints
+                if c.get("data", {}).get("cycle_id")
+            }),
             "cycle_limit": budget.get("max_cycles", self.settings.budget.max_cycles_per_task) if enabled else None,
         }
 

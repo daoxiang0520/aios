@@ -21,14 +21,36 @@ CORE_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {"type": "function", "function": {"name": "bash", "description": "Run a command inside the configured strong sandbox with /workspace as its working directory. Never runs on the host and must not scan container root.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "timeout_seconds": {"type": "integer"}}, "required": ["command"], "additionalProperties": False}}},
 ]
 
+OBSERVE_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "observe",
+        "description": "Read immutable AIOS observations without asking the Host to interpret them. view=tasks lists task records; view=task_events lists addressable Trace envelopes for one task; view=trace reads an exact bounded JSON range from one Trace; view=self_versions lists recorded Self versions. Use task_events first, then fetch only relevant trace refs.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "view": {"type": "string", "enum": ["tasks", "task_events", "trace", "self_versions"]},
+                "task_id": {"type": "integer"}, "ref": {"type": "string"},
+                "after_id": {"type": "integer"}, "offset": {"type": "integer"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["view"], "additionalProperties": False,
+        },
+    },
+}
+
 EVOLVE_TOOL_SCHEMA: dict[str, Any] = {
     "type": "function",
     "function": {
         "name": "evolve",
-        "description": "Open a reversible, versioned modification transaction for your own mutable system. This starts no model, diagnosis, benchmark, or adoption process. After it returns, use read/write/edit/bash on /self; prior versions remain read-only at /self-history.",
+        "description": "Manage a reversible Self modification transaction without starting another model or evaluator. operation=open forks a writable descendant at /self; edit it with normal tools. operation=commit activates it for the next cycle/task and requests a checkpoint restart. operation=abort leaves CURRENT unchanged. Prior versions remain read-only at /self-history.",
         "parameters": {
             "type": "object",
-            "properties": {"reason": {"type": "string"}, "base_version": {"type": "string"}},
+            "properties": {
+                "operation": {"type": "string", "enum": ["open", "commit", "abort"]},
+                "reason": {"type": "string"},
+                "base_version": {"type": "string"},
+            },
             "additionalProperties": False,
         },
     },
@@ -36,16 +58,23 @@ EVOLVE_TOOL_SCHEMA: dict[str, Any] = {
 
 
 class ToolRegistry:
-    def __init__(self, permissions: PermissionConfig, plugins: PluginManager | None = None, sandbox: DockerSandboxBroker | None = None, self_versions: Any = None):
+    def __init__(
+        self, permissions: PermissionConfig, plugins: PluginManager | None = None,
+        sandbox: DockerSandboxBroker | None = None, self_versions: Any = None,
+        observation_provider: Tool | None = None,
+    ):
         self.permissions = permissions
         self.sandbox = sandbox
         self.resources = ResourceAdapter(permissions, sandbox)
         self.self_versions = self_versions
+        self.observation_provider = observation_provider
         self._tools: dict[str, Tool] = {}
         self._schemas = {item["function"]["name"]: item for item in CORE_TOOL_SCHEMAS}
+        if observation_provider is not None:
+            self._schemas["observe"] = OBSERVE_TOOL_SCHEMA
         if self_versions is not None:
             self._schemas["evolve"] = EVOLVE_TOOL_SCHEMA
-        for name, tool in (("read", self.read), ("write", self.write), ("edit", self.edit), ("bash", self.bash), ("evolve", self.evolve), ("echo", self.echo), ("list_files", self.list_files), ("read_file", self.read_file), ("write_file", self.write_file), ("append_file", self.append_file)):
+        for name, tool in (("read", self.read), ("write", self.write), ("edit", self.edit), ("bash", self.bash), ("observe", self.observe), ("evolve", self.evolve), ("echo", self.echo), ("list_files", self.list_files), ("read_file", self.read_file), ("write_file", self.write_file), ("append_file", self.append_file)):
             self.register(name, tool)
         if plugins is not None:
             self.load_plugins(plugins)
@@ -60,6 +89,8 @@ class ToolRegistry:
 
     def schemas(self) -> list[dict[str, Any]]:
         visible = ["read", "write", "edit", "bash"]
+        if self.observation_provider is not None:
+            visible.append("observe")
         if self.self_versions is not None:
             visible.append("evolve")
         return [self._schemas[name] for name in visible if name in self.permissions.allowed_tools]
@@ -100,10 +131,30 @@ class ToolRegistry:
             raise RuntimeError("Sandbox broker is not configured")
         return self.sandbox.run(command, timeout_seconds)
 
-    def evolve(self, reason: str | None = None, base_version: str | None = None) -> dict[str, Any]:
+    def observe(
+        self, view: str, task_id: int | None = None, ref: str | None = None,
+        after_id: int = 0, offset: int = 0, limit: int | None = None,
+    ) -> Any:
+        if self.observation_provider is None:
+            raise RuntimeError("Agent observation is not configured")
+        return self.observation_provider(
+            view=view, task_id=task_id, ref=ref, after_id=after_id,
+            offset=offset, limit=limit,
+        )
+
+    def evolve(
+        self, operation: str = "open", reason: str | None = None,
+        base_version: str | None = None,
+    ) -> dict[str, Any]:
         if self.self_versions is None:
             raise RuntimeError("Self modification is not configured")
-        return self.self_versions.open(reason=reason, base_version=base_version)
+        if operation == "open":
+            return self.self_versions.open(reason=reason, base_version=base_version)
+        if operation == "commit":
+            return self.self_versions.commit()
+        if operation == "abort":
+            return self.self_versions.abort()
+        raise ValueError(f"Unknown evolve operation: {operation}")
 
     def list_files(self, path: str = ".") -> Any:
         return self.resources.legacy_list(path)

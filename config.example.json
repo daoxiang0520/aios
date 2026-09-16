@@ -4,13 +4,18 @@
   "poll_interval_seconds": 2.0,
   "max_actions_per_cycle": 8,
   "runtime": {
-    "completion_mode": "free"
+    "completion_mode": "free",
+    "liveness_checkpoint_rounds": 48
   },
   "self_modification": {
     "enabled": true,
     "root": "./self",
     "experiment_condition": "natural",
-    "max_system_prompt_characters": 8000
+    "max_system_prompt_characters": 8000,
+    "in_task_reflection_rounds": [12, 36, 72],
+    "reflection_cooldown_checkpoints": 3,
+    "failure_recovery_enabled": true,
+    "max_failure_recovery_invocations": 1
   },
   "budget": {
     "enabled": true,
@@ -75,7 +80,7 @@
     "protocol": "tool_calling"
   },
   "permissions": {
-    "allowed_tools": ["read", "write", "edit", "bash", "evolve"],
+    "allowed_tools": ["read", "write", "edit", "bash", "observe", "evolve"],
     "allow_writes": true,
     "max_read_bytes": 1048576,
     "max_write_bytes": 1048576

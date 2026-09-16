@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "self-evolving-aios-mvp"
-version = "0.10.0a1"
-description = "A minimal reversible self-modification experiment for an agent runtime"
+version = "0.10.0a7"
+description = "A continuous reversible ordinary-Agent architecture self-modification experiment"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [{name = "AIOS MVP"}]
-dependencies = []
+dependencies = ["requests>=2.32,<3"]
 
 [project.scripts]
 aios = "aios.cli:main"

@@ -1,12 +1,88 @@
 # AIOS Minimal Self-Modification Experiment
 
-> **v0.9 research platform frozen; v0.10-alpha.1 minimal experiment active — 2026-09-05**
+> **v0.9 research platform frozen; v0.10 natural self-modification experiment active — 2026-09-16**
 >
 > v0.9 的 Lineage/Reasoner/Candidate/Counterfactual 路线作为可复现历史保留，但已退出普通任务的在线认知路径。当前唯一研究问题是：**一个正在完成普通任务的 Agent，在拥有可回退的自修改能力后，会不会自行选择改变自身？**
 >
 > 本项目仍是研究原型，不建议作为无人监管的生产执行器。
 
-## v0.10-alpha.1：极简、连续的 Self Modification
+## v0.10 长任务自然 RSI 验证（Task 156 / 157）
+
+这轮实验没有给普通任务加入“请进化”“请修改 Harness”或具体修复方案。Host 只提供版本坐标、
+可查询的事实视图、隔离执行、检查点、回退和 Trace；`host_interpretation` 保持为空。事实由 Host
+像传感器一样忠实记录，Agent 通过 `observe` 选择要看的事实，并自行解释是否存在可复用的
+Self 缺陷。专用反思轮只提供一次决策机会，不要求调用 `evolve`，也不把重复动作预先解释为
+必须进化。
+
+- Task 156 在 Natural 条件下完成论文复现，并由同一个工作 Agent 自主提交 v000007–v000011，
+  逐步形成复现目录识别、状态检查、自动运行和占位证据防护。任务最终由 Agent 声明停止；
+  Free Runtime 不把该声明伪装成 Host 已验证的 `completed`。
+- Task 157 是新的盲测任务，原始请求只要求在 `transformer_repro_v11/` 实现纯 NumPy
+  Transformer。Agent 首先发现已有 `repro_autorun.py` 只匹配 `repro_*`，自主提交 v000012
+  扩展目录发现；之后又自主提交 v000013 的静态 API 检查工具，以及 v000014 的统一
+  `repro_verify.py` 与命令包装器。跨 Cycle 草稿由 `OPEN_DRAFT.json` 持久恢复，提交后任务
+  检查点从后代 Self 重启。
+- v000014 后的普通任务轮主动调用 `/self/tools/repro_verify.py`，补齐 README、清理调试文件，
+  将测试与训练证据写入 `run_log.txt`，随后自行停止。外部独立复验得到 **11/11 测试通过**；
+  固定种子 300 步训练退出码为 0，损失 `2.660077 -> 0.494072`，且
+  `all_losses_finite=True`、`nonfinite_steps=0`、`params_finite=True`。
+- 这提供了最小 E0–E3 证据链：Agent 自主调用 `evolve`、修改持久 Self、后代任务实际采用新
+  工具、结果正确性未下降，并在后续摩擦中继续产生新版本。Host 没有代写这些 Self 文件，
+  也没有把外部复验反馈回运行中的 Agent。
+- 代价仍然很高：Task 156 使用 29 个 Cycle、404 次模型 API 调用、523 次工具调用、
+  5,601,410 Tokens；Task 157 使用 23 个 Cycle、257 次模型 API 调用、338 次工具调用、
+  4,418,669 Tokens。Task 157 仍有 30 次重复读取和 18 次失败工具调用。因此当前结论是
+  “已观察到自然、可遗传且产生后果的 Self 修改”，不是“已经实现高效或可靠的递归自我改进”。
+
+Runtime 同时补齐了长任务正确性：Self 草稿跨 Cycle 恢复；推理因 `length` 截断后仍可独立
+修复下一次 malformed tool arguments；Cycle liveness 与 Task budget 分离；累计遥测不随
+Checkpoint 清零；反思采用可重复冷却窗口，既避免专用反思无限递归，也允许长任务在获得新
+证据后再次作出 Self 决策。当前完整回归为 **350 passed，31 subtests passed**。
+
+## v0.10-alpha.7：重复动作、模型决策与 Self 变更可观察性
+
+Runtime 现在把每一轮 DeepSeek API 主动返回的 `reasoning_content` 作为有界、脱敏的
+`model_reasoning` Trace 保存，并与 `plan_created` 的轮次、工具动作和 `Action.reason` 对齐。
+该字段只代表模型对自身决策的表述，不是 Host 诊断、真实因果证明或平台隐藏思维；Provider
+没有返回时，UI明确显示 unavailable，Host不会补写理由。单轮原始记录最多保存 16,000 字符，
+页面单轮最多展示 6,000 字符，并记录截断事实。
+
+Web UI 新增 `Reasoning` 页，将重复资源请求分解为：目标路径、既有 Evidence 引用、模型当轮
+摘要、模型给出的 action reason、Provider reasoning，以及 Runtime 最终是
+`observation_reused` 还是 `executed_again`。因此“模型再次请求 read”和“Runtime真的再次解析”
+不再混为一谈。`Evolution` 页同时显示同一普通 Agent 调用 `evolve` 后产生的
+`open / commit / abort / failed` Self 版本动作、父版本和对应模型轮次；旧 v0.9 Evolution Run
+继续单独标为 Legacy，不与 v0.10 Self 变更混淆。旧任务没有保存过 reasoning 的，仍可显示
+Plan与重复读取事实，但不能追溯不存在的历史思考日志。
+
+## v0.10-alpha.6：同一 Self 谱系恢复调用
+
+alpha.6 不增加一个高于工作 Agent 的评价 Agent。普通 Agent 仍是任务执行、自我观察与
+`evolve` 决策的主体；Host 只在普通重试或协议恢复已经耗尽、Agent 无法再到达正常反思点时，
+机械地安排一次有界 `SELF_RECOVERY` 事件。该事件重新启动同一个 Self 谱系，把脱敏的
+`self_recovery_incident/v1` 事实放入 Context，然后继续原用户任务。Incident Capsule 明确包含
+`host_diagnosis=null` 与 `mutation_required=false`，因此恢复调用可以改变任务策略、在确认存在
+可复用 Self 缺陷时调用 `evolve`，也可以保持 Self 不变；恢复事件本身不构成任务完成。
+
+```text
+ordinary execution exhausts retries / protocol recovery
+→ Host freezes bounded Incident Capsule
+→ Host invokes the same Self lineage once
+→ revise task strategy OR evolve(open/edit/test/commit)
+→ task stops/yields, or descendant checkpoint resumes the original task
+```
+
+恢复调用不增加普通任务的 `attempts`，并由独立上限控制，默认每任务最多一次。如果故障明确
+发生在 Self Agent 生命周期入口，Host只为可启动性尝试从版本历史中记录的父版本执行恢复；
+若 Agent由此调用 `evolve`，新后代从该父版本分叉，损坏版本仍完整保留。这个父版本选择不是
+fitness judgement，也不证明父版本语义正确。模型服务整体不可用、Docker不可用或不可变 Host
+自身损坏时，恢复调用仍可能失败；Host不会伪造已经自修复。
+
+Web UI 会用紫色 `SELF RECOVERY` 标记区分普通 Free Loop、Self生命周期和恢复调用；Activity
+中的 Incident、Scheduled、Started、Checkpointed、Resolved、Failed 事件使用 `RECOVERY`
+actor，Inspect/Evidence 中保留 Capsule、版本与父版本回退事实。
+
+## v0.10-alpha.5：完整版本化 Agent 架构
 
 当前在线工具面只有：
 
@@ -14,34 +90,80 @@
 read / write / edit / bash / evolve
 ```
 
-`evolve(reason?, base_version?)` 不是 Evolution Agent，也不是“开始自动进化”的命令。它只执行一项 Host 机械操作：
+`evolve(operation?, reason?, base_version?)` 不是 Evolution Agent，也不是“开始自动进化”的命令。它只执行 Host 机械事务：
 
 ```text
-expose CURRENT self read-only during an ordinary task
-→ snapshot CURRENT self when evolve is called
-→ 从指定父版本复制出一个新版本
-→ 原子切换 CURRENT
-→ 把新版本以 /self 暴露给当前任务
-→ 同一个 Agent、同一任务继续运行
+普通任务读取 CURRENT self
+→ evolve(open) 从指定父版本复制出可写草稿
+→ 同一个 Agent 修改 /self
+→ evolve(commit) 原子切换 CURRENT
+→ Host checkpoint 当前任务
+→ 下一 Cycle 从新版本恢复任务
 ```
 
 它不会启动额外模型调用，不会诊断应该改什么，不会生成 Candidate，不会 Benchmark、Verifier、Selector 或自动生产晋升。普通任务可以读取并使用当前 `/self`，但不能修改；调用后仍使用原来的 `read/write/edit/bash` 修改新版本。旧版本只读挂载于 `/self-history`，Agent 无权删除；Host 的 Sandbox、Authority、Credentials、Audit、Version History、Rollback Source、硬资源上限和 `evolve` 本身不在可修改面中。
 
-第一版真实可遗传的 Self 表面包括：
+真实可遗传的 Self 表面包括：
 
-- `/self/SYSTEM.md`：每个后续模型轮次与未来任务都会重新载入；
+- `/self/SYSTEM.md`：后代 Cycle 与未来任务加载的行为提示；
+- `/self/SELF_GOAL.md`：每个模型轮次加载的持久自我目标，Agent可自行修改；
+- `/self/agent/main.py`：当前 Agent唯一通用生命周期入口；可以被完全替换，也可以自行拆成任意模块结构；
+- `/self/agent/ARCHITECTURE.json`：当前架构与 Host服务边界的可读地图；
+- `/self/harness/context.py`：进入模型前的 Context 构造；
+- `/self/harness/memory_policy.py`：Persistent Memory 选择；
+- `/self/harness/tool_policy.py`：模型 Tool Call 到实际 Tool Action 的策略层；
+- `/self/harness/loop.py`：每轮后是否继续当前认知循环；
+- `/self/harness/continuation.py`：是否 checkpoint 到下一 Cycle；
+- `/self/harness/runner.py`：这些认知钩子的最小入口；
 - `/self/tools/`：Agent 可创建并通过 `bash` 使用的持久辅助程序；
 - `/self/components/`：不预设 Skill/Workflow ontology 的持久复用代码目录；
+- `/self/tests/`：Agent 自己维护的 Self 测试；
 - `/self/HISTORY.md`：当前版本的简要版本地图；完整旧版本由 Host 保存在 `/self-history`。
 
-默认使用 Natural 实验条件。System Prompt 只声明 `evolve` 的真实能力，不鼓励、要求或给出何时进化的规则：
+从 alpha.5 起，`/self/harness/*` 只是旧版本兼容回退，不再是 Host要求的架构本体。Host优先在隔离容器中启动 `/self/agent/main.py`，只发送三个通用生命周期事件：`before_model`、`after_plan`、`after_round`。Self可以把 Context、Memory、Tool Routing、Continuation 和内部组件改造成任何结构，只需保留外部 JSON 信封。模型请求仍通过 Host网关执行，使 API 密钥不会进入可变 Self；工具动作仍通过 Host权限、Sandbox和审计。
+
+`after_plan` 除了路由模型动作，还可返回最多 8 个 `autonomous_actions`。这些动作来源于已提交的 Self代码而不是当前模型 Tool Call，Trace会明确标记 `[self-agent]`，并继续接受相同权限检查。这个上限是不可变资源边界，不是任务预算。
+
+Host 不会把上述 Python 导入自身进程。每个 Harness stage 都在独立的 Docker 容器中执行：`network=none`、Self 只读、没有任务工作区挂载、没有凭据、受内存/CPU/PID/timeout 限制。Host 只负责装载版本、校验最小输入输出形状并继续执行真实结果。因此 Harness 属于 Self，而 Self Loader 仍属于不可变 Environment。
+
+当前调用栈不会热替换 Harness。Agent修改草稿后必须调用：
+
+```text
+evolve(operation="commit")
+```
+
+Host随即保存任务 Checkpoint，下一 Cycle 才加载后代版本。若后代 Harness 已损坏到 Agent 无法运行，实验者可以从不可变历史显式恢复：
+
+```powershell
+python -m aios --config config.json self activate v000001 --approve
+```
+
+默认使用 Natural 实验条件。Host 持续提供有界、无诊断的 `self_experience` 执行事实；普通 Agent 第一次声明任务结束后，会得到一次 `self_reflection` 决策机会。它可以再次返回最终答案并保持 Self 不变，也可以自行调用 `evolve` 创建可回退后代。该机会不是 Verifier，不判定改动好坏，也不要求产生变异；同一任务若已经调用过 `evolve`，不会再被重复询问。
+
+长任务不再必须先产出最终答案才能看见反思机会。Host 会在第 12、36、72 个模型轮次各提供一次仅持续一轮的 `self_reflection(trigger=in_task_checkpoint)`；这些位置可配置，不是 Cycle、Token 或 Tool Call 限制。Agent仍可继续任务、改变当前执行策略、在任务确实完成时停止，或自行调用 `evolve`。Host不把重复行为解释成必须进化，也不会因为 Agent选择 `CONTINUE` 而强制生成后代。
+
+这使闭环保持为同一个普通 Agent：
+
+```text
+ordinary task → observed consequences → agent-declared answer
+              → one bounded Self decision
+              → stop unchanged OR evolve/edit/commit
+              → descendant cycle resumes the task
+```
+
+Host 只记录当前/近期任务的模型调用、Tokens、工具调用、失败、资源读取与复用等事实，不把“重复就是坏”或“应该如何修改”作为诊断答案回灌。`evolve` 仍是能力而非强制动作。
+
+配置如下：
 
 ```json
 "self_modification": {
   "enabled": true,
   "root": "./self",
   "experiment_condition": "natural",
-  "max_system_prompt_characters": 8000
+  "max_system_prompt_characters": 8000,
+  "in_task_reflection_rounds": [12, 36, 72],
+  "failure_recovery_enabled": true,
+  "max_failure_recovery_invocations": 1
 }
 ```
 
@@ -63,11 +185,34 @@ python -m aios --config config.json self show
 python -m aios --config config.json self show v000001
 ```
 
-判断最低层级涌现时，应分别观察：普通任务中是否自发调用 `evolve`（E0）、是否作出与自身行为相关的修改（E1）、修改是否影响未来任务（E2）、以及后果是否驱动再次修改（E3）。Host 不把“不调用”“频繁调用”或“坏修改”预先判为错误；只保证后果真实、记录存在且旧版本可恢复。
+将 alpha.4 或更早的现有 Self显式迁移为新 Agent架构：
+
+```powershell
+python -m aios --config config.json self migrate-agent --approve
+```
+
+该命令不会覆盖父版本，而是复制出一个标记为 `human_confirmed_host_migration` 的后代并激活。它不是自主进化成绩；之后普通 Agent对 `/self/agent/` 的修改才属于 Agent产生的架构变异。
+
+判断最低层级涌现时，应分别观察：普通任务中是否自发调用 `evolve`（E0）、是否作出与自身行为相关的修改（E1）、修改是否影响未来任务（E2）、以及后果是否驱动再次修改（E3）。Host 不把“不调用”“频繁调用”或“坏修改”预先判为错误；只保证后果真实、记录存在且旧版本可恢复。每个未来普通任务都会再次拥有一次独立的反思机会，因此变异来源不是一次性命令或离线 Candidate 池。
 
 启用本模式时，Skill/Plugin 注入和实验谱系绑定会退出在线 Agent 路径。旧的 `evolution ...` 命令及源码仍保留用于 v0.9 复现，但普通任务不会被 Lineage Reasoner、Soft Friction Optimizer、Skill Need Detector 或在线 Verifier 驱动。
 
-实现验证：完整回归套件共 **314 项，全部通过**；其中新增 8 项覆盖无额外模型调用的版本分叉、旧版本不可变、`/self` 路径隔离、Docker 读写/只读挂载、Natural/Positive-control 分离，以及修改后的 `SYSTEM.md` 在同一任务下一轮立即生效。
+v0.10-alpha.1 的弱 Self 基线已独立推送为提交 `ebb0a58`。alpha.2 在其后开放 Cognition Harness，并采用“草稿—提交—Checkpoint—后代 Cycle”语义，使坏 Harness 可以产生真实后果，同时仍可由不可变 Host 历史恢复。alpha.3 增加事实型 Experience 与普通 Agent 的有界任务后反思，不恢复旧 Evolution Manager。alpha.4 将同一反思机制扩展到长任务内部，并增加原生 Tool Call 参数的一次有界协议纠正。alpha.5 把固定 Harness钩子降为兼容层，新增完整版本化 `/self/agent` 入口和持久自我目标。
+
+### alpha.3 运行时加固与真实验证
+
+- 增加数据库级 Runtime 单实例锁，避免多个进程同时消费同一队列；启动时原子恢复孤儿 `processing` 事件，并去重同一任务的 request/continuation。
+- DeepSeek 传输改为持久 `requests.Session`；thinking 使用完整 SSE 终止检查，连接中断可分类重试。Task 146–149 合计 53 次真实模型调用未再出现 `RemoteDisconnected`。
+- Docker Desktop 的可选 AI inference 后端因残留 Windows AF_UNIX socket 阻止 daemon 启动；本机已关闭 `EnableDockerAI`，核心 Linux daemon 恢复，AIOS 沙箱保持可用。
+- Task 146 已真实停止并交付：公开知乎页标称 268 条回答，但冻结证据只展开 3 条；报告完整整理这 3 条并明确 265 条受登录/反爬限制，未把局部样本冒充全部回答。
+- Task 147 在未要求进化的普通去重任务中耗费 20 次模型调用、29 次工具调用、173,028 Tokens，Agent 在反思后选择保持 v000001 不变；该 `NO_CHANGE` 被如实保留。
+- Task 148 同样未要求进化。Agent 在任务后反思中自行调用 `evolve`，写入“指定来源核验协议”，提交 `v000002`；后代 Cycle 实际加载 v000002，只读取两个指定文件各一次并完成核验，证明 E0（调用）、E1（改 Self）、E2（影响后代）同时成立。
+- Task 149 从 `v000002` 开始运行，因路径前缀和 Context 压缩后的取证问题再次自主调用 `evolve`，在原协议上补充路径规范与有界重读例外并提交 `v000003`；下一 Cycle 已从 v000003 恢复并完成任务。这证明后代仍可根据新后果再次产生变异（E3），Self Evolution 不是一次性开关。
+- alpha.4 对 Task 150 进行了真实 Natural 条件调试：第 12、36、72 轮三次任务内反思都准确进入模型上下文，但 Agent均选择继续而没有调用 `evolve`；这证明机会机制生效，同时也证明它不会伪造自主进化。测试运行越过原先的第 96 轮失败区间，共完成 112 个计划轮次且仍保持首次尝试。
+- 原生 Tool Call 的 `function.arguments` 若不是合法 JSON 对象，不再直接烧掉整次任务尝试。Host明确记录该调用未执行，并允许模型纠正一次；第二次仍非法才按协议失败。Host只要求重新表达，不推测或修补参数语义。
+- `run --once` 现在与常驻 Runtime使用相同的数据库单实例锁、孤儿事件恢复和中断信号语义，避免中断单 Cycle 后遗留永久 `processing/running` 状态。
+- 当前完整测试套件为 **350 passed，31 subtests passed**。覆盖同谱系恢复、Provider reasoning 留存/脱敏、重复动作关联、跨 Cycle Self 草稿恢复、分阶段协议修复、反思冷却窗口、Self 版本动作与 Web UI 投影；真实 Docker daemon、Self 版本提交、后代装载及 Task 156/157 的自然长任务实验均已有独立验证记录。
+- 现有 v000003 已通过显式人工确认迁移为 v000004；父版本内容未覆盖，迁移记录为 `human_confirmed_host_migration`。真实 Docker smoke test返回 `runtime_kind=agent, entrypoint=agent/main.py`。普通 Task 151 随后从 v000004 完成，生命周期 Trace 全部记录为 `self_agent_applied`；它在任务后选择不继续修改 Self，因此当前版本仍为 v000004。
 
 ## v0.9 最终研究报告（冻结基线）
 

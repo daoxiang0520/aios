@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from aios.config import BudgetConfig, Settings
+from aios.controller import ControllerError
 from aios.lineage import LineageManager
 from aios.runtime import AIOSRuntime, TaskBudget
 from aios.types import Action, Event, Plan, Task, TaskStatus
@@ -117,6 +118,67 @@ class UnlimitedBudgetTests(unittest.TestCase):
         self.assertEqual(done.result["evidence"]["task_cycles"], 2)
         self.assertEqual(done.result["evidence"]["task_tool_calls"], 1)
 
+    def test_unlimited_cycle_uses_fresh_context_liveness_boundary(self):
+        self.settings.runtime.liveness_checkpoint_rounds = 2
+        runtime = self.runtime()
+        runtime.controller.plan = Mock(side_effect=[
+            Plan("step one", [Action("write", {"path": "one.txt", "content": "1"})], done=False),
+            Plan("step two", [Action("write", {"path": "two.txt", "content": "2"})], done=False),
+        ])
+        runtime.store.add_event(Event("USER_REQUEST", {"message": "long work"}))
+
+        runtime.run_once()
+
+        deferred = runtime.store.list_tasks()[0]
+        self.assertEqual(deferred.status, TaskStatus.DEFERRED)
+        self.assertEqual(deferred.result["continuation_reason"], "runtime_liveness_checkpoint")
+        self.assertFalse(deferred.result["evidence"]["budget_limits_enabled"])
+        self.assertEqual(runtime.store.count_pending_events(), 1)
+        traces = runtime.store.traces_for_cycles([deferred.result["cycle_id"]])
+        self.assertTrue(any(item["kind"] == "liveness_checkpoint_requested" for item in traces))
+        checkpoint = runtime.store.task_checkpoints(deferred.id)[-1]["data"]
+        self.assertEqual(checkpoint["metrics"]["liveness_checkpoints"], 1)
+        self.assertIn("_pending_self_reflection", checkpoint["working_state"])
+        self.assertTrue((self.settings.workspace / "one.txt").is_file())
+        self.assertTrue((self.settings.workspace / "two.txt").is_file())
+
+    def test_failed_cycle_preserves_private_workspace_for_retry(self):
+        runtime = self.runtime()
+        runtime.controller.plan = Mock(side_effect=[
+            Plan("create intermediate", [Action("write", {
+                "path": "intermediate.txt", "content": "preserved",
+            })], done=False),
+            ControllerError("invalid model response"),
+        ])
+        runtime.store.add_event(Event("USER_REQUEST", {"message": "multi-step work"}))
+
+        runtime.run_once()
+
+        task = runtime.store.list_tasks()[0]
+        self.assertEqual(task.status, TaskStatus.RETRYING)
+        self.assertFalse((self.settings.workspace / "intermediate.txt").exists())
+        private_file = (
+            self.settings.sandbox_root / "task_workspaces"
+            / f"task_{task.id}" / "intermediate.txt"
+        )
+        self.assertEqual(private_file.read_text(encoding="utf-8"), "preserved")
+        reset = [
+            item for item in runtime.store.task_checkpoints(task.id)
+            if item["phase"] == "retry_reset"
+        ][-1]
+        self.assertTrue(reset["data"]["preserve_working_state"])
+
+        resumed = self.runtime()
+        resumed.controller.plan = Mock(return_value=Plan("stop", [], done=True))
+        resumed.run_once()
+        finished = resumed.store.get_task(task.id)
+        self.assertEqual(finished.status, TaskStatus.STOPPED)
+        self.assertEqual(
+            (self.settings.workspace / "intermediate.txt").read_text(encoding="utf-8"),
+            "preserved",
+        )
+        self.assertFalse(private_file.exists())
+
     def test_old_checkpoint_limits_do_not_reenable_budget(self):
         runtime = self.runtime()
         task_id = runtime.store.create_task(Task("old", "old"))
@@ -163,6 +225,25 @@ class UnlimitedBudgetTests(unittest.TestCase):
         old = app._budget({"evidence": {"model_tokens": 99}}, [])
         self.assertTrue(old["enabled"])
         self.assertEqual(old["tokens"], 99)
+
+    def test_ui_aggregates_lifetime_usage_from_all_cycle_traces(self):
+        app = AIOSWebApplication(self.settings, self.runtime().store)
+        traces = [
+            {"cycle_id": "a", "kind": "plan_created", "data": {
+                "model_usage": {"model_calls": 2, "total_tokens": 100},
+            }},
+            {"cycle_id": "a", "kind": "action_result", "data": {}},
+            {"cycle_id": "b", "kind": "plan_created", "data": {
+                "model_usage": {"model_calls": 1, "total_tokens": 50},
+            }},
+            {"cycle_id": "b", "kind": "action_result", "data": {}},
+        ]
+        projected = app._budget({}, [], traces)
+        self.assertEqual(projected["scope"], "task_lifetime")
+        self.assertEqual(projected["model_calls"], 3)
+        self.assertEqual(projected["tokens"], 150)
+        self.assertEqual(projected["tool_calls"], 2)
+        self.assertEqual(projected["cycles"], 2)
 
 
 if __name__ == "__main__":
